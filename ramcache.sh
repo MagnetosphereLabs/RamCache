@@ -388,7 +388,7 @@ def main() -> int:
         try:
             config_text, cfg = load_config()
             config_changed = config_text != current_config_text
-            if config_changed:
+            if config_changed or watcher.dead():
                 current_config_text = config_text
                 watcher.start(cfg)
 
@@ -472,8 +472,8 @@ write_config_if_missing() {
     "/swapfile"
   ],
   "stay_on_filesystem": true,
-  "check_interval_seconds": 10,
-  "full_rescan_interval_seconds": 21600,
+  "check_interval_seconds": 120,
+  "full_rescan_interval_seconds": 86400,
   "base_target_ratio": 0.50,
   "min_available_ratio": 0.125,
   "small_files_share_percent": 70,
