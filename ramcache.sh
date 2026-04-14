@@ -636,18 +636,17 @@ write_config_if_missing() {
   "stay_on_filesystem": true,
   "check_interval_seconds": 180,
   "full_rescan_interval_seconds": 86400,
-  "base_target_ratio": 0.70,
+  "base_target_ratio": 0.56,
   "min_available_ratio": 0.125,
   "small_files_share_percent": 70,
   "vmtouch_max_file_size_ratio": 0.50,
   "vmtouch_feed_pause_seconds": 0.02,
   "vmtouch_feed_target_extra_seconds": 30,
   "reduce_thresholds": [
-    {"working_used_ratio": 0.0, "target_locked_ratio": 0.70},
-    {"working_used_ratio": 0.375, "target_locked_ratio": 0.50},
-    {"working_used_ratio": 0.50, "target_locked_ratio": 0.35},
-    {"working_used_ratio": 0.625, "target_locked_ratio": 0.21},
-    {"working_used_ratio": 0.75, "target_locked_ratio": 0.0}
+    {"working_used_ratio": 0.0, "target_locked_ratio": 0.56},
+    {"working_used_ratio": 0.63, "target_locked_ratio": 0.35},
+    {"working_used_ratio": 0.70, "target_locked_ratio": 0.28},
+    {"working_used_ratio": 0.77, "target_locked_ratio": 0.0}
   ]
 }
 JSON
