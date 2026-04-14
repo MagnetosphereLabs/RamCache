@@ -39,7 +39,7 @@ The service installs a Python controller, a systemd unit, a default config, and 
 
 Each cycle does four main things. It loads the current config, decides whether the filesystem inventory needs to be rebuilt, reads current memory state from `/proc/meminfo`, and then selects a file set that fits inside the current RAM target. Filesystem inventory rebuilds are driven separately from the fast memory control loop, so the controller can check memory pressure frequently without needing to rescan the full filesystem each time. If the selected set changes, it restarts `vmtouch` with the new list.
 
-The result is a managed hot file set that stays aligned with both the current filesystem and the machine’s current memory usage.
+The result is a managed hot file set that stays in sync with both the current filesystem and the machine’s current memory usage.
 
 ## How the RAM target works
 
@@ -47,13 +47,12 @@ RamCache Controller does not use a fixed hardcoded amount of memory. It calculat
 
 It reads `MemTotal` and `MemAvailable` from `/proc/meminfo`, then computes a working set value from the difference. From there it applies the configured ratios in `config.json`.
 
-With the default config, the controller starts with a base target of 50 percent of total RAM. As the machine’s working memory usage rises, it steps that target down through the configured thresholds:
+With the default config, the controller starts with a base target of 72 percent of total RAM. As the machine’s working memory usage rises, it steps that target down through the configured thresholds:
 
-* 50 percent target at low pressure
-* 37.5 percent target once working memory use reaches 37.5 percent of RAM
-* 25 percent target once working memory use reaches 50 percent of RAM
-* 12.5 percent target once working memory use reaches 62.5 percent of RAM
-* 0 percent target once working memory use reaches 75 percent of RAM
+* 72 percent target at low pressure
+* 50 percent target once working memory use reaches 68 percent of RAM
+* 36 percent target once working memory use reaches 75 percent of RAM
+* 0 percent target once working memory use reaches 82 percent of RAM
 
 There is also a minimum available memory guard. If `MemAvailable` falls below 12.5 percent of total RAM, the target is forced to zero immediately. This lets the service stay aggressive when RAM is truly spare and back off automatically when applications need it.
 
@@ -156,20 +155,18 @@ This makes it easy to see exactly what the controller is doing at runtime.
   "check_interval_seconds": 30,
   "dirty_rescan_interval_seconds": 1800,
   "full_rescan_interval_seconds": 86400,
-  "base_target_ratio": 0.50,
+  "base_target_ratio": 0.72,
   "min_available_ratio": 0.125,
   "small_files_share_percent": 70,
   "vmtouch_max_file_size_ratio": 0.50,
   "vmtouch_feed_pause_seconds": 0.02,
   "vmtouch_feed_target_extra_seconds": 30,
   "reduce_thresholds": [
-    {"working_used_ratio": 0.0, "target_locked_ratio": 0.50},
-    {"working_used_ratio": 0.375, "target_locked_ratio": 0.375},
-    {"working_used_ratio": 0.50, "target_locked_ratio": 0.25},
-    {"working_used_ratio": 0.625, "target_locked_ratio": 0.125},
-    {"working_used_ratio": 0.75, "target_locked_ratio": 0.0}
+    {"working_used_ratio": 0.0, "target_locked_ratio": 0.72},
+    {"working_used_ratio": 0.68, "target_locked_ratio": 0.50},
+    {"working_used_ratio": 0.75, "target_locked_ratio": 0.36},
+    {"working_used_ratio": 0.82, "target_locked_ratio": 0.0}
   ]
-}
 ```
 
 ## Systemd service
