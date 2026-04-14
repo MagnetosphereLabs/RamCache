@@ -544,6 +544,7 @@ def main() -> int:
     current_target_bytes: Optional[int] = None
     current_vmtouch = None
     last_full_scan = 0.0
+    last_dirty_scan = 0.0
 
     while RUNNING:
         try:
@@ -554,11 +555,17 @@ def main() -> int:
                 watcher.start(cfg)
 
             now = time.time()
+            dirty_rescan_interval = int(cfg.get("dirty_rescan_interval_seconds", 1800))
+            dirty_scan_due = (
+                watcher.is_dirty()
+                and now - last_dirty_scan >= dirty_rescan_interval
+            )
+
             need_scan = (
                 config_changed
                 or not inventory
-                or watcher.is_dirty()
                 or watcher.dead()
+                or dirty_scan_due
                 or now - last_full_scan >= int(cfg.get("full_rescan_interval_seconds", 86400))
             )
 
@@ -566,6 +573,8 @@ def main() -> int:
                 inventory = scan_files(cfg)
                 small_sorted, large_sorted = build_selection_orders(inventory)
                 last_full_scan = now
+                if watcher.is_dirty():
+                    last_dirty_scan = now
                 watcher.mark_clean()
 
             meminfo = parse_meminfo()
@@ -634,7 +643,8 @@ write_config_if_missing() {
     "/swapfile"
   ],
   "stay_on_filesystem": true,
-  "check_interval_seconds": 180,
+  "check_interval_seconds": 60,
+  "dirty_rescan_interval_seconds": 1800,
   "full_rescan_interval_seconds": 86400,
   "base_target_ratio": 0.56,
   "min_available_ratio": 0.125,
