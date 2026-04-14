@@ -99,6 +99,7 @@ def scan_files(cfg: dict) -> list[FileRec]:
     max_file_size = parse_size(cfg.get("vmtouch_max_file_size"))
     seen_realpaths: set[str] = set()
     files: list[FileRec] = []
+    steps = 0
 
     for root in include_paths:
         try:
@@ -107,6 +108,16 @@ def scan_files(cfg: dict) -> list[FileRec]:
             continue
 
         for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            steps += 1
+            maybe_cooldown(
+                steps,
+                cfg,
+                every_key="scan_cooldown_every",
+                sleep_key="scan_cooldown_seconds",
+                default_every=4096,
+                default_sleep=0.0015,
+            )
+
             dirpath = os.path.normpath(dirpath)
 
             if path_is_excluded(dirpath, excludes):
@@ -130,6 +141,16 @@ def scan_files(cfg: dict) -> list[FileRec]:
             dirnames[:] = kept_dirs
 
             for name in filenames:
+                steps += 1
+                maybe_cooldown(
+                    steps,
+                    cfg,
+                    every_key="scan_cooldown_every",
+                    sleep_key="scan_cooldown_seconds",
+                    default_every=4096,
+                    default_sleep=0.0015,
+                )
+
                 full = os.path.normpath(os.path.join(dirpath, name))
                 if path_is_excluded(full, excludes):
                     continue
@@ -154,42 +175,88 @@ def scan_files(cfg: dict) -> list[FileRec]:
     return files
 
 
-def select_files(files: list[FileRec], budget_bytes: int, cfg: dict) -> list[FileRec]:
+def maybe_cooldown(
+    step: int,
+    cfg: dict,
+    *,
+    every_key: str,
+    sleep_key: str,
+    default_every: int,
+    default_sleep: float,
+) -> None:
+    every = int(cfg.get(every_key, default_every) or 0)
+    delay = float(cfg.get(sleep_key, default_sleep) or 0.0)
+    if every > 0 and delay > 0 and step % every == 0:
+        time.sleep(delay)
+
+
+def build_selection_orders(files: list[FileRec]) -> tuple[list[FileRec], list[FileRec]]:
+    return (
+        sorted(files, key=lambda r: (r.size, -r.mtime, r.path)),
+        sorted(files, key=lambda r: (-r.size, -r.mtime, r.path)),
+    )
+
+
+def select_files(
+    small_sorted: list[FileRec],
+    large_sorted: list[FileRec],
+    budget_bytes: int,
+    cfg: dict,
+) -> list[FileRec]:
     if budget_bytes <= 0:
         return []
 
-    # Simple policy:
-    # 70% of the budget goes to smallest files first (tons of files).
-    # 30% goes to largest files first (still keep big useful files hot).
+    # 70% of the budget goes to smallest files first.
+    # 30% goes to largest files first.
     # Then fill whatever budget remains with anything that fits.
     small_share = float(cfg.get("small_files_share_percent", 70)) / 100.0
     small_budget = int(budget_bytes * small_share)
     large_budget = budget_bytes - small_budget
-
-    small_sorted = sorted(files, key=lambda r: (r.size, -r.mtime, r.path))
-    large_sorted = sorted(files, key=lambda r: (-r.size, -r.mtime, r.path))
 
     selected: list[FileRec] = []
     seen: set[str] = set()
     total = 0
     small_total = 0
     large_total = 0
+    steps = 0
 
     for rec in small_sorted:
+        steps += 1
+        maybe_cooldown(
+            steps,
+            cfg,
+            every_key="select_cooldown_every",
+            sleep_key="select_cooldown_seconds",
+            default_every=2048,
+            default_sleep=0.001,
+        )
+
         if small_total + rec.size > small_budget:
-            continue
+            break  # ascending by size, so nothing later will fit either
+
         selected.append(rec)
         seen.add(rec.path)
         small_total += rec.size
         total += rec.size
 
     for rec in large_sorted:
+        steps += 1
+        maybe_cooldown(
+            steps,
+            cfg,
+            every_key="select_cooldown_every",
+            sleep_key="select_cooldown_seconds",
+            default_every=2048,
+            default_sleep=0.001,
+        )
+
         if rec.path in seen:
             continue
         if total + rec.size > budget_bytes:
             continue
         if large_total + rec.size > large_budget:
             continue
+
         selected.append(rec)
         seen.add(rec.path)
         large_total += rec.size
@@ -197,10 +264,23 @@ def select_files(files: list[FileRec], budget_bytes: int, cfg: dict) -> list[Fil
 
     for source in (small_sorted, large_sorted):
         for rec in source:
+            steps += 1
+            maybe_cooldown(
+                steps,
+                cfg,
+                every_key="select_cooldown_every",
+                sleep_key="select_cooldown_seconds",
+                default_every=2048,
+                default_sleep=0.001,
+            )
+
             if rec.path in seen:
                 continue
             if total + rec.size > budget_bytes:
+                if source is small_sorted:
+                    break  # ascending by size
                 continue
+
             selected.append(rec)
             seen.add(rec.path)
             total += rec.size
@@ -379,6 +459,8 @@ def main() -> int:
     watcher = Watcher()
     current_config_text = None
     inventory: list[FileRec] = []
+    small_sorted: list[FileRec] = []
+    large_sorted: list[FileRec] = []
     current_paths: list[str] = []
     current_target_bytes: Optional[int] = None
     current_vmtouch: Optional[subprocess.Popen] = None
@@ -388,7 +470,7 @@ def main() -> int:
         try:
             config_text, cfg = load_config()
             config_changed = config_text != current_config_text
-            if config_changed or watcher.dead():
+            if config_changed:
                 current_config_text = config_text
                 watcher.start(cfg)
 
@@ -398,7 +480,7 @@ def main() -> int:
                 or not inventory
                 or watcher.is_dirty()
                 or watcher.dead()
-                or now - last_full_scan >= int(cfg.get("full_rescan_interval_seconds", 21600))
+                or now - last_full_scan >= int(cfg.get("full_rescan_interval_seconds", 86400))
             )
 
             if need_scan:
@@ -472,7 +554,7 @@ write_config_if_missing() {
     "/swapfile"
   ],
   "stay_on_filesystem": true,
-  "check_interval_seconds": 120,
+  "check_interval_seconds": 180,
   "full_rescan_interval_seconds": 86400,
   "base_target_ratio": 0.50,
   "min_available_ratio": 0.125,
