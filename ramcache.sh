@@ -470,7 +470,7 @@ def main() -> int:
         try:
             config_text, cfg = load_config()
             config_changed = config_text != current_config_text
-            if config_changed:
+            if config_changed or watcher.dead():
                 current_config_text = config_text
                 watcher.start(cfg)
 
@@ -485,12 +485,13 @@ def main() -> int:
 
             if need_scan:
                 inventory = scan_files(cfg)
+                small_sorted, large_sorted = build_selection_orders(inventory)
                 last_full_scan = now
                 watcher.mark_clean()
 
             meminfo = parse_meminfo()
             target_bytes, _, _ = choose_target_bytes(meminfo, cfg)
-            selected = select_files(inventory, target_bytes, cfg)
+            selected = select_files(small_sorted, large_sorted, target_bytes, cfg)
             new_paths = [r.path for r in selected]
 
             if (
