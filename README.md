@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/RamCache/main/ram
 
 The service installs a Python controller, a systemd unit, a default config, and the required packages: `python3`, `vmtouch`, and `inotify-tools`. Once started, the controller runs in a loop and manages a selected set of files that should stay hot in RAM.
 
-Each cycle does four main things. It loads the current config, decides whether the filesystem inventory needs to be rebuilt, reads current memory state from `/proc/meminfo`, and then selects a file set that fits inside the current RAM target. If that selected set changes, it restarts `vmtouch` with the new list.
+Each cycle does four main things. It loads the current config, decides whether the filesystem inventory needs to be rebuilt, reads current memory state from `/proc/meminfo`, and then selects a file set that fits inside the current RAM target. Filesystem inventory rebuilds are driven separately from the fast memory control loop, so the controller can check memory pressure frequently without needing to rescan the full filesystem each time. If the selected set changes, it restarts `vmtouch` with the new list.
 
 The result is a managed hot file set that stays aligned with both the current filesystem and the machine’s current memory usage.
 
@@ -103,15 +103,19 @@ If the target changes, the selected file list changes, the config changes, or th
 
 ## Watching for changes
 
-RamCache Controller uses `inotifywait` to watch the included paths recursively. It listens for writes, creates, deletes, moves, and attribute changes. When something changes, it marks the inventory so the next control cycle rebuilds the file list and recalculates selection.
+RamCache Controller uses `inotifywait` to watch the included paths recursively. It listens for writes, creates, deletes, moves, and attribute changes. When something changes, it marks the inventory as dirty so the controller knows a rebuild is needed.
+
+Watcher driven rebuilds are intentionally rate limited by `dirty_rescan_interval_seconds`. By default, filesystem changes are folded into a rebuild at most once every 30 minutes instead of forcing a full inventory pass on every fast control cycle.
 
 There is also a scheduled full rescan interval. By default the controller forces a full rebuild every 24 hours even if no watch event triggered it.
 
 ## Runtime and status
 
-The controller wakes up every `check_interval_seconds`, which is 180 seconds by default in the current version.
+The controller wakes up every `check_interval_seconds`, which is 30 seconds by default in the current version.
 
-On each pass it can rebuild inventory if needed, recalculate the RAM target from current memory state, reselect files from the cached sorted lists, and refresh the running `vmtouch` set only when something actually changed.
+On each pass it reads current memory state, recalculates the RAM target, reselects files from the cached sorted lists, and refreshes the running `vmtouch` set only when something actually changed.
+
+Full filesystem inventory rebuilds are handled on a separate schedule. By default, watcher driven rebuilds are allowed at most once every 30 minutes through `dirty_rescan_interval_seconds`, while a full safety rebuild still runs every 24 hours through `full_rescan_interval_seconds`.
 
 It also writes a status file at:
 
@@ -149,7 +153,8 @@ This makes it easy to see exactly what the controller is doing at runtime.
     "/swapfile"
   ],
   "stay_on_filesystem": true,
-  "check_interval_seconds": 180,
+  "check_interval_seconds": 30,
+  "dirty_rescan_interval_seconds": 1800,
   "full_rescan_interval_seconds": 86400,
   "base_target_ratio": 0.50,
   "min_available_ratio": 0.125,
