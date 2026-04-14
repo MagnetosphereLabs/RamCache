@@ -45,14 +45,16 @@ The result is a managed hot file set that stays in sync with both the current fi
 
 RamCache Controller does not use a fixed hardcoded amount of memory. It calculates a target from live memory state every cycle.
 
-It reads `MemTotal` and `MemAvailable` from `/proc/meminfo`, then computes a working set value from the difference. From there it applies the configured ratios in `config.json`.
+It reads `MemTotal` and `MemAvailable` from `/proc/meminfo`, then computes current total memory pressure from the difference. That total already includes application memory, kernel managed memory, and memory locked by RamCache through `vmtouch`. Each threshold below is a trigger, and each target is the new total amount of RAM RamCache is allowed to keep locked after that trigger is reached. So when the system reaches 68 percent total memory pressure, RamCache does not try to find another 50 percent of free RAM. It lowers its own total lock cap to 50 percent and shrinks toward that level if it is currently above it.
 
-With the default config, the controller starts with a base target of 72 percent of total RAM. As the machine’s working memory usage rises, it steps that target down through the configured thresholds:
+With the default config, the controller starts with a 72 percent lock target. As total memory pressure rises, it steps that RamCache cap down through the configured thresholds:
 
-* 72 percent target at low pressure
-* 50 percent target once working memory use reaches 68 percent of RAM
-* 36 percent target once working memory use reaches 75 percent of RAM
-* 0 percent target once working memory use reaches 82 percent of RAM
+* 72 percent target under 68 percent total memory pressure
+* 50 percent target at 68 percent total memory pressure
+* 36 percent target at 75 percent total memory pressure
+* 0 percent target at 82 percent total memory pressure
+
+Because these pressure thresholds already include RamCache’s own locked memory, the controller never tries to use that target on top of current usage; it treats the target as the new total RamCache cap at that pressure level and rechecks every 30 seconds so it can shrink before memory gets low.
 
 There is also a minimum available memory guard. If `MemAvailable` falls below 12.5 percent of total RAM, the target is forced to zero immediately. This lets the service stay aggressive when RAM is truly spare and back off automatically when applications need it.
 
