@@ -43,6 +43,14 @@ class FileRec:
     size: int
     mtime: float
 
+@dataclass
+class VmtouchRun:
+    proc: subprocess.Popen
+    feeder: threading.Thread
+    stop_event: threading.Event
+
+    def poll(self):
+        return self.proc.poll()
 
 def handle_signal(signum, frame):
     global RUNNING
@@ -310,19 +318,36 @@ def choose_target_bytes(meminfo: dict[str, int], cfg: dict) -> tuple[int, int, i
     return target_bytes, int(working_used), int(available)
 
 
-def stop_proc(proc: Optional[subprocess.Popen]) -> None:
+def stop_proc(proc) -> None:
     if proc is None:
         return
-    if proc.poll() is not None:
+
+    runner = proc.proc if isinstance(proc, VmtouchRun) else proc
+
+    if isinstance(proc, VmtouchRun):
+        proc.stop_event.set()
+        try:
+            if runner.stdin is not None and not runner.stdin.closed:
+                runner.stdin.close()
+        except Exception:
+            pass
+
+    if runner.poll() is not None:
+        if isinstance(proc, VmtouchRun) and proc.feeder.is_alive():
+            proc.feeder.join(timeout=1)
         return
+
     try:
-        proc.terminate()
-        proc.wait(timeout=15)
+        runner.terminate()
+        runner.wait(timeout=15)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        runner.kill()
+        runner.wait(timeout=5)
     except ProcessLookupError:
         pass
+    finally:
+        if isinstance(proc, VmtouchRun) and proc.feeder.is_alive():
+            proc.feeder.join(timeout=1)
 
 
 class Watcher:
@@ -395,8 +420,18 @@ class Watcher:
     def dead(self) -> bool:
         return self.proc is None or self.proc.poll() is not None
 
+def compute_vmtouch_pause_plan(path_count: int, cfg: dict) -> tuple[float, int]:
+    pause_seconds = float(cfg.get("vmtouch_feed_pause_seconds", 0.02) or 0.0)
+    extra_budget_seconds = float(cfg.get("vmtouch_feed_target_extra_seconds", 30.0) or 0.0)
 
-def start_vmtouch(cfg: dict, meminfo: dict[str, int], paths: list[str]) -> subprocess.Popen:
+    if path_count <= 1 or pause_seconds <= 0 or extra_budget_seconds <= 0:
+        return 0.0, 0
+
+    pause_count = min(path_count - 1, int(extra_budget_seconds / pause_seconds))
+    return pause_seconds, max(0, pause_count)
+
+
+def start_vmtouch(cfg: dict, meminfo: dict[str, int], paths: list[str]) -> VmtouchRun:
     if "vmtouch_max_file_size_ratio" in cfg:
         max_file_size_bytes = int(meminfo["MemTotal"] * float(cfg["vmtouch_max_file_size_ratio"]))
         max_file_size_mib = max(1, max_file_size_bytes // MIB)
@@ -421,13 +456,57 @@ def start_vmtouch(cfg: dict, meminfo: dict[str, int], paths: list[str]) -> subpr
         stderr=subprocess.PIPE,
         text=False,
     )
-    payload = b"\0".join(os.fsencode(p) for p in paths)
-    if payload:
-        assert proc.stdin is not None
-        proc.stdin.write(payload)
-    assert proc.stdin is not None
-    proc.stdin.close()
-    return proc
+
+    pause_seconds, pause_count = compute_vmtouch_pause_plan(len(paths), cfg)
+    stop_event = threading.Event()
+
+    def feed_paths() -> None:
+        first_path = True
+        pauses_done = 0
+        total_paths = len(paths)
+
+        try:
+            assert proc.stdin is not None
+
+            for idx, path in enumerate(paths, start=1):
+                if stop_event.is_set() or proc.poll() is not None:
+                    break
+
+                if not first_path:
+                    proc.stdin.write(b"\0")
+                proc.stdin.write(os.fsencode(path))
+                first_path = False
+
+                target_pauses = (idx * pause_count) // total_paths
+                if idx < total_paths and target_pauses > pauses_done:
+                    proc.stdin.flush()
+
+                    while pauses_done < target_pauses:
+                        deadline = time.monotonic() + pause_seconds
+                        while not stop_event.is_set():
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(0.25, remaining))
+
+                        pauses_done += 1
+                        if stop_event.is_set():
+                            break
+
+        except BrokenPipeError:
+            pass
+        except Exception:
+            logging.exception("vmtouch feeder error")
+        finally:
+            try:
+                if proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.close()
+            except Exception:
+                pass
+
+    feeder = threading.Thread(target=feed_paths, daemon=True)
+    feeder.start()
+    return VmtouchRun(proc=proc, feeder=feeder, stop_event=stop_event)
 
 
 def write_status(target_gib: int, selected: list[FileRec], meminfo: dict[str, int], last_scan_epoch: float) -> None:
@@ -463,7 +542,7 @@ def main() -> int:
     large_sorted: list[FileRec] = []
     current_paths: list[str] = []
     current_target_bytes: Optional[int] = None
-    current_vmtouch: Optional[subprocess.Popen] = None
+    current_vmtouch = None
     last_full_scan = 0.0
 
     while RUNNING:
@@ -561,6 +640,8 @@ write_config_if_missing() {
   "min_available_ratio": 0.125,
   "small_files_share_percent": 70,
   "vmtouch_max_file_size_ratio": 0.50,
+  "vmtouch_feed_pause_seconds": 0.02,
+  "vmtouch_feed_target_extra_seconds": 30,
   "reduce_thresholds": [
     {"working_used_ratio": 0.0, "target_locked_ratio": 0.50},
     {"working_used_ratio": 0.375, "target_locked_ratio": 0.375},
