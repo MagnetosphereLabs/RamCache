@@ -305,13 +305,21 @@ def choose_target_bytes(meminfo: dict[str, int], cfg: dict) -> tuple[int, int, i
     available = meminfo["MemAvailable"]
     working_used = total - available
 
-    target_bytes = int(total * float(cfg["base_target_ratio"]))
+    # Hard cap for total system RAM usage, including this cache.
+    max_total_used_ratio = float(cfg.get("max_total_used_ratio", 0.75))
 
-    thresholds = sorted(cfg["reduce_thresholds"], key=lambda x: x["working_used_ratio"])
-    for row in thresholds:
-        if working_used >= int(total * float(row["working_used_ratio"])):
-            target_bytes = int(total * float(row["target_locked_ratio"]))
+    # vmtouch -l uses mlock(), so Mlocked is the best approximation of
+    # how much RAM is currently being held by this cache.
+    locked_now = int(meminfo.get("Mlocked", 0))
 
+    # Estimate everything except our locked cache.
+    non_cache_used = max(0, working_used - locked_now)
+
+    # Allow just enough locked cache so total used stays at or below the cap.
+    target_bytes = int(total * max_total_used_ratio) - non_cache_used
+    target_bytes = max(0, min(target_bytes, total))
+
+    # Keep the emergency safety brake.
     if available < int(total * float(cfg.get("min_available_ratio", 0.125))):
         target_bytes = 0
 
@@ -648,6 +656,7 @@ write_config_if_missing() {
   "full_rescan_interval_seconds": 86400,
   "base_target_ratio": 0.72,
   "min_available_ratio": 0.125,
+  "max_total_used_ratio": 0.75,
   "small_files_share_percent": 70,
   "vmtouch_max_file_size_ratio": 0.50,
   "vmtouch_feed_pause_seconds": 0.02,
