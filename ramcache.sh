@@ -325,6 +325,30 @@ def choose_target_bytes(meminfo: dict[str, int], cfg: dict) -> tuple[int, int, i
 
     return target_bytes, int(working_used), int(available)
 
+def target_change_is_meaningful(
+    current_target_bytes: Optional[int],
+    desired_target_bytes: int,
+    cfg: dict,
+) -> bool:
+    if current_target_bytes is None:
+        return True
+
+    if desired_target_bytes == current_target_bytes:
+        return False
+
+    # Always react immediately when either side is zero.
+    if desired_target_bytes == 0 or current_target_bytes == 0:
+        return True
+
+    abs_deadband = parse_size(cfg.get("target_relock_min_delta", "512M")) or 0
+    rel_deadband = float(cfg.get("target_relock_min_delta_ratio", 0.03))
+
+    threshold = max(
+        abs_deadband,
+        int(max(current_target_bytes, desired_target_bytes) * rel_deadband),
+    )
+
+    return abs(desired_target_bytes - current_target_bytes) >= threshold
 
 def stop_proc(proc) -> None:
     if proc is None:
@@ -586,13 +610,19 @@ def main() -> int:
                 watcher.mark_clean()
 
             meminfo = parse_meminfo()
-            target_bytes, _, _ = choose_target_bytes(meminfo, cfg)
-            selected = select_files(small_sorted, large_sorted, target_bytes, cfg)
+            desired_target_bytes, _, _ = choose_target_bytes(meminfo, cfg)
+
+            effective_target_bytes = current_target_bytes
+            if target_change_is_meaningful(current_target_bytes, desired_target_bytes, cfg):
+                effective_target_bytes = desired_target_bytes
+            if effective_target_bytes is None:
+                effective_target_bytes = desired_target_bytes
+
+            selected = select_files(small_sorted, large_sorted, effective_target_bytes, cfg)
             new_paths = [r.path for r in selected]
 
             if (
-                target_bytes != current_target_bytes
-                or new_paths != current_paths
+                new_paths != current_paths
                 or current_vmtouch is None
                 or current_vmtouch.poll() is not None
             ):
@@ -601,7 +631,8 @@ def main() -> int:
                 if new_paths:
                     current_vmtouch = start_vmtouch(cfg, meminfo, new_paths)
                 current_paths = new_paths
-                current_target_bytes = target_bytes
+
+            current_target_bytes = effective_target_bytes
 
             write_status(bytes_to_gib(current_target_bytes or 0), selected, meminfo, last_full_scan)
 
@@ -657,6 +688,8 @@ write_config_if_missing() {
   "base_target_ratio": 0.72,
   "min_available_ratio": 0.125,
   "max_total_used_ratio": 0.75,
+  "target_relock_min_delta": "512M",
+  "target_relock_min_delta_ratio": 0.03,
   "small_files_share_percent": 70,
   "vmtouch_max_file_size_ratio": 0.50,
   "vmtouch_feed_pause_seconds": 0.02,
