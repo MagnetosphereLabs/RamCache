@@ -189,46 +189,11 @@ This makes it easy to see exactly what the controller is doing at runtime.
     {"working_used_ratio": 0.82, "target_locked_ratio": 0.0}
   ]
 }
-````
+```
 
 The live RAM-target calculation uses `max_total_used_ratio`, `min_available_ratio`, `target_relock_min_delta`, and `target_relock_min_delta_ratio`.
 
 `base_target_ratio` and `reduce_thresholds` are still present in the generated config file, but the current controller path does not use them when calculating the active RAM target.
-
-## Default configuration
-
-```json
-{
-  "include_paths": ["/"],
-  "exclude_prefixes": [
-    "/proc",
-    "/sys",
-    "/dev",
-    "/run",
-    "/tmp",
-    "/var/tmp",
-    "/var/cache/apt/archives",
-    "/var/lib/systemd/coredump",
-    "/lost+found",
-    "/swapfile"
-  ],
-  "stay_on_filesystem": true,
-  "check_interval_seconds": 30,
-  "dirty_rescan_interval_seconds": 1800,
-  "full_rescan_interval_seconds": 86400,
-  "base_target_ratio": 0.72,
-  "min_available_ratio": 0.125,
-  "small_files_share_percent": 70,
-  "vmtouch_max_file_size_ratio": 0.50,
-  "vmtouch_feed_pause_seconds": 0.02,
-  "vmtouch_feed_target_extra_seconds": 30,
-  "reduce_thresholds": [
-    {"working_used_ratio": 0.0, "target_locked_ratio": 0.72},
-    {"working_used_ratio": 0.68, "target_locked_ratio": 0.50},
-    {"working_used_ratio": 0.75, "target_locked_ratio": 0.36},
-    {"working_used_ratio": 0.82, "target_locked_ratio": 0.0}
-  ]
-```
 
 ## Systemd service
 
