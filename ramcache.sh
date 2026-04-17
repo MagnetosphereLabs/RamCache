@@ -17,6 +17,7 @@ write_controller() {
 import json
 import logging
 import os
+import resource
 import signal
 import stat
 import subprocess
@@ -92,6 +93,82 @@ def parse_meminfo() -> dict[str, int]:
             data[name] = int(value.strip().split()[0]) * KIB
     return data
 
+def resolve_vmtouch_max_file_size_bytes(meminfo: dict[str, int], cfg: dict) -> Optional[int]:
+    if "vmtouch_max_file_size_ratio" in cfg:
+        return int(meminfo["MemTotal"] * float(cfg["vmtouch_max_file_size_ratio"]))
+    return parse_size(cfg.get("vmtouch_max_file_size"))
+
+
+def read_int_file(path: str) -> Optional[int]:
+    try:
+        return int(Path(path).read_text(encoding="utf-8").strip().split()[0])
+    except Exception:
+        return None
+
+
+def write_int_file(path: str, value: int) -> None:
+    Path(path).write_text(f"{int(value)}\n", encoding="utf-8")
+
+
+def ensure_procfs_min(path: str, want: int) -> None:
+    current = read_int_file(path)
+    if current is None or current >= want:
+        return
+    try:
+        write_int_file(path, want)
+    except Exception:
+        logging.exception("failed to raise %s to %d", path, want)
+
+
+def ensure_nofile_limit(required_files: int, cfg: dict) -> None:
+    reserve = int(cfg.get("fd_limit_reserve", 65536))
+    auto_max = int(cfg.get("fd_limit_auto_max", 8388608))
+    want = max(131072, required_files + reserve)
+    want = min(want, auto_max)
+
+    ensure_procfs_min("/proc/sys/fs/nr_open", want)
+    ensure_procfs_min("/proc/sys/fs/file-max", max(262144, want * 2))
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        new_soft = soft
+        new_hard = hard
+
+        if soft != resource.RLIM_INFINITY and soft < want:
+            new_soft = want
+        if hard != resource.RLIM_INFINITY and hard < want:
+            new_hard = want
+
+        if new_soft != soft or new_hard != hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, new_hard))
+    except Exception:
+        logging.exception("failed to raise RLIMIT_NOFILE")
+
+
+def ensure_memlock_limit(required_bytes: int, cfg: dict) -> None:
+    reserve = parse_size(cfg.get("memlock_limit_reserve", "1G")) or GIB
+    minimum = parse_size(cfg.get("memlock_limit_min", "1G")) or GIB
+    want = max(minimum, required_bytes + reserve)
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        new_soft = soft
+        new_hard = hard
+
+        if soft != resource.RLIM_INFINITY and soft < want:
+            new_soft = want
+        if hard != resource.RLIM_INFINITY and hard < want:
+            new_hard = want
+
+        if new_soft != soft or new_hard != hard:
+            resource.setrlimit(resource.RLIMIT_MEMLOCK, (new_soft, new_hard))
+    except Exception:
+        logging.exception("failed to raise RLIMIT_MEMLOCK")
+
+
+def ensure_limits_for_selection(selected: list[FileRec], cfg: dict) -> None:
+    ensure_nofile_limit(len(selected), cfg)
+    ensure_memlock_limit(sum(r.size for r in selected), cfg)
 
 def path_is_excluded(path: str, excludes: list[str]) -> bool:
     path = os.path.normpath(path)
@@ -101,10 +178,9 @@ def path_is_excluded(path: str, excludes: list[str]) -> bool:
     return False
 
 
-def scan_files(cfg: dict) -> list[FileRec]:
+def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
     include_paths = [os.path.normpath(p) for p in cfg["include_paths"]]
     excludes = [os.path.normpath(p) for p in cfg["exclude_prefixes"]]
-    max_file_size = parse_size(cfg.get("vmtouch_max_file_size"))
     seen_realpaths: set[str] = set()
     files: list[FileRec] = []
     steps = 0
@@ -198,37 +274,23 @@ def maybe_cooldown(
         time.sleep(delay)
 
 
-def build_selection_orders(files: list[FileRec]) -> tuple[list[FileRec], list[FileRec]]:
-    return (
-        sorted(files, key=lambda r: (r.size, -r.mtime, r.path)),
-        sorted(files, key=lambda r: (-r.size, -r.mtime, r.path)),
-    )
+def build_selection_order(files: list[FileRec]) -> list[FileRec]:
+    return sorted(files, key=lambda r: (r.size, -r.mtime, r.path))
 
 
 def select_files(
-    small_sorted: list[FileRec],
-    large_sorted: list[FileRec],
+    ordered: list[FileRec],
     budget_bytes: int,
     cfg: dict,
 ) -> list[FileRec]:
     if budget_bytes <= 0:
         return []
 
-    # 70% of the budget goes to smallest files first.
-    # 30% goes to largest files first.
-    # Then fill whatever budget remains with anything that fits.
-    small_share = float(cfg.get("small_files_share_percent", 70)) / 100.0
-    small_budget = int(budget_bytes * small_share)
-    large_budget = budget_bytes - small_budget
-
     selected: list[FileRec] = []
-    seen: set[str] = set()
     total = 0
-    small_total = 0
-    large_total = 0
     steps = 0
 
-    for rec in small_sorted:
+    for rec in ordered:
         steps += 1
         maybe_cooldown(
             steps,
@@ -239,59 +301,11 @@ def select_files(
             default_sleep=0.001,
         )
 
-        if small_total + rec.size > small_budget:
+        if total + rec.size > budget_bytes:
             break  # ascending by size, so nothing later will fit either
 
         selected.append(rec)
-        seen.add(rec.path)
-        small_total += rec.size
         total += rec.size
-
-    for rec in large_sorted:
-        steps += 1
-        maybe_cooldown(
-            steps,
-            cfg,
-            every_key="select_cooldown_every",
-            sleep_key="select_cooldown_seconds",
-            default_every=2048,
-            default_sleep=0.001,
-        )
-
-        if rec.path in seen:
-            continue
-        if total + rec.size > budget_bytes:
-            continue
-        if large_total + rec.size > large_budget:
-            continue
-
-        selected.append(rec)
-        seen.add(rec.path)
-        large_total += rec.size
-        total += rec.size
-
-    for source in (small_sorted, large_sorted):
-        for rec in source:
-            steps += 1
-            maybe_cooldown(
-                steps,
-                cfg,
-                every_key="select_cooldown_every",
-                sleep_key="select_cooldown_seconds",
-                default_every=2048,
-                default_sleep=0.001,
-            )
-
-            if rec.path in seen:
-                continue
-            if total + rec.size > budget_bytes:
-                if source is small_sorted:
-                    break  # ascending by size
-                continue
-
-            selected.append(rec)
-            seen.add(rec.path)
-            total += rec.size
 
     return selected
 
@@ -463,10 +477,9 @@ def compute_vmtouch_pause_plan(path_count: int, cfg: dict) -> tuple[float, int]:
     return pause_seconds, max(0, pause_count)
 
 
-def start_vmtouch(cfg: dict, meminfo: dict[str, int], paths: list[str]) -> VmtouchRun:
-    if "vmtouch_max_file_size_ratio" in cfg:
-        max_file_size_bytes = int(meminfo["MemTotal"] * float(cfg["vmtouch_max_file_size_ratio"]))
-        max_file_size_mib = max(1, max_file_size_bytes // MIB)
+def start_vmtouch(cfg: dict, max_file_size_bytes: Optional[int], paths: list[str]) -> VmtouchRun:
+    if max_file_size_bytes is not None:
+        max_file_size_mib = max(1, (max_file_size_bytes + MIB - 1) // MIB)
         max_file_size_arg = f"{max_file_size_mib}M"
     else:
         max_file_size_arg = str(cfg.get("vmtouch_max_file_size", "32G"))
@@ -570,8 +583,7 @@ def main() -> int:
     watcher = Watcher()
     current_config_text = None
     inventory: list[FileRec] = []
-    small_sorted: list[FileRec] = []
-    large_sorted: list[FileRec] = []
+    ordered: list[FileRec] = []
     current_paths: list[str] = []
     current_target_bytes: Optional[int] = None
     current_vmtouch = None
@@ -585,6 +597,9 @@ def main() -> int:
             if config_changed or watcher.dead():
                 current_config_text = config_text
                 watcher.start(cfg)
+
+            meminfo = parse_meminfo()
+            max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
 
             now = time.time()
             dirty_rescan_interval = int(cfg.get("dirty_rescan_interval_seconds", 1800))
@@ -602,14 +617,13 @@ def main() -> int:
             )
 
             if need_scan:
-                inventory = scan_files(cfg)
-                small_sorted, large_sorted = build_selection_orders(inventory)
+                inventory = scan_files(cfg, max_file_size_bytes)
+                ordered = build_selection_order(inventory)
                 last_full_scan = now
                 if watcher.is_dirty():
                     last_dirty_scan = now
                 watcher.mark_clean()
 
-            meminfo = parse_meminfo()
             desired_target_bytes, _, _ = choose_target_bytes(meminfo, cfg)
 
             effective_target_bytes = current_target_bytes
@@ -618,7 +632,8 @@ def main() -> int:
             if effective_target_bytes is None:
                 effective_target_bytes = desired_target_bytes
 
-            selected = select_files(small_sorted, large_sorted, effective_target_bytes, cfg)
+            selected = select_files(ordered, effective_target_bytes, cfg)
+            ensure_limits_for_selection(selected, cfg)
             new_paths = [r.path for r in selected]
 
             if (
@@ -629,7 +644,7 @@ def main() -> int:
                 stop_proc(current_vmtouch)
                 current_vmtouch = None
                 if new_paths:
-                    current_vmtouch = start_vmtouch(cfg, meminfo, new_paths)
+                    current_vmtouch = start_vmtouch(cfg, max_file_size_bytes, new_paths)
                 current_paths = new_paths
 
             current_target_bytes = effective_target_bytes
@@ -690,10 +705,13 @@ write_config_if_missing() {
   "max_total_used_ratio": 0.75,
   "target_relock_min_delta": "1G",
   "target_relock_min_delta_ratio": 0.07,
-  "small_files_share_percent": 70,
+  "fd_limit_reserve": 65536,
+  "fd_limit_auto_max": 8388608,
+  "memlock_limit_reserve": "1G",
+  "memlock_limit_min": "1G",
   "vmtouch_max_file_size_ratio": 0.50,
-  "vmtouch_feed_pause_seconds": 0.02,
-  "vmtouch_feed_target_extra_seconds": 30,
+  "vmtouch_feed_pause_seconds": 0,
+  "vmtouch_feed_target_extra_seconds": 0,
   "reduce_thresholds": [
     {"working_used_ratio": 0.0, "target_locked_ratio": 0.72},
     {"working_used_ratio": 0.68, "target_locked_ratio": 0.50},
@@ -720,7 +738,7 @@ ExecStart=/usr/bin/python3 /opt/ramcache-controller/ramcache_controller.py
 Restart=always
 RestartSec=70
 KillMode=control-group
-LimitNOFILE=1048576
+LimitNOFILE=infinity
 LimitMEMLOCK=infinity
 RuntimeDirectory=ramcache-controller
 
