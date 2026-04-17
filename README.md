@@ -1,21 +1,23 @@
 # RamCache Controller
 
-RamCache Controller is a lightweight Linux service that turns spare RAM into a smarter file cache for your system. It proactively builds a large hot working set from files on disk, keeps that set resident with `vmtouch`, watches for file changes, and continuously adjusts its locked cache budget so total system memory usage stays under a configured cap without thrashing on tiny memory fluctuations. This is especially useful on machines with more RAM than they normally use, and on systems where storage is a bottleneck, like DRAM less SSDs, slower SATA SSDs, or older drives.
+RamCache Controller is a lightweight Linux service that turns spare RAM into a smarter file cache for your system. It proactively scans eligible files, sorts them from smallest to largest, keeps as many of those files resident with `vmtouch` as will fit inside its live RAM target, watches for file changes, and continuously adjusts that locked cache budget so total system memory usage stays under a configured cap without thrashing on small memory fluctuations. This is especially useful on machines with at least 16 GB of RAM that are bottlenecked by slower storage, such as HDDs, USB attached drives, DRAM less SSDs, and older SATA SSDs. Many OS, app, library, and metadata heavy reads come from lots of small files that benefit disproportionately from being kept hot in RAM. SSDs are known for being fast at reading big files, but are much slower at reading lots of small files.
 
 ## What it does
 
 - Preloads files into RAM
+- Sorts eligible files from smallest to largest and fills the RAM target in that order
 - Keeps a large hot file set resident over time
 - Adjusts its locked cache size from live memory state
 - Keeps total system RAM usage under a configured ceiling
 - Ignores small target drift so it does not keep reloading `vmtouch` unnecessarily
 - Watches for filesystem changes and refreshes automatically
+- Automatically raises relevant open file and memlock limits when needed before launching `vmtouch`
 - Installs as a simple systemd service
-- Works well on systems with 16 GB, 32 GB, 64 GB, or more RAM
+- Works especially well on systems with 16 GB, 32 GB, 64 GB, or more RAM
 
 ## How it differs from normal Linux caching
 
-Instead of waiting for the cache to slowly form on its own, it deliberately loads and maintains a much larger hot set of real files in RAM, then trims that set back well before the machine starts needing memory for something more important. It does not replace Linux page cache, but makes it more persistent and makes better use of spare RAM on systems where that is worth it.
+Instead of waiting for the cache to slowly form on its own, it deliberately loads and maintains a much larger hot set of real files in RAM, biased toward the smallest eligible files first, then trims that set back well before the machine starts needing memory for something more important. It does not replace Linux page cache, but makes it more persistent and makes better use of spare RAM on systems where that is worth it.
 
 ## Install
 
@@ -39,9 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/RamCache/main/ram
 
 The service installs a Python controller, a systemd unit, a default config, and the required packages: `python3`, `vmtouch`, and `inotify-tools`. Once started, the controller runs in a loop and manages a selected set of files that should stay hot in RAM.
 
-Each cycle does four main things. It loads the current config, decides whether the filesystem inventory needs to be rebuilt, reads current memory state from `/proc/meminfo`, and then selects a file set that fits inside the current effective RAM target. Filesystem inventory rebuilds are driven separately from the fast memory control loop, so the controller can check memory pressure frequently without needing to rescan the full filesystem each time. The controller computes a desired target every cycle, but only adopts target changes when they are large enough to matter. If the effective target changes enough to alter the selected set, it restarts `vmtouch` with the new list.
-
-The result is a managed hot file set that stays in sync with both the current filesystem and the machine’s current memory usage.
+Each cycle does five main things. It loads the current config, decides whether the filesystem inventory needs to be rebuilt, reads current memory state from `/proc/meminfo`, selects a file set that fits inside the current effective RAM target, and then ensures the relevant open file and memlock limits are high enough for that selected set before launching `vmtouch`. Filesystem inventory rebuilds are driven separately from the fast memory control loop, so the controller can check memory pressure frequently without needing to rescan the full filesystem each time. The controller computes a desired target every cycle, but only adopts target changes when they are large enough to matter. If the effective target changes enough to alter the selected set, it restarts `vmtouch` with the new list.
 
 ## How the RAM target works
 
@@ -61,14 +61,14 @@ The controller then derives the desired cache budget from the configured total R
 
 That result is clamped between zero and total system RAM.
 
-With the default config, `max_total_used_ratio` is `0.75`. In practice, that means RamCache tries to use as much memory as possible while keeping total system RAM usage at or below 75 percent. If applications and the rest of the system use more RAM, RamCache shrinks by only the amount needed. If non-cache memory use reaches that cap by itself, RamCache’s target falls to zero.
+With the default config, `max_total_used_ratio` is `0.75`. In practice, that means RamCache tries to use as much memory as possible while keeping total system RAM usage at or below 75 percent. If applications and the rest of the system use more RAM, RamCache shrinks by only the amount needed. If non cache memory use reaches that cap by itself, RamCache’s target falls to zero.
 
 The controller also applies a deadband before acting on a newly computed target. Small target drift is ignored unless the change crosses a meaningful threshold. By default, a target change must be at least the larger of:
 
 * `512M`
 * `3 percent` of the current or desired target
 
-This prevents needless stop/start churn when `/proc/meminfo` moves by small amounts between control-loop passes.
+This prevents needless stop/start churn when `/proc/meminfo` moves by small amounts between control loop passes.
 
 There is also a minimum available memory guard. If `MemAvailable` falls below 12.5 percent of total RAM, the target is forced to zero immediately.
 
@@ -86,37 +86,24 @@ During large scans it briefly stops at configurable intervals so long scans acro
 
 ## How file selection works
 
-Once the inventory exists, the controller builds two sorted views of it:
+Once the inventory exists, the controller builds one sorted view of it ordered from smallest file to largest.
 
-* one ordered from smallest file to largest
-* one ordered from largest file to smallest
+It then walks that ordered list once and keeps adding files until the next file would exceed the current RAM budget. Selection is based on total file bytes, not file count. If there are many files on disk, the controller scans them all, sorts them from smallest to largest, and chooses the longest prefix of that sorted list whose combined size still fits inside the current target.
 
-It then selects files against the current RAM budget in three passes.
+This strongly biases the cache toward lots of small files. That is intentional. On many desktops, a large amount of perceived responsiveness comes from repeatedly touching many relatively small files such as shared libraries, executables, scripts, icons, metadata heavy trees, and application support files. With enough spare RAM, keeping a very large number of those files hot can improve responsiveness more than spending the same RAM on a much smaller number of large files.
 
-First, it assigns 70 percent of the budget to the smallest files first. This quickly packs a large number of useful small files into RAM. Small libraries, binaries, scripts, metadata-heavy trees, and lots of small files from your OS and apps can benefit from this because many of those small files can fit into a relatively small amount of memory.
-
-Second, it assigns the remaining 30 percent of the budget to the largest files first. This keeps the cache from becoming overly biased toward only tiny files and lets larger useful files stay hot too.
-
-Third, after those two passes, it fills any remaining space with whatever still fits. That gives the controller a fuller final packing instead of leaving easy caching wins behind.
-
-Selection is based on total file bytes, not file count. If there are many files on disk, the controller scans them all, then chooses the subset whose combined size fits inside the current target. So the cache grows to a calculated cap based on available RAM.
-
-When files are the same size, newer modification time is preferred first, and path provides a stable final tie break.
-
-Large selection passes pause briefly at configurable intervals in the same way scans do.
+When files are the same size, newer modification time is preferred first, and path provides a stable final tie break. Large selection passes pause briefly at configurable intervals in the same way scans do.
 
 ## How `vmtouch` is managed
 
-After selection, the controller turns the chosen paths into a null separated list and feeds them to `vmtouch` over standard input.
+After selection, the controller ensures the relevant open file and memlock limits are high enough for the selected set, turns the chosen paths into a null separated list, and feeds them to `vmtouch` over standard input.
 
-The current version does this through a dedicated feeder thread. That thread can pace the input stream using two config values:
+The current version does this through a dedicated feeder thread. The feed path can still be paced using two config values:
 
 * `vmtouch_feed_pause_seconds`
 * `vmtouch_feed_target_extra_seconds`
 
-These settings let the controller spread out part of the feed over a short window instead of dumping the whole path list at once. On large path sets, that makes the handoff to `vmtouch` more controlled.
-
-The controller computes a desired RAM target every cycle, but it only adopts target changes that are large enough to matter. If that effective target changes enough to produce a different selected file list, if the config changes, or if the current `vmtouch` process exits, the controller stops the existing run cleanly and starts a new one with the updated set.
+But the default configuration now disables that pacing, so under default settings the controller feeds the selected path list to `vmtouch` as quickly as possible.
 
 ## Watching for changes
 
@@ -130,9 +117,7 @@ There is also a scheduled full rescan interval. By default the controller forces
 
 The controller wakes up every `check_interval_seconds`, which is 30 seconds by default in the current version.
 
-On each pass it reads current memory state, recalculates the desired RAM target from `MemTotal`, `MemAvailable`, `Mlocked`, and `max_total_used_ratio`, applies a deadband so tiny target drift is ignored, reselects files from the cached sorted lists using the effective target, and refreshes the running `vmtouch` set only when something materially changed.
-
-Full filesystem inventory rebuilds are handled on a separate schedule. By default, watcher-driven rebuilds are allowed at most once every 30 minutes through `dirty_rescan_interval_seconds`, while a full safety rebuild still runs every 24 hours through `full_rescan_interval_seconds`.
+On each pass it reads current memory state, resolves the effective maximum eligible file size, recalculates the desired RAM target from `MemTotal`, `MemAvailable`, `Mlocked`, and `max_total_used_ratio`, applies a deadband so tiny target drift is ignored, reselects files from the cached smallest to largest ordered list using the effective target, ensures limits are high enough for that selected set, and refreshes the running `vmtouch` set only when something materially changed.
 
 It also writes a status file at:
 
@@ -176,12 +161,15 @@ This makes it easy to see exactly what the controller is doing at runtime.
   "base_target_ratio": 0.72,
   "min_available_ratio": 0.125,
   "max_total_used_ratio": 0.75,
-  "target_relock_min_delta": "512M",
-  "target_relock_min_delta_ratio": 0.03,
-  "small_files_share_percent": 70,
+  "target_relock_min_delta": "1G",
+  "target_relock_min_delta_ratio": 0.07,
+  "fd_limit_reserve": 65536,
+  "fd_limit_auto_max": 8388608,
+  "memlock_limit_reserve": "1G",
+  "memlock_limit_min": "1G",
   "vmtouch_max_file_size_ratio": 0.50,
-  "vmtouch_feed_pause_seconds": 0.02,
-  "vmtouch_feed_target_extra_seconds": 30,
+  "vmtouch_feed_pause_seconds": 0,
+  "vmtouch_feed_target_extra_seconds": 0,
   "reduce_thresholds": [
     {"working_used_ratio": 0.0, "target_locked_ratio": 0.72},
     {"working_used_ratio": 0.68, "target_locked_ratio": 0.50},
@@ -191,12 +179,14 @@ This makes it easy to see exactly what the controller is doing at runtime.
 }
 ```
 
-The live RAM-target calculation uses `max_total_used_ratio`, `min_available_ratio`, `target_relock_min_delta`, and `target_relock_min_delta_ratio`.
+The live RAM target calculation uses `max_total_used_ratio`, `min_available_ratio`, `target_relock_min_delta`, and `target_relock_min_delta_ratio`.
+
+The current controller also uses `fd_limit_reserve`, `fd_limit_auto_max`, `memlock_limit_reserve`, `memlock_limit_min`, `vmtouch_max_file_size_ratio`, `vmtouch_feed_pause_seconds`, and `vmtouch_feed_target_extra_seconds`.
 
 `base_target_ratio` and `reduce_thresholds` are still present in the generated config file, but the current controller path does not use them when calculating the active RAM target.
 
 ## Systemd service
 
-The installer creates a systemd service that starts the controller at boot and keeps it running. It runs as root, restarts automatically, raises the open file descriptor limit, and allows unlimited memory locking so `vmtouch` can keep the selected working set resident.
+The installer creates a systemd service that starts the controller at boot and keeps it running. It runs as root, restarts automatically, sets a very high open-file limit, and allows unlimited memory locking so `vmtouch` can keep the selected working set resident. The controller itself also raises the relevant open file and memlock limits at runtime when the current selected set would need more.
 
 It also raises `fs.inotify.max_user_watches` and sets a low `vm.vfs_cache_pressure` profile so the kernel stays friendlier to persistent file caching.
