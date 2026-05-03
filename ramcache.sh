@@ -37,12 +37,12 @@ GIB = 1024 ** 3
 
 RUNNING = True
 
-
 @dataclass(frozen=True)
 class FileRec:
     path: str
     size: int
     mtime: float
+    mode: int
 
 @dataclass
 class VmtouchRun:
@@ -170,6 +170,14 @@ def ensure_limits_for_selection(selected: list[FileRec], cfg: dict) -> None:
     ensure_nofile_limit(len(selected), cfg)
     ensure_memlock_limit(sum(r.size for r in selected), cfg)
 
+def path_has_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(path == prefix or path.startswith(prefix + os.sep) for prefix in prefixes)
+
+
+def path_contains_any(path: str, needles: tuple[str, ...]) -> bool:
+    return any(needle in path for needle in needles)
+
+
 def path_is_excluded(path: str, excludes: list[str]) -> bool:
     path = os.path.normpath(path)
     for ex in excludes:
@@ -178,18 +186,766 @@ def path_is_excluded(path: str, excludes: list[str]) -> bool:
     return False
 
 
+def existing_dir(path: Path) -> Optional[str]:
+    try:
+        if path.is_dir():
+            return os.path.normpath(str(path))
+    except OSError:
+        return None
+    return None
+
+
+def iter_home_dirs() -> list[Path]:
+    homes: list[Path] = [Path("/root")]
+    base = Path("/home")
+
+    try:
+        for p in base.iterdir():
+            try:
+                if p.is_dir():
+                    homes.append(p)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    return homes
+
+
+def parse_steam_libraryfolders_vdf(path: Path) -> list[str]:
+    libraries: list[str] = []
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return libraries
+
+    for line in lines:
+        s = line.strip()
+        if not s.startswith('"path"'):
+            continue
+
+        parts = s.split('"')
+        if len(parts) >= 4:
+            value = parts[3].replace("\\\\", "\\")
+            if value:
+                libraries.append(value)
+
+    return libraries
+
+
+def discover_extra_include_paths(cfg: dict) -> list[str]:
+    if not bool(cfg.get("auto_include_common_app_paths", True)):
+        return []
+
+    paths: list[str] = []
+
+    for p in (
+        Path("/home"),
+        Path("/opt"),
+        Path("/usr/local"),
+        Path("/snap"),
+        Path("/var/lib/flatpak/app"),
+        Path("/var/lib/flatpak/runtime"),
+        Path("/var/lib/flatpak/exports"),
+        Path("/var/lib/snapd/desktop"),
+    ):
+        found = existing_dir(p)
+        if found is not None:
+            paths.append(found)
+
+    for home in iter_home_dirs():
+        for p in (
+            home / ".config",
+            home / ".local/bin",
+            home / ".local/share",
+            home / ".local/share/applications",
+            home / ".local/share/icons",
+            home / ".local/share/fonts",
+            home / ".local/share/mime",
+            home / ".local/share/flatpak/app",
+            home / ".local/share/flatpak/runtime",
+            home / ".local/share/flatpak/exports",
+            home / ".cache/fontconfig",
+            home / ".cache/mesa_shader_cache",
+            home / ".cache/nvidia",
+            home / ".steam/root",
+            home / ".local/share/Steam",
+            home / ".var/app/com.valvesoftware.Steam",
+        ):
+            found = existing_dir(p)
+            if found is not None:
+                paths.append(found)
+
+        steam_vdfs = (
+            home / ".steam/root/steamapps/libraryfolders.vdf",
+            home / ".local/share/Steam/steamapps/libraryfolders.vdf",
+            home / ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/libraryfolders.vdf",
+        )
+
+        for vdf in steam_vdfs:
+            for library in parse_steam_libraryfolders_vdf(vdf):
+                for p in (
+                    Path(library),
+                    Path(library) / "steamapps",
+                    Path(library) / "steamapps/common",
+                    Path(library) / "steamapps/shadercache",
+                    Path(library) / "steamapps/compatdata",
+                ):
+                    found = existing_dir(p)
+                    if found is not None:
+                        paths.append(found)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    for p in paths:
+        norm = os.path.normpath(p)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(norm)
+
+    return deduped
+
+
+def root_allows_cross_filesystem(root: str, cfg: dict) -> bool:
+    root = os.path.normpath(root)
+    cross_roots = tuple(
+        os.path.normpath(p)
+        for p in cfg.get("cross_filesystem_include_roots", ["/snap"])
+    )
+    return path_has_prefix(root, cross_roots)
+
+
+def path_is_under(child: str, parent: str) -> bool:
+    child = os.path.normpath(child)
+    parent = os.path.normpath(parent)
+
+    if parent == "/":
+        return child.startswith("/")
+    return child == parent or child.startswith(parent + os.sep)
+
+
+def safe_dev(path: str) -> Optional[int]:
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
+def build_include_paths(cfg: dict) -> list[str]:
+    raw_paths: list[str] = []
+
+    for p in cfg["include_paths"]:
+        norm = os.path.normpath(p)
+        if norm not in raw_paths:
+            raw_paths.append(norm)
+
+    for p in discover_extra_include_paths(cfg):
+        norm = os.path.normpath(p)
+        if norm not in raw_paths:
+            raw_paths.append(norm)
+
+    # Avoid walking /home, /opt, etc. twice when they are already covered by /
+    # on the same filesystem. Keep them when they are separate filesystems.
+    ordered = sorted(raw_paths, key=lambda p: (p.count(os.sep), len(p), p))
+    kept: list[str] = []
+
+    stay_on_filesystem = bool(cfg.get("stay_on_filesystem", True))
+
+    for path in ordered:
+        path_dev = safe_dev(path)
+        redundant = False
+
+        for parent in kept:
+            if not path_is_under(path, parent):
+                continue
+
+            parent_dev = safe_dev(parent)
+
+            if not stay_on_filesystem or root_allows_cross_filesystem(parent, cfg):
+                redundant = True
+                break
+
+            if path_dev is not None and parent_dev is not None and path_dev == parent_dev:
+                redundant = True
+                break
+
+        if not redundant:
+            kept.append(path)
+
+    return kept
+
+
+HOT_SYSTEM_PREFIXES = (
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/libexec",
+    "/usr/local/bin",
+    "/usr/local/lib",
+    "/usr/local/libexec",
+)
+
+APP_RUNTIME_PREFIXES = (
+    "/opt",
+    "/usr/local",
+    "/var/lib/flatpak/app",
+    "/var/lib/flatpak/runtime",
+    "/var/lib/flatpak/exports",
+    "/var/lib/snapd/desktop",
+    "/snap",
+)
+
+BROWSER_RUNTIME_PREFIXES = (
+    "/usr/lib/firefox",
+    "/usr/lib/thunderbird",
+    "/usr/lib/chromium",
+    "/usr/lib/chromium-browser",
+    "/opt/google/chrome",
+    "/opt/brave.com",
+    "/opt/microsoft/msedge",
+    "/snap/firefox",
+    "/snap/chromium",
+)
+
+DESKTOP_SUPPORT_PREFIXES = (
+    "/usr/share/applications",
+    "/usr/local/share/applications",
+    "/usr/share/appdata",
+    "/usr/share/metainfo",
+    "/usr/share/desktop-directories",
+    "/usr/share/icons",
+    "/usr/share/pixmaps",
+    "/usr/share/mime",
+    "/usr/share/glib-2.0",
+    "/usr/share/dbus-1",
+    "/usr/share/systemd",
+    "/usr/share/polkit-1",
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "/usr/share/themes",
+    "/usr/share/sounds",
+    "/usr/share/thumbnailers",
+    "/usr/share/wayland",
+    "/usr/share/wayland-sessions",
+    "/usr/share/xsessions",
+    "/usr/share/x11",
+    "/usr/share/vulkan",
+    "/usr/share/drirc.d",
+    "/usr/share/alsa",
+    "/usr/share/pipewire",
+    "/usr/share/pulseaudio",
+    "/usr/share/gstreamer-1.0",
+    "/usr/share/kservices5",
+    "/usr/share/kservicetypes5",
+    "/usr/share/kxmlgui5",
+    "/usr/share/plasma",
+    "/usr/share/gnome-shell",
+    "/usr/share/cinnamon",
+    "/usr/share/mate",
+    "/usr/share/xfce4",
+    "/var/cache/fontconfig",
+)
+
+GRAPHICS_AUDIO_RUNTIME_SUBSTRINGS = (
+    "/mesa",
+    "/vulkan",
+    "/opengl",
+    "/egl",
+    "/glvnd",
+    "/vaapi",
+    "/vdpau",
+    "/pipewire",
+    "/pulseaudio",
+    "/alsa",
+    "/gstreamer",
+    "/wireplumber",
+)
+
+HOT_USER_SUBSTRINGS = (
+    "/.local/bin/",
+    "/.local/share/applications/",
+    "/.local/share/icons/",
+    "/.local/share/fonts/",
+    "/.local/share/mime/",
+    "/.local/share/flatpak/app/",
+    "/.local/share/flatpak/runtime/",
+    "/.local/share/flatpak/exports/",
+    "/.config/autostart/",
+    "/.config/systemd/",
+    "/.themes/",
+    "/.icons/",
+    "/.fonts/",
+    "/.cache/fontconfig/",
+)
+
+BROWSER_PROFILE_SUBSTRINGS = (
+    "/.mozilla/firefox/",
+    "/.config/google-chrome/",
+    "/.config/chromium/",
+    "/.config/bravesoftware/",
+    "/.config/microsoft-edge/",
+    "/.config/vivaldi/",
+    "/.config/opera/",
+)
+
+USER_APP_SUBSTRINGS = (
+    "/.config/discord/",
+    "/.config/vesktop/",
+    "/.config/obs-studio/",
+    "/.config/code/",
+    "/.config/vscode/",
+    "/.config/slack/",
+    "/.config/teams/",
+)
+
+ELECTRON_APP_SUBSTRINGS = (
+    "/discord/",
+    "/vesktop/",
+    "/resources/app/",
+    "/resources/app.asar",
+)
+
+STEAM_SUBSTRINGS = (
+    "/.steam/",
+    "/.local/share/steam/",
+    "/.var/app/com.valvesoftware.steam/",
+    "/steamapps/",
+    "/proton",
+    "/steam-runtime",
+    "/steamlinuxruntime",
+)
+
+VR_RUNTIME_SUBSTRINGS = (
+    "/openvr",
+    "/steamvr",
+    "/wivrn",
+    "/wayvr",
+    "/monado",
+    "/vrchat",
+    "/alvr",
+    "/xrizer",
+    "/openhmd",
+)
+
+SHADER_CACHE_SUBSTRINGS = (
+    "/mesa_shader_cache/",
+    "/steamapps/shadercache/",
+    "/shadercache/",
+    "/glcache/",
+    "/.nv/glcache/",
+    "/.cache/nvidia/",
+    "/.cache/mesa_shader_cache/",
+    "/dxvk_state_cache",
+    "/vkd3d",
+)
+
+HARD_COLD_PREFIXES = (
+    "/usr/share/doc",
+    "/usr/share/man",
+    "/usr/share/help",
+    "/usr/share/gtk-doc",
+    "/usr/share/licenses",
+    "/usr/src",
+    "/var/log",
+    "/var/crash",
+    "/var/lib/systemd/coredump",
+    "/var/lib/docker",
+    "/var/lib/containers",
+    "/var/lib/libvirt",
+    "/var/lib/flatpak/repo",
+    "/var/lib/snapd/cache",
+    "/var/lib/snapd/snaps",
+)
+
+BROWSER_HTTP_CACHE_SUBSTRINGS = (
+    "/cache/cache_data/",
+    "/cache2/entries/",
+    "/code cache/",
+    "/service worker/cachestorage/",
+    "/application cache/",
+    "/gpucache/",
+    "/grshadercache/",
+)
+
+PRUNE_DIR_SUBSTRINGS = (
+    "/.local/share/trash/",
+    "/.trash/",
+    "/.git/",
+    "/.svn/",
+    "/.hg/",
+    "/cmakefiles/",
+    "/target/debug/",
+    "/target/release/",
+)
+
+MEDIA_SUFFIXES = (
+    ".mp4", ".m4v", ".mkv", ".mov", ".webm", ".avi", ".flv", ".wmv",
+    ".mp3", ".flac", ".wav", ".ogg", ".opus", ".m4a", ".aac",
+    ".jpg", ".jpeg", ".heic", ".heif", ".raw", ".cr2", ".nef", ".arw",
+)
+
+ARCHIVE_SUFFIXES = (
+    ".zip", ".7z", ".rar", ".tar", ".tgz", ".tar.gz", ".tar.xz",
+    ".tar.zst", ".gz", ".xz", ".zst", ".bz2",
+)
+
+PACKAGE_IMAGE_SUFFIXES = (
+    ".deb", ".rpm", ".snap", ".flatpak", ".iso", ".img", ".qcow2",
+    ".vdi", ".vmdk", ".ova",
+)
+
+DOCUMENT_SUFFIXES = (
+    ".pdf", ".epub", ".mobi", ".azw", ".azw3", ".cbz", ".cbr",
+    ".doc", ".docx", ".odt", ".rtf", ".ppt", ".pptx", ".xls", ".xlsx",
+)
+
+GAME_ASSET_SUFFIXES = (
+    ".pak", ".vpk", ".ucas", ".utoc", ".bundle", ".rpak", ".forge",
+    ".bsa", ".ba2", ".wad", ".pk3", ".iwd", ".wem", ".bnk",
+)
+
+CONFIG_SUFFIXES = (
+    ".conf", ".cfg", ".ini", ".json", ".toml", ".yaml", ".yml",
+    ".xml", ".desktop", ".service", ".socket", ".target", ".timer",
+    ".mount", ".automount", ".path", ".rules", ".policy", ".theme",
+    ".index", ".list", ".vdf", ".acf", ".manifest",
+)
+
+RUNTIME_SUFFIXES = (
+    ".so", ".dll", ".exe", ".bin", ".appimage", ".node", ".jar",
+    ".py", ".pyc", ".pyo", ".qml", ".js", ".mjs", ".cjs", ".lua",
+    ".rb", ".pl", ".pm", ".class",
+)
+
+FONT_SUFFIXES = (
+    ".ttf", ".otf", ".ttc", ".woff", ".woff2", ".pcf", ".pfb",
+)
+
+ICON_SUFFIXES = (
+    ".svg", ".svgz", ".png", ".xpm", ".ico",
+)
+
+SHADER_SUFFIXES = (
+    ".spv", ".cache", ".foz", ".toc",
+)
+
+HOT_SPECIAL_NAMES = {
+    "ld.so.cache",
+    "locale-archive",
+    "gschemas.compiled",
+    "mime.cache",
+    "mimeinfo.cache",
+    "icon-theme.cache",
+    "index.theme",
+    "recently-used.xbel",
+    "mimeapps.list",
+    "monitors.xml",
+    "user-dirs.dirs",
+    "user-dirs.locale",
+}
+
+BROWSER_STARTUP_NAMES = {
+    "prefs.js",
+    "sessionstore.jsonlz4",
+    "extensions.json",
+    "addons.json",
+    "compatibility.ini",
+    "profiles.ini",
+    "places.sqlite",
+    "favicons.sqlite",
+    "permissions.sqlite",
+    "cookies.sqlite",
+    "storage.sqlite",
+}
+
+STEAM_STARTUP_NAMES = {
+    "libraryfolders.vdf",
+    "config.vdf",
+    "loginusers.vdf",
+    "shortcuts.vdf",
+    "localconfig.vdf",
+    "system.reg",
+    "user.reg",
+    "userdef.reg",
+}
+
+ELECTRON_RUNTIME_NAMES = {
+    "app.asar",
+    "omni.ja",
+    "icudtl.dat",
+    "resources.pak",
+    "snapshot_blob.bin",
+    "v8_context_snapshot.bin",
+    "chrome_100_percent.pak",
+    "chrome_200_percent.pak",
+}
+
+
+def file_is_executable(rec: FileRec) -> bool:
+    return bool(rec.mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+
+
+def is_shared_library_name(name: str) -> bool:
+    return name.endswith(".so") or ".so." in name
+
+
+def is_browser_profile_path(path: str) -> bool:
+    return path_contains_any(path, BROWSER_PROFILE_SUBSTRINGS)
+
+
+def is_browser_http_cache_path(path: str) -> bool:
+    return path_contains_any(path, BROWSER_HTTP_CACHE_SUBSTRINGS)
+
+
+def is_steam_path(path: str) -> bool:
+    return path_contains_any(path, STEAM_SUBSTRINGS)
+
+
+def is_vr_path(path: str) -> bool:
+    return path_contains_any(path, VR_RUNTIME_SUBSTRINGS)
+
+
+def is_shader_cache_path(path: str) -> bool:
+    return path_contains_any(path, SHADER_CACHE_SUBSTRINGS)
+
+
+def is_app_runtime_path(path: str) -> bool:
+    return (
+        path_has_prefix(path, APP_RUNTIME_PREFIXES)
+        or path_has_prefix(path, BROWSER_RUNTIME_PREFIXES)
+        or path_contains_any(path, ELECTRON_APP_SUBSTRINGS)
+        or is_steam_path(path)
+        or is_vr_path(path)
+    )
+
+
+def should_prune_dir(path: str) -> bool:
+    p = os.path.normpath(path).lower()
+
+    if path_has_prefix(p, HARD_COLD_PREFIXES):
+        return True
+
+    if is_browser_http_cache_path(p) and not is_shader_cache_path(p):
+        return True
+
+    if path_contains_any(p, PRUNE_DIR_SUBSTRINGS):
+        return True
+
+    # Do not scan arbitrary project dependency forests, but keep packaged
+    # Electron app runtime node_modules because those can be part of app launch.
+    if "/node_modules/" in p and "/resources/app/node_modules/" not in p:
+        return True
+
+    return False
+
+
+def is_hard_cold_file(path: str, name: str, size: int) -> bool:
+    if path_has_prefix(path, HARD_COLD_PREFIXES):
+        return True
+
+    if is_browser_http_cache_path(path) and not is_shader_cache_path(path):
+        return True
+
+    if name.endswith(MEDIA_SUFFIXES):
+        return True
+
+    if name.endswith(PACKAGE_IMAGE_SUFFIXES):
+        return True
+
+    if name.endswith(DOCUMENT_SUFFIXES):
+        return True
+
+    if name.endswith(ARCHIVE_SUFFIXES) and not is_app_runtime_path(path):
+        return True
+
+    # General preemptive cache should not spend locked RAM on huge opaque game
+    # asset packs. Runtime files around the game are better default targets.
+    if size > 64 * MIB and name.endswith(GAME_ASSET_SUFFIXES):
+        return True
+
+    return False
+
+
+def classify_file(rec: FileRec) -> tuple[int, int, int]:
+    path = os.path.normpath(rec.path).lower()
+    name = os.path.basename(path)
+    size = rec.size
+
+    if is_hard_cold_file(path, name, size):
+        return (99, 0, 0)
+
+    executable = file_is_executable(rec)
+    shared_lib = is_shared_library_name(name)
+
+    # Tier 0: core OS/runtime foundation. These help almost everything:
+    # terminal, browser, Steam, OBS, desktop shell, system tools, Proton startup.
+    if (
+        path_has_prefix(path, HOT_SYSTEM_PREFIXES)
+        and (
+            shared_lib
+            or executable
+            or name in HOT_SPECIAL_NAMES
+            or name.endswith(CONFIG_SUFFIXES)
+            or name.endswith(RUNTIME_SUFFIXES)
+        )
+    ):
+        confidence = 900
+        if shared_lib:
+            confidence += 220
+        if executable:
+            confidence += 180
+        if name in HOT_SPECIAL_NAMES:
+            confidence += 260
+        if path_contains_any(path, GRAPHICS_AUDIO_RUNTIME_SUBSTRINGS):
+            confidence += 120
+        return (0, confidence, 0)
+
+    # Tier 1: installed app runtimes: browsers, Flatpak/Snap apps, /opt apps,
+    # Electron apps, AppImages, Discord-like apps.
+    if (
+        is_app_runtime_path(path)
+        and (
+            shared_lib
+            or executable
+            or name.endswith(RUNTIME_SUFFIXES)
+            or name in ELECTRON_RUNTIME_NAMES
+            or name.endswith(CONFIG_SUFFIXES)
+        )
+    ):
+        confidence = 820
+        if path_has_prefix(path, BROWSER_RUNTIME_PREFIXES):
+            confidence += 180
+        if name in ELECTRON_RUNTIME_NAMES:
+            confidence += 140
+        if shared_lib or executable:
+            confidence += 140
+        return (1, confidence, 0)
+
+    # Tier 2: Steam, Proton, Wine, games, VR launch support. This targets the
+    # launch path, not giant asset packs.
+    if (
+        is_steam_path(path)
+        or is_vr_path(path)
+        or is_shader_cache_path(path)
+    ):
+        if name.startswith("appmanifest_") and name.endswith(".acf"):
+            return (2, 980, 0)
+
+        if name in STEAM_STARTUP_NAMES:
+            return (2, 940, 0)
+
+        if shared_lib or executable or name.endswith((".dll", ".exe")):
+            return (2, 900, 0)
+
+        if name.endswith(CONFIG_SUFFIXES):
+            return (2, 820, 0)
+
+        if is_shader_cache_path(path) and name.endswith(SHADER_SUFFIXES) and size <= 256 * MIB:
+            return (2, 720, 0)
+
+        if size <= 16 * MIB:
+            return (2, 520, 0)
+
+        return (5, 120, 0)
+
+    # Tier 3: high-confidence desktop support. Useful, but deliberately below
+    # real binaries/libs/runtimes.
+    if (
+        path_has_prefix(path, DESKTOP_SUPPORT_PREFIXES)
+        or path_contains_any(path, HOT_USER_SUBSTRINGS)
+        or name in HOT_SPECIAL_NAMES
+        or name.endswith(FONT_SUFFIXES)
+        or name.endswith(ICON_SUFFIXES)
+        or name.endswith(".desktop")
+    ):
+        confidence = 650
+        if name in HOT_SPECIAL_NAMES:
+            confidence += 220
+        if name.endswith(FONT_SUFFIXES):
+            confidence += 180
+        if name.endswith(".desktop"):
+            confidence += 160
+        if name.endswith(ICON_SUFFIXES):
+            confidence += 80
+        if name.endswith(CONFIG_SUFFIXES):
+            confidence += 80
+        return (3, confidence, 0)
+
+    # Tier 4: browser/user-app profile startup state. Cache configs and startup
+    # DBs, not random HTTP cache blobs.
+    if is_browser_profile_path(path) or path_contains_any(path, USER_APP_SUBSTRINGS):
+        if name in BROWSER_STARTUP_NAMES:
+            return (4, 780, 0)
+
+        if name.endswith((".sqlite", ".sqlite3", ".db")) and size <= 256 * MIB:
+            return (4, 650, 0)
+
+        if name.endswith(CONFIG_SUFFIXES) or name.endswith(RUNTIME_SUFFIXES):
+            return (4, 600, 0)
+
+        if size <= 4 * MIB:
+            return (4, 420, 0)
+
+        return (5, 100, 0)
+
+    # Tier 5: fallback. This is intentionally the old behavior: after genuinely
+    # useful candidates, fill remaining RAM with smallest safe files.
+    return (5, 0, 0)
+
+
+def fallback_size_rank(size: int) -> int:
+    if size <= 4 * KIB:
+        return 0
+    if size <= 16 * KIB:
+        return 1
+    if size <= 64 * KIB:
+        return 2
+    if size <= 256 * KIB:
+        return 3
+    if size <= 1 * MIB:
+        return 4
+    if size <= 4 * MIB:
+        return 5
+    if size <= 16 * MIB:
+        return 6
+    if size <= 64 * MIB:
+        return 7
+    if size <= 256 * MIB:
+        return 8
+    if size <= 1 * GIB:
+        return 9
+    return 10
+
+
 def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
-    include_paths = [os.path.normpath(p) for p in cfg["include_paths"]]
+    include_paths = build_include_paths(cfg)
     excludes = [os.path.normpath(p) for p in cfg["exclude_prefixes"]]
     seen_realpaths: set[str] = set()
     files: list[FileRec] = []
     steps = 0
 
     for root in include_paths:
+        if path_is_excluded(root, excludes):
+            continue
+
         try:
             root_dev = os.stat(root).st_dev
         except OSError:
             continue
+
+        stay_on_this_filesystem = (
+            cfg.get("stay_on_filesystem", True)
+            and not root_allows_cross_filesystem(root, cfg)
+        )
 
         for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
             steps += 1
@@ -204,24 +960,31 @@ def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
 
             dirpath = os.path.normpath(dirpath)
 
-            if path_is_excluded(dirpath, excludes):
+            if path_is_excluded(dirpath, excludes) or should_prune_dir(dirpath):
                 dirnames[:] = []
                 continue
 
             kept_dirs: list[str] = []
             for d in dirnames:
                 full = os.path.normpath(os.path.join(dirpath, d))
-                if path_is_excluded(full, excludes):
+                full_l = full.lower()
+
+                if path_is_excluded(full, excludes) or should_prune_dir(full_l):
                     continue
+
                 try:
                     st = os.lstat(full)
                 except OSError:
                     continue
+
                 if stat.S_ISLNK(st.st_mode):
                     continue
-                if cfg.get("stay_on_filesystem", True) and st.st_dev != root_dev:
+
+                if stay_on_this_filesystem and st.st_dev != root_dev:
                     continue
+
                 kept_dirs.append(d)
+
             dirnames[:] = kept_dirs
 
             for name in filenames:
@@ -236,26 +999,35 @@ def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
                 )
 
                 full = os.path.normpath(os.path.join(dirpath, name))
+
                 if path_is_excluded(full, excludes):
                     continue
+
                 try:
                     st = os.lstat(full)
                 except OSError:
                     continue
+
                 if not stat.S_ISREG(st.st_mode):
                     continue
-                if cfg.get("stay_on_filesystem", True) and st.st_dev != root_dev:
+
+                if stay_on_this_filesystem and st.st_dev != root_dev:
                     continue
+
                 size = st.st_size
                 if size <= 0:
                     continue
+
                 if max_file_size is not None and size > max_file_size:
                     continue
+
                 real = os.path.realpath(full)
                 if real in seen_realpaths:
                     continue
+
                 seen_realpaths.add(real)
-                files.append(FileRec(path=full, size=size, mtime=st.st_mtime))
+                files.append(FileRec(path=full, size=size, mtime=st.st_mtime, mode=st.st_mode))
+
     return files
 
 
@@ -275,7 +1047,44 @@ def maybe_cooldown(
 
 
 def build_selection_order(files: list[FileRec]) -> list[FileRec]:
-    return sorted(files, key=lambda r: (r.size, -r.mtime, r.path))
+    ranked: list[tuple[tuple[int, int, int, int, float, str], FileRec]] = []
+
+    for rec in files:
+        tier, confidence, _ = classify_file(rec)
+
+        if tier >= 99:
+            continue
+
+        # Priority tiers first. Inside each tier:
+        # - higher confidence wins
+        # - smaller files win
+        # - newer files win
+        #
+        # Tier 5 is the fallback and therefore behaves like the old algorithm:
+        # smallest files first, then newer files.
+        if tier == 5:
+            key = (
+                tier,
+                fallback_size_rank(rec.size),
+                rec.size,
+                0,
+                -rec.mtime,
+                rec.path,
+            )
+        else:
+            key = (
+                tier,
+                -confidence,
+                fallback_size_rank(rec.size),
+                rec.size,
+                -rec.mtime,
+                rec.path,
+            )
+
+        ranked.append((key, rec))
+
+    ranked.sort(key=lambda item: item[0])
+    return [rec for _, rec in ranked]
 
 
 def select_files(
@@ -285,6 +1094,35 @@ def select_files(
 ) -> list[FileRec]:
     if budget_bytes <= 0:
         return []
+
+    selected: list[FileRec] = []
+    total = 0
+    steps = 0
+
+    for rec in ordered:
+        steps += 1
+        maybe_cooldown(
+            steps,
+            cfg,
+            every_key="select_cooldown_every",
+            sleep_key="select_cooldown_seconds",
+            default_every=2048,
+            default_sleep=0.001,
+        )
+
+        # The list is now tier/priority sorted, not globally size-sorted.
+        # If one high-priority file does not fit, skip it and keep filling the
+        # budget with other useful files.
+        if total + rec.size > budget_bytes:
+            continue
+
+        selected.append(rec)
+        total += rec.size
+
+        if total >= budget_bytes:
+            break
+
+    return selected
 
     selected: list[FileRec] = []
     total = 0
@@ -418,7 +1256,7 @@ class Watcher:
     def _write_watch_list(self, cfg: dict) -> None:
         WATCH_LIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         lines = []
-        for p in cfg["include_paths"]:
+        for p in build_include_paths(cfg):
             lines.append(os.path.normpath(p))
         for p in cfg["exclude_prefixes"]:
             lines.append("@" + os.path.normpath(p))
@@ -695,7 +1533,7 @@ write_config_if_missing() {
   if [[ ! -f /etc/ramcache-controller/config.json ]]; then
     cat > /etc/ramcache-controller/config.json <<'JSON'
 {
-  "include_paths": ["/"],
+  "include_paths": ["/", "/home"],
   "exclude_prefixes": [
     "/proc",
     "/sys",
@@ -709,6 +1547,8 @@ write_config_if_missing() {
     "/swapfile"
   ],
   "stay_on_filesystem": true,
+  "auto_include_common_app_paths": true,
+  "cross_filesystem_include_roots": ["/snap"],
   "check_interval_seconds": 30,
   "dirty_rescan_interval_seconds": 1800,
   "full_rescan_interval_seconds": 86400,
