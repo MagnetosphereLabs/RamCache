@@ -320,7 +320,19 @@ def choose_target_bytes(meminfo: dict[str, int], cfg: dict) -> tuple[int, int, i
     working_used = total - available
 
     # Hard cap for total system RAM usage, including this cache.
-    max_total_used_ratio = float(cfg.get("max_total_used_ratio", 0.75))
+    # On smaller-memory systems, cap total RAM usage lower to avoid OOMs when
+    # user applications spike memory usage, especially on machines without swap.
+    configured_max_total_used_ratio = float(cfg.get("max_total_used_ratio", 0.75))
+    low_memory_total_threshold = parse_size(cfg.get("low_memory_total_threshold", "24G")) or (24 * GIB)
+    low_memory_max_total_used_ratio = float(cfg.get("low_memory_max_total_used_ratio", 0.50))
+
+    if total < low_memory_total_threshold:
+        max_total_used_ratio = min(
+            configured_max_total_used_ratio,
+            low_memory_max_total_used_ratio,
+        )
+    else:
+        max_total_used_ratio = configured_max_total_used_ratio
 
     # vmtouch -l uses mlock(), so Mlocked is the best approximation of
     # how much RAM is currently being held by this cache.
