@@ -841,6 +841,7 @@ def should_prune_dir(path: str) -> bool:
     return False
 
 
+
 def is_hard_cold_file(path: str, name: str, size: int) -> bool:
     if path_has_prefix(path, HARD_COLD_PREFIXES):
         return True
@@ -848,16 +849,23 @@ def is_hard_cold_file(path: str, name: str, size: int) -> bool:
     if is_browser_http_cache_path(path) and not is_shader_cache_path(path):
         return True
 
-    if name.endswith(MEDIA_SUFFIXES):
+    # These are early-priority cache targets, but they should not be
+    # hard-banned. On high-RAM desktops, after OS/app/runtime/Steam/desktop
+    # candidates are selected, they are valid late fallback files so the cache
+    # can actually use the available RAM instead of stopping early.
+    #
+    # Only reject huge cold blobs that are unlikely to help launch/system
+    # responsiveness and would make shrink chunks coarse.
+    if name.endswith(MEDIA_SUFFIXES) and size > 2 * GIB:
         return True
 
-    if name.endswith(PACKAGE_IMAGE_SUFFIXES):
+    if name.endswith(DOCUMENT_SUFFIXES) and size > 1 * GIB:
         return True
 
-    if name.endswith(DOCUMENT_SUFFIXES):
+    if name.endswith(PACKAGE_IMAGE_SUFFIXES) and size > 4 * GIB:
         return True
 
-    if name.endswith(ARCHIVE_SUFFIXES) and not is_app_runtime_path(path):
+    if name.endswith(ARCHIVE_SUFFIXES) and not is_app_runtime_path(path) and size > 4 * GIB:
         return True
 
     # Do not prioritize huge opaque game asset packs, but do not hard-ban
@@ -868,11 +876,10 @@ def is_hard_cold_file(path: str, name: str, size: int) -> bool:
 
     # Huge monolithic executables/blobs are usually bad.
     # Small/medium runtimes are the win.
-    if size > 512 * MIB and name.endswith((".appimage", ".bin")):
+    if size > 4 * GIB and name.endswith((".appimage", ".bin")):
         return True
 
     return False
-
 
 def classify_file(rec: FileRec) -> tuple[int, int, int]:
     path = os.path.normpath(rec.path).lower()
@@ -1827,7 +1834,7 @@ write_config() {
 
   cat > /etc/ramcache-controller/config.json <<'JSON'
 {
-  "include_paths": ["/"],
+  "include_paths": ["/", "/home"],
   "exclude_prefixes": [
     "/proc",
     "/sys",
