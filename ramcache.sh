@@ -1324,7 +1324,18 @@ def choose_target_bytes(
         #   next target: 42G + (21G - 5G) = 58G
         baseline = int(current_target_bytes) if current_target_bytes is not None else locked_now
         target = baseline + available - reserve_bytes
-        return max(0, min(int(target), total))
+
+        # This is a file-selection budget, not guaranteed real locked RAM.
+        # On large systems, selected logical file bytes can be much larger than
+        # the pages that actually become Mlocked. Capping this at MemTotal can
+        # strand lots of available RAM unused.
+        selection_budget_cap = parse_size(cfg.get("max_selection_budget_bytes"))
+        if selection_budget_cap is None:
+            selection_budget_cap = int(
+                total * float(cfg.get("max_selection_budget_total_ratio", 4.0))
+            )
+
+        return max(0, min(int(target), int(selection_budget_cap)))
 
     if current_target_bytes is None:
         # First run / dead vmtouch / unknown state: fill, but leave the normal
@@ -1368,17 +1379,12 @@ def target_change_is_meaningful(
     if desired_target_bytes < current_target_bytes:
         return True
 
-    # Grow slowly. This avoids churn when apps close, browser tabs fluctuate,
-    # or the system hovers near the upper watermark.
+    # Grow only after choose_target_bytes() says MemAvailable is above the
+    # upper watermark. Do not scale the grow deadband with total cache size:
+    # on 64G+ systems that strands multiple GiB unused. The absolute deadband
+    # is enough to prevent churn while still converging toward the 5G reserve.
     abs_deadband = parse_size(cfg.get("target_relock_min_delta", "512M")) or 0
-    rel_deadband = float(cfg.get("target_relock_min_delta_ratio", 0.03))
-
-    threshold = max(
-        abs_deadband,
-        int(max(current_target_bytes, desired_target_bytes) * rel_deadband),
-    )
-
-    return abs(desired_target_bytes - current_target_bytes) >= threshold
+    return desired_target_bytes - current_target_bytes >= abs_deadband
 
 def stop_proc(proc) -> None:
     if proc is None:
@@ -1869,6 +1875,7 @@ write_config() {
   "target_grow_to_available_bytes": "5G",
   "vmtouch_chunk_target_bytes": "256M",
   "vmtouch_chunk_max_paths": 4096,
+  "max_selection_budget_total_ratio": 4.0,
 
   "target_relock_min_delta": "1G",
   "target_relock_min_delta_ratio": 0.07,
