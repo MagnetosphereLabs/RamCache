@@ -860,9 +860,10 @@ def is_hard_cold_file(path: str, name: str, size: int) -> bool:
     if name.endswith(ARCHIVE_SUFFIXES) and not is_app_runtime_path(path):
         return True
 
-    # General preemptive cache should not spend locked RAM on huge opaque game
-    # asset packs. Runtime files around the game are better default targets.
-    if size > 64 * MIB and name.endswith(GAME_ASSET_SUFFIXES):
+    # Do not prioritize huge opaque game asset packs, but do not hard-ban
+    # normal-sized ones either. On high-RAM desktops, these are valid late
+    # fallback candidates after OS/app/runtime files have already been chosen.
+    if size > 16 * GIB and name.endswith(GAME_ASSET_SUFFIXES):
         return True
 
     # Huge monolithic executables/blobs are usually bad.
@@ -1862,7 +1863,7 @@ write_config() {
   "memlock_limit_reserve": "1G",
   "memlock_limit_min": "1G",
 
-  "vmtouch_max_file_size_ratio": 0.50,
+  "vmtouch_max_file_size": "128G",
   "vmtouch_feed_pause_seconds": 0,
   "vmtouch_feed_target_extra_seconds": 0
 }
