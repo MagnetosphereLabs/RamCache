@@ -240,25 +240,29 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
 
     paths: list[str] = []
 
+    def add(path: Path) -> None:
+        found = existing_dir(path)
+        if found is not None:
+            paths.append(found)
+
+    # System app/runtime roots. These are where installed app runtimes, Flatpaks, Snaps, /opt apps, and local apps live.
     for p in (
-        Path("/home"),
         Path("/opt"),
-        Path("/usr/local"),
+        Path("/usr/local/bin"),
+        Path("/usr/local/lib"),
+        Path("/usr/local/libexec"),
         Path("/snap"),
         Path("/var/lib/flatpak/app"),
         Path("/var/lib/flatpak/runtime"),
         Path("/var/lib/flatpak/exports"),
         Path("/var/lib/snapd/desktop"),
     ):
-        found = existing_dir(p)
-        if found is not None:
-            paths.append(found)
+        add(p)
 
     for home in iter_home_dirs():
+        # User app/runtime roots. Deliberately avoid broad "cache all of home".
         for p in (
-            home / ".config",
             home / ".local/bin",
-            home / ".local/share",
             home / ".local/share/applications",
             home / ".local/share/icons",
             home / ".local/share/fonts",
@@ -266,35 +270,92 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
             home / ".local/share/flatpak/app",
             home / ".local/share/flatpak/runtime",
             home / ".local/share/flatpak/exports",
+
+            # Browser profile startup state.
+            home / ".mozilla/firefox",
+            home / ".config/google-chrome",
+            home / ".config/chromium",
+            home / ".config/BraveSoftware",
+            home / ".config/bravesoftware",
+            home / ".config/vivaldi",
+            home / ".config/opera",
+
+            # Common Electron / desktop apps.
+            home / ".config/discord",
+            home / ".config/Discord",
+            home / ".config/vesktop",
+            home / ".config/Vesktop",
+            home / ".config/obs-studio",
+            home / ".config/Code",
+            home / ".config/code",
+            home / ".config/VSCodium",
+            home / ".config/vscodium",
+
+            # COSMIC / Pop desktop app state.
+            home / ".config/cosmic",
+            home / ".config/com.system76.CosmicSettings",
+            home / ".config/com.system76.CosmicFiles",
+
+            # High-value caches, not general browser HTTP cache.
             home / ".cache/fontconfig",
             home / ".cache/mesa_shader_cache",
             home / ".cache/nvidia",
+
+            # Native Steam layouts seen on Debian/Ubuntu/Pop and common Steam symlinks.
             home / ".steam/root",
+            home / ".steam/steam",
+            home / ".steam/debian-installation",
             home / ".local/share/Steam",
+
+            # Flatpak Steam layout.
             home / ".var/app/com.valvesoftware.Steam",
+            home / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
         ):
-            found = existing_dir(p)
-            if found is not None:
-                paths.append(found)
+            add(p)
+
+        steam_roots = (
+            home / ".steam/root",
+            home / ".steam/steam",
+            home / ".steam/debian-installation",
+            home / ".local/share/Steam",
+            home / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+        )
+
+        for steam_root in steam_roots:
+            for p in (
+                steam_root / "appcache",
+                steam_root / "config",
+                steam_root / "package",
+                steam_root / "public",
+                steam_root / "resource",
+                steam_root / "ubuntu12_32",
+                steam_root / "ubuntu12_64",
+                steam_root / "compatibilitytools.d",
+                steam_root / "steamapps",
+                steam_root / "steamapps/common",
+                steam_root / "steamapps/shadercache",
+                steam_root / "steamapps/compatdata",
+            ):
+                add(p)
 
         steam_vdfs = (
             home / ".steam/root/steamapps/libraryfolders.vdf",
+            home / ".steam/steam/steamapps/libraryfolders.vdf",
+            home / ".steam/debian-installation/steamapps/libraryfolders.vdf",
             home / ".local/share/Steam/steamapps/libraryfolders.vdf",
             home / ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/libraryfolders.vdf",
         )
 
         for vdf in steam_vdfs:
             for library in parse_steam_libraryfolders_vdf(vdf):
+                library_path = Path(library)
                 for p in (
-                    Path(library),
-                    Path(library) / "steamapps",
-                    Path(library) / "steamapps/common",
-                    Path(library) / "steamapps/shadercache",
-                    Path(library) / "steamapps/compatdata",
+                    library_path / "steamapps",
+                    library_path / "steamapps/common",
+                    library_path / "steamapps/shadercache",
+                    library_path / "steamapps/compatdata",
                 ):
-                    found = existing_dir(p)
-                    if found is not None:
-                        paths.append(found)
+                    add(p)
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -503,8 +564,12 @@ USER_APP_SUBSTRINGS = (
     "/.config/obs-studio/",
     "/.config/code/",
     "/.config/vscode/",
+    "/.config/vscodium/",
     "/.config/slack/",
-    "/.config/teams/",
+    "/.config/teams-for-linux/",
+    "/.config/cosmic/",
+    "/.config/com.system76.cosmicsettings/",
+    "/.config/com.system76.cosmicfiles/",
 )
 
 ELECTRON_APP_SUBSTRINGS = (
@@ -512,16 +577,44 @@ ELECTRON_APP_SUBSTRINGS = (
     "/vesktop/",
     "/resources/app/",
     "/resources/app.asar",
+    "/app.asar",
 )
 
 STEAM_SUBSTRINGS = (
-    "/.steam/",
+    "/.steam/root/",
+    "/.steam/steam/",
+    "/.steam/debian-installation/",
     "/.local/share/steam/",
     "/.var/app/com.valvesoftware.steam/",
     "/steamapps/",
+    "/compatibilitytools.d/",
     "/proton",
     "/steam-runtime",
     "/steamlinuxruntime",
+)
+
+STEAM_FAST_SUBSTRINGS = (
+    "/appcache/",
+    "/config/",
+    "/package/",
+    "/public/",
+    "/resource/",
+    "/ubuntu12_32/",
+    "/ubuntu12_64/",
+    "/compatibilitytools.d/",
+    "/steamapps/compatdata/",
+    "/steamapps/shadercache/",
+    "/steamapps/common/proton",
+    "/steamapps/common/steamlinuxruntime",
+    "/steamapps/common/steam linux runtime",
+    "/steamapps/common/steamworks shared",
+)
+
+COSMIC_SUBSTRINGS = (
+    "/cosmic",
+    "/com.system76.cosmic",
+    "/pop-cosmic",
+    "/start-cosmic",
 )
 
 VR_RUNTIME_SUBSTRINGS = (
@@ -723,8 +816,6 @@ def is_app_runtime_path(path: str) -> bool:
         path_has_prefix(path, APP_RUNTIME_PREFIXES)
         or path_has_prefix(path, BROWSER_RUNTIME_PREFIXES)
         or path_contains_any(path, ELECTRON_APP_SUBSTRINGS)
-        or is_steam_path(path)
-        or is_vr_path(path)
     )
 
 
@@ -772,6 +863,11 @@ def is_hard_cold_file(path: str, name: str, size: int) -> bool:
     if size > 64 * MIB and name.endswith(GAME_ASSET_SUFFIXES):
         return True
 
+    # Huge monolithic executables/blobs are usually bad.
+    # Small/medium runtimes are the win.
+    if size > 512 * MIB and name.endswith((".appimage", ".bin")):
+        return True
+
     return False
 
 
@@ -785,9 +881,16 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
 
     executable = file_is_executable(rec)
     shared_lib = is_shared_library_name(name)
+    steam = is_steam_path(path)
+    vr = is_vr_path(path)
+    shader = is_shader_cache_path(path)
+    browser_profile = is_browser_profile_path(path)
+    user_app = path_contains_any(path, USER_APP_SUBSTRINGS)
+    cosmic = path_contains_any(path, COSMIC_SUBSTRINGS)
 
-    # Tier 0: core OS/runtime foundation. These help almost everything:
-    # terminal, browser, Steam, OBS, desktop shell, system tools, Proton startup.
+    # Tier 0: core OS/runtime foundation. Keep the proven wins:
+    # dynamic linker, system shared libs, core binaries, graphics/audio libs,
+    # GTK/Qt/PipeWire/ALSA/Vulkan/Mesa, etc.
     if (
         path_has_prefix(path, HOT_SYSTEM_PREFIXES)
         and (
@@ -800,17 +903,58 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     ):
         confidence = 900
         if shared_lib:
-            confidence += 220
+            confidence += 240
         if executable:
-            confidence += 180
+            confidence += 200
         if name in HOT_SPECIAL_NAMES:
             confidence += 260
         if path_contains_any(path, GRAPHICS_AUDIO_RUNTIME_SUBSTRINGS):
-            confidence += 120
+            confidence += 160
+        if "/obs-" in path or "/obs/" in path or "/obs-plugins/" in path:
+            confidence += 240
+        if cosmic:
+            confidence += 180
         return (0, confidence, 0)
 
-    # Tier 1: installed app runtimes: browsers, Flatpak/Snap apps, /opt apps,
-    # Electron apps, AppImages, Discord-like apps.
+    # Tier 1: Steam / Proton / Wine / game / VR launch path.
+    # This must happen before generic app-runtime classification.
+    if steam or vr or shader:
+        if name.startswith("appmanifest_") and name.endswith(".acf"):
+            return (1, 1250, 0)
+
+        if name in STEAM_STARTUP_NAMES:
+            return (1, 1220, 0)
+
+        if path_contains_any(path, STEAM_FAST_SUBSTRINGS):
+            confidence = 980
+            if shared_lib or executable or name.endswith((".dll", ".exe")):
+                confidence += 240
+            if name.endswith(CONFIG_SUFFIXES):
+                confidence += 180
+            if name in ELECTRON_RUNTIME_NAMES:
+                confidence += 160
+            if name in {"steamwebhelper", "steam", "steam.sh", "proton", "toolmanifest.vdf", "version"}:
+                confidence += 220
+            return (1, confidence, 0)
+
+        # Game launch support: prefer executables, config, manifests.
+        # Do not spend early RAM on giant opaque game asset packs.
+        if shared_lib or executable or name.endswith((".dll", ".exe")):
+            return (1, 930, 0)
+
+        if name.endswith(CONFIG_SUFFIXES):
+            return (1, 850, 0)
+
+        if shader and name.endswith(SHADER_SUFFIXES) and size <= 256 * MIB:
+            return (1, 760, 0)
+
+        if size <= 8 * MIB:
+            return (2, 520, 0)
+
+        return (5, 120, 0)
+
+    # Tier 2: installed app runtimes: browsers, Flatpak/Snap apps, /opt apps,
+    # Electron apps, AppImages, Discord/Vesktop-like apps.
     if (
         is_app_runtime_path(path)
         and (
@@ -823,42 +967,38 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     ):
         confidence = 820
         if path_has_prefix(path, BROWSER_RUNTIME_PREFIXES):
-            confidence += 180
+            confidence += 220
+        if path_contains_any(path, ELECTRON_APP_SUBSTRINGS):
+            confidence += 220
         if name in ELECTRON_RUNTIME_NAMES:
-            confidence += 140
+            confidence += 200
         if shared_lib or executable:
-            confidence += 140
-        return (1, confidence, 0)
+            confidence += 160
+        return (2, confidence, 0)
 
-    # Tier 2: Steam, Proton, Wine, games, VR launch support. This targets the
-    # launch path, not giant asset packs.
-    if (
-        is_steam_path(path)
-        or is_vr_path(path)
-        or is_shader_cache_path(path)
-    ):
-        if name.startswith("appmanifest_") and name.endswith(".acf"):
-            return (2, 980, 0)
+    # Tier 3: browser, Vesktop/Discord, OBS, COSMIC, VS Code, Slack user startup state.
+    # Cache configs and startup DBs, not random HTTP cache blobs.
+    if browser_profile or user_app or cosmic:
+        if name in BROWSER_STARTUP_NAMES:
+            return (3, 900, 0)
 
-        if name in STEAM_STARTUP_NAMES:
-            return (2, 940, 0)
+        if name in ELECTRON_RUNTIME_NAMES:
+            return (3, 880, 0)
 
-        if shared_lib or executable or name.endswith((".dll", ".exe")):
-            return (2, 900, 0)
+        if name.endswith((".sqlite", ".sqlite3", ".db")) and size <= 256 * MIB:
+            return (3, 780, 0)
 
-        if name.endswith(CONFIG_SUFFIXES):
-            return (2, 820, 0)
+        if name.endswith(CONFIG_SUFFIXES) or name.endswith(RUNTIME_SUFFIXES):
+            return (3, 720, 0)
 
-        if is_shader_cache_path(path) and name.endswith(SHADER_SUFFIXES) and size <= 256 * MIB:
-            return (2, 720, 0)
+        if size <= 4 * MIB:
+            return (3, 500, 0)
 
-        if size <= 16 * MIB:
-            return (2, 520, 0)
+        return (5, 100, 0)
 
-        return (5, 120, 0)
-
-    # Tier 3: high-confidence desktop support. Useful, but deliberately below
-    # real binaries/libs/runtimes.
+    # Tier 4: desktop support. Useful for app menus, fonts, icons, file picker,
+    # MIME associations, settings apps, and desktop shell startup, but below
+    # real binaries/libs/app runtimes.
     if (
         path_has_prefix(path, DESKTOP_SUPPORT_PREFIXES)
         or path_contains_any(path, HOT_USER_SUBSTRINGS)
@@ -869,7 +1009,7 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     ):
         confidence = 650
         if name in HOT_SPECIAL_NAMES:
-            confidence += 220
+            confidence += 240
         if name.endswith(FONT_SUFFIXES):
             confidence += 180
         if name.endswith(".desktop"):
@@ -878,27 +1018,10 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
             confidence += 80
         if name.endswith(CONFIG_SUFFIXES):
             confidence += 80
-        return (3, confidence, 0)
+        return (4, confidence, 0)
 
-    # Tier 4: browser/user-app profile startup state. Cache configs and startup
-    # DBs, not random HTTP cache blobs.
-    if is_browser_profile_path(path) or path_contains_any(path, USER_APP_SUBSTRINGS):
-        if name in BROWSER_STARTUP_NAMES:
-            return (4, 780, 0)
-
-        if name.endswith((".sqlite", ".sqlite3", ".db")) and size <= 256 * MIB:
-            return (4, 650, 0)
-
-        if name.endswith(CONFIG_SUFFIXES) or name.endswith(RUNTIME_SUFFIXES):
-            return (4, 600, 0)
-
-        if size <= 4 * MIB:
-            return (4, 420, 0)
-
-        return (5, 100, 0)
-
-    # Tier 5: fallback. This is intentionally the old behavior: after genuinely
-    # useful candidates, fill remaining RAM with smallest safe files.
+    # Tier 5: fallback. After high-confidence launch/runtime files, fill remaining RAM with
+    # smallest safe files first.
     return (5, 0, 0)
 
 
@@ -1121,29 +1244,6 @@ def select_files(
 
         if total >= budget_bytes:
             break
-
-    return selected
-
-    selected: list[FileRec] = []
-    total = 0
-    steps = 0
-
-    for rec in ordered:
-        steps += 1
-        maybe_cooldown(
-            steps,
-            cfg,
-            every_key="select_cooldown_every",
-            sleep_key="select_cooldown_seconds",
-            default_every=2048,
-            default_sleep=0.001,
-        )
-
-        if total + rec.size > budget_bytes:
-            break  # ascending by size, so nothing later will fit either
-
-        selected.append(rec)
-        total += rec.size
 
     return selected
 
@@ -1533,7 +1633,7 @@ write_config_if_missing() {
   if [[ ! -f /etc/ramcache-controller/config.json ]]; then
     cat > /etc/ramcache-controller/config.json <<'JSON'
 {
-  "include_paths": ["/", "/home"],
+  "include_paths": ["/"],
   "exclude_prefixes": [
     "/proc",
     "/sys",
