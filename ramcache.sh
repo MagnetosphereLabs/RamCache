@@ -1929,17 +1929,28 @@ install_all() {
 
 uninstall_all() {
   need_root
-  systemctl disable --now ramcache-controller.service || true
+
+  systemctl stop ramcache-controller.service || true
+  systemctl kill ramcache-controller.service --kill-who=all || true
+  systemctl disable ramcache-controller.service || true
+
   rm -f /etc/systemd/system/ramcache-controller.service
   rm -rf /opt/ramcache-controller
   rm -rf /etc/ramcache-controller
+  rm -rf /run/ramcache-controller
   rm -f /etc/sysctl.d/99-ramcache-inotify.conf
+
   systemctl daemon-reload
+  systemctl reset-failed ramcache-controller.service || true
   sysctl --system >/dev/null || true
 
   echo
   echo "Removed ramcache-controller."
-  echo "Note: /etc/sysctl.d/99-cache-aggressive.conf was left alone."
+  echo "Removed:"
+  echo "  /etc/ramcache-controller"
+  echo "  /opt/ramcache-controller"
+  echo "  /run/ramcache-controller"
+  echo "  /etc/systemd/system/ramcache-controller.service"
 }
 
 status_all() {
