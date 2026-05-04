@@ -1197,8 +1197,8 @@ def build_selection_order(files: list[FileRec]) -> list[FileRec]:
         else:
             key = (
                 tier,
-                -confidence,
                 fallback_size_rank(rec.size),
+                -confidence,
                 rec.size,
                 -rec.mtime,
                 rec.path,
@@ -1252,40 +1252,80 @@ def bytes_to_gib(n: int) -> float:
     return round(n / GIB, 2)
 
 
-def choose_target_bytes(meminfo: dict[str, int], cfg: dict) -> tuple[int, int, int]:
+def choose_target_bytes(
+    meminfo: dict[str, int],
+    cfg: dict,
+    current_target_bytes: Optional[int],
+) -> tuple[int, int, int]:
     total = meminfo["MemTotal"]
     available = meminfo["MemAvailable"]
     working_used = total - available
-
-    # Hard cap for total system RAM usage, including this cache.
-    # On smaller-memory systems, cap total RAM usage lower to avoid OOMs when
-    # user applications spike memory usage, especially on machines without swap.
-    configured_max_total_used_ratio = float(cfg.get("max_total_used_ratio", 0.75))
-    low_memory_total_threshold = parse_size(cfg.get("low_memory_total_threshold", "24G")) or (24 * GIB)
-    low_memory_max_total_used_ratio = float(cfg.get("low_memory_max_total_used_ratio", 0.50))
-
-    if total < low_memory_total_threshold:
-        max_total_used_ratio = min(
-            configured_max_total_used_ratio,
-            low_memory_max_total_used_ratio,
-        )
-    else:
-        max_total_used_ratio = configured_max_total_used_ratio
 
     # vmtouch -l uses mlock(), so Mlocked is the best approximation of
     # how much RAM is currently being held by this cache.
     locked_now = int(meminfo.get("Mlocked", 0))
 
-    # Estimate everything except our locked cache.
-    non_cache_used = max(0, working_used - locked_now)
+    # Hysteresis watermarks:
+    #
+    # - target_available_bytes is the hard floor. If MemAvailable falls below
+    #   this, shrink immediately.
+    #
+    # - target_shrink_to_available_bytes is where shrinking aims. This gives
+    #   breathing room so the machine does not hover right at the hard floor.
+    #
+    # - target_grow_above_available_bytes is the upper watermark. The cache only
+    #   grows again after MemAvailable clearly rises above this.
+    #
+    # - target_grow_to_available_bytes is where growth aims. Usually this should
+    #   match target_shrink_to_available_bytes.
+    floor_available = parse_size(cfg.get("target_available_bytes", "8G")) or (8 * GIB)
+    shrink_to_available = (
+        parse_size(cfg.get("target_shrink_to_available_bytes", "9G"))
+        or (9 * GIB)
+    )
+    grow_above_available = (
+        parse_size(cfg.get("target_grow_above_available_bytes", "10G"))
+        or (10 * GIB)
+    )
+    grow_to_available = (
+        parse_size(cfg.get("target_grow_to_available_bytes", "9G"))
+        or shrink_to_available
+    )
 
-    # Allow just enough locked cache so total used stays at or below the cap.
-    target_bytes = int(total * max_total_used_ratio) - non_cache_used
-    target_bytes = max(0, min(target_bytes, total))
+    # Keep the watermarks sane even if the config is edited badly.
+    shrink_to_available = max(shrink_to_available, floor_available)
+    grow_to_available = max(grow_to_available, shrink_to_available)
+    grow_above_available = max(grow_above_available, grow_to_available)
 
-    # Keep the emergency safety brake.
-    if available < int(total * float(cfg.get("min_available_ratio", 0.125))):
-        target_bytes = 0
+    def target_for_available_reserve(reserve_bytes: int) -> int:
+        # Estimate:
+        #
+        #   available_after = current_available + currently_locked_cache - new_cache_target
+        #
+        # So:
+        #
+        #   new_cache_target = current_available + currently_locked_cache - desired_available
+        target = available + locked_now - reserve_bytes
+        return max(0, min(int(target), total))
+
+    if current_target_bytes is None:
+        # First run / dead vmtouch / unknown state: fill, but leave the normal
+        # reserve instead of pushing right to the hard floor.
+        target_bytes = target_for_available_reserve(grow_to_available)
+
+    elif available < floor_available:
+        # Memory pressure: shrink immediately and overshoot back to the safer
+        # reserve. This avoids bouncing around the 8G line.
+        target_bytes = target_for_available_reserve(shrink_to_available)
+
+    elif available > grow_above_available:
+        # Plenty of headroom: grow again, but only after crossing the upper
+        # watermark. This prevents oscillation.
+        target_bytes = target_for_available_reserve(grow_to_available)
+
+    else:
+        # Hysteresis band: do nothing. Keep the existing target.
+        target_bytes = int(current_target_bytes)
 
     return target_bytes, int(working_used), int(available)
 
@@ -1304,6 +1344,14 @@ def target_change_is_meaningful(
     if desired_target_bytes == 0 or current_target_bytes == 0:
         return True
 
+    # Shrink immediately. choose_target_bytes() already includes hysteresis, so
+    # a shrink request means MemAvailable crossed the hard floor and we need to
+    # release cache now.
+    if desired_target_bytes < current_target_bytes:
+        return True
+
+    # Grow slowly. This avoids churn when apps close, browser tabs fluctuate,
+    # or the system hovers near the upper watermark.
     abs_deadband = parse_size(cfg.get("target_relock_min_delta", "512M")) or 0
     rel_deadband = float(cfg.get("target_relock_min_delta_ratio", 0.03))
 
@@ -1574,7 +1622,11 @@ def main() -> int:
                     last_dirty_scan = now
                 watcher.mark_clean()
 
-            desired_target_bytes, _, _ = choose_target_bytes(meminfo, cfg)
+            active_target_bytes = current_target_bytes
+            if current_vmtouch is None or current_vmtouch.poll() is not None:
+                active_target_bytes = None
+            
+            desired_target_bytes, _, _ = choose_target_bytes(meminfo, cfg, active_target_bytes)
 
             effective_target_bytes = current_target_bytes
             if target_change_is_meaningful(current_target_bytes, desired_target_bytes, cfg):
@@ -1627,11 +1679,10 @@ PY
   chmod 755 /opt/ramcache-controller/ramcache_controller.py
 }
 
-write_config_if_missing() {
+write_config() {
   install -d -m 755 /etc/ramcache-controller
 
-  if [[ ! -f /etc/ramcache-controller/config.json ]]; then
-    cat > /etc/ramcache-controller/config.json <<'JSON'
+  cat > /etc/ramcache-controller/config.json <<'JSON'
 {
   "include_paths": ["/"],
   "exclude_prefixes": [
@@ -1649,30 +1700,29 @@ write_config_if_missing() {
   "stay_on_filesystem": true,
   "auto_include_common_app_paths": true,
   "cross_filesystem_include_roots": ["/snap"],
-  "check_interval_seconds": 30,
+
+  "check_interval_seconds": 10,
   "dirty_rescan_interval_seconds": 1800,
   "full_rescan_interval_seconds": 86400,
-  "base_target_ratio": 0.72,
-  "min_available_ratio": 0.125,
-  "max_total_used_ratio": 0.75,
+
+  "target_available_bytes": "8G",
+  "target_shrink_to_available_bytes": "9G",
+  "target_grow_above_available_bytes": "10G",
+  "target_grow_to_available_bytes": "9G",
+
   "target_relock_min_delta": "1G",
   "target_relock_min_delta_ratio": 0.07,
+
   "fd_limit_reserve": 65536,
   "fd_limit_auto_max": 8388608,
   "memlock_limit_reserve": "1G",
   "memlock_limit_min": "1G",
+
   "vmtouch_max_file_size_ratio": 0.50,
   "vmtouch_feed_pause_seconds": 0,
-  "vmtouch_feed_target_extra_seconds": 0,
-  "reduce_thresholds": [
-    {"working_used_ratio": 0.0, "target_locked_ratio": 0.72},
-    {"working_used_ratio": 0.68, "target_locked_ratio": 0.50},
-    {"working_used_ratio": 0.75, "target_locked_ratio": 0.36},
-    {"working_used_ratio": 0.82, "target_locked_ratio": 0.0}
-  ]
+  "vmtouch_feed_target_extra_seconds": 0
 }
 JSON
-  fi
 }
 
 write_service() {
@@ -1720,7 +1770,7 @@ install_all() {
   apt update
   apt install -y python3 vmtouch inotify-tools
   write_controller
-  write_config_if_missing
+  write_config
   write_service
   write_sysctls
   systemctl daemon-reload
