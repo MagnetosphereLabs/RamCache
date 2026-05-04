@@ -1785,10 +1785,11 @@ def main() -> int:
                 max_file_size_bytes,
             )
 
-            current_target_bytes = selected_bytes(current_selected)
+            current_target_bytes = effective_target_bytes
+            current_locked_bytes = selected_bytes(current_selected)
 
             write_status(
-                bytes_to_gib(current_target_bytes or 0),
+                bytes_to_gib(current_locked_bytes),
                 current_selected,
                 meminfo,
                 last_full_scan,
