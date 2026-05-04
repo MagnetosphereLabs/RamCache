@@ -1308,14 +1308,22 @@ def choose_target_bytes(
     grow_above_available = max(grow_above_available, grow_to_available)
 
     def target_for_available_reserve(reserve_bytes: int) -> int:
-        # Estimate:
+        # Control against the controller's current selected cache budget, not
+        # only Mlocked.
         #
-        #   available_after = current_available + currently_locked_cache - new_cache_target
+        # Mlocked is useful status data, but it can understate the controller's
+        # effective cache target and it does not always move MemAvailable
+        # one-for-one on large systems. If MemAvailable is still above the
+        # grow watermark, grow from the current selected target by the extra
+        # available headroom.
         #
-        # So:
-        #
-        #   new_cache_target = current_available + currently_locked_cache - desired_available
-        target = available + locked_now - reserve_bytes
+        # Example:
+        #   current target: 42G
+        #   MemAvailable: 21G
+        #   desired reserve: 5G
+        #   next target: 42G + (21G - 5G) = 58G
+        baseline = int(current_target_bytes) if current_target_bytes is not None else locked_now
+        target = baseline + available - reserve_bytes
         return max(0, min(int(target), total))
 
     if current_target_bytes is None:
