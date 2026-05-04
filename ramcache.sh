@@ -49,6 +49,8 @@ class VmtouchRun:
     proc: subprocess.Popen
     feeder: threading.Thread
     stop_event: threading.Event
+    records: list[FileRec]
+    bytes_locked: int
 
     def poll(self):
         return self.proc.poll()
@@ -1475,7 +1477,11 @@ def compute_vmtouch_pause_plan(path_count: int, cfg: dict) -> tuple[float, int]:
     return pause_seconds, max(0, pause_count)
 
 
-def start_vmtouch(cfg: dict, max_file_size_bytes: Optional[int], paths: list[str]) -> VmtouchRun:
+
+def start_vmtouch(cfg: dict, max_file_size_bytes: Optional[int], records: list[FileRec]) -> VmtouchRun:
+    paths = [r.path for r in records]
+    bytes_locked = sum(r.size for r in records)
+
     if max_file_size_bytes is not None:
         max_file_size_mib = max(1, (max_file_size_bytes + MIB - 1) // MIB)
         max_file_size_arg = f"{max_file_size_mib}M"
@@ -1549,8 +1555,138 @@ def start_vmtouch(cfg: dict, max_file_size_bytes: Optional[int], paths: list[str
 
     feeder = threading.Thread(target=feed_paths, daemon=True)
     feeder.start()
-    return VmtouchRun(proc=proc, feeder=feeder, stop_event=stop_event)
 
+    return VmtouchRun(
+        proc=proc,
+        feeder=feeder,
+        stop_event=stop_event,
+        records=records,
+        bytes_locked=bytes_locked,
+    )
+
+def selected_bytes(selected: list[FileRec]) -> int:
+    return sum(r.size for r in selected)
+
+
+def run_bytes(runs: list[VmtouchRun]) -> int:
+    return sum(r.bytes_locked for r in runs)
+
+
+def flatten_run_records(runs: list[VmtouchRun]) -> list[FileRec]:
+    records: list[FileRec] = []
+    for run in runs:
+        records.extend(run.records)
+    return records
+
+
+def record_identity(rec: FileRec) -> tuple[str, int, float]:
+    return (rec.path, rec.size, rec.mtime)
+
+
+def common_prefix_len(a: list[FileRec], b: list[FileRec]) -> int:
+    limit = min(len(a), len(b))
+    idx = 0
+
+    while idx < limit and record_identity(a[idx]) == record_identity(b[idx]):
+        idx += 1
+
+    return idx
+
+
+def stop_vmtouch_runs(runs: list[VmtouchRun]) -> None:
+    for run in reversed(runs):
+        stop_proc(run)
+    runs.clear()
+
+
+def chunk_selected_records(selected: list[FileRec], cfg: dict) -> list[list[FileRec]]:
+    # Smaller chunks make shrink more surgical. 256M means shrink usually
+    # releases only what it needs plus at most roughly one chunk.
+    max_chunk_bytes = (
+        parse_size(cfg.get("vmtouch_chunk_target_bytes", "256M"))
+        or (256 * MIB)
+    )
+    max_chunk_paths = int(cfg.get("vmtouch_chunk_max_paths", 4096))
+
+    chunks: list[list[FileRec]] = []
+    current: list[FileRec] = []
+    current_bytes = 0
+
+    for rec in selected:
+        if current and (
+            current_bytes + rec.size > max_chunk_bytes
+            or len(current) >= max_chunk_paths
+        ):
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+
+        current.append(rec)
+        current_bytes += rec.size
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def start_vmtouch_chunks(
+    cfg: dict,
+    max_file_size_bytes: Optional[int],
+    selected: list[FileRec],
+) -> list[VmtouchRun]:
+    runs: list[VmtouchRun] = []
+
+    for chunk in chunk_selected_records(selected, cfg):
+        if chunk:
+            runs.append(start_vmtouch(cfg, max_file_size_bytes, chunk))
+
+    return runs
+
+
+def sync_vmtouch_cache(
+    runs: list[VmtouchRun],
+    desired: list[FileRec],
+    cfg: dict,
+    max_file_size_bytes: Optional[int],
+) -> tuple[list[VmtouchRun], list[FileRec]]:
+    current = flatten_run_records(runs)
+
+    if [record_identity(r) for r in current] == [record_identity(r) for r in desired]:
+        return runs, current
+
+    current_bytes = run_bytes(runs)
+    desired_bytes = selected_bytes(desired)
+
+    # Shrink path: do NOT rebuild. Just drop tail chunks until the locked cache
+    # is under the desired budget. Because build_selection_order() puts small
+    # and high-priority files earlier, tail chunks are the correct things to
+    # discard first under pressure.
+    if desired_bytes < current_bytes:
+        while runs and run_bytes(runs) > desired_bytes:
+            run = runs.pop()
+            stop_proc(run)
+
+        return runs, flatten_run_records(runs)
+
+    prefix = common_prefix_len(current, desired)
+
+    # Grow path: if the desired cache extends the current cache, append only
+    # the new suffix chunks.
+    if prefix == len(current):
+        extra = desired[prefix:]
+        for chunk in chunk_selected_records(extra, cfg):
+            if chunk:
+                runs.append(start_vmtouch(cfg, max_file_size_bytes, chunk))
+
+        return runs, flatten_run_records(runs)
+
+    # Reorder/config/rescan path: full rebuild only when the desired file order
+    # changed in a non-prefix way. This should be caused by rescans/config
+    # changes, not normal memory-pressure shrink.
+    stop_vmtouch_runs(runs)
+    runs.extend(start_vmtouch_chunks(cfg, max_file_size_bytes, desired))
+    return runs, flatten_run_records(runs)
 
 def write_status(target_gib: int, selected: list[FileRec], meminfo: dict[str, int], last_scan_epoch: float) -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1582,9 +1718,9 @@ def main() -> int:
     current_config_text = None
     inventory: list[FileRec] = []
     ordered: list[FileRec] = []
-    current_paths: list[str] = []
     current_target_bytes: Optional[int] = None
-    current_vmtouch = None
+    current_vmtouch_runs: list[VmtouchRun] = []
+    current_selected: list[FileRec] = []
     last_full_scan = 0.0
     last_dirty_scan = 0.0
 
@@ -1626,6 +1762,12 @@ def main() -> int:
             if current_vmtouch is None or current_vmtouch.poll() is not None:
                 active_target_bytes = None
             
+            any_vmtouch_dead = any(run.poll() is not None for run in current_vmtouch_runs)
+            active_target_bytes = current_target_bytes
+
+            if not current_vmtouch_runs or any_vmtouch_dead:
+                active_target_bytes = None
+
             desired_target_bytes, _, _ = choose_target_bytes(meminfo, cfg, active_target_bytes)
 
             effective_target_bytes = current_target_bytes
@@ -1634,24 +1776,27 @@ def main() -> int:
             if effective_target_bytes is None:
                 effective_target_bytes = desired_target_bytes
 
-            selected = select_files(ordered, effective_target_bytes, cfg)
-            ensure_limits_for_selection(selected, cfg)
-            new_paths = [r.path for r in selected]
+            desired_selected = select_files(ordered, effective_target_bytes, cfg)
+            ensure_limits_for_selection(desired_selected, cfg)
 
-            if (
-                new_paths != current_paths
-                or current_vmtouch is None
-                or current_vmtouch.poll() is not None
-            ):
-                stop_proc(current_vmtouch)
-                current_vmtouch = None
-                if new_paths:
-                    current_vmtouch = start_vmtouch(cfg, max_file_size_bytes, new_paths)
-                current_paths = new_paths
+            if any_vmtouch_dead:
+                stop_vmtouch_runs(current_vmtouch_runs)
 
-            current_target_bytes = effective_target_bytes
+            current_vmtouch_runs, current_selected = sync_vmtouch_cache(
+                current_vmtouch_runs,
+                desired_selected,
+                cfg,
+                max_file_size_bytes,
+            )
 
-            write_status(bytes_to_gib(current_target_bytes or 0), selected, meminfo, last_full_scan)
+            current_target_bytes = selected_bytes(current_selected)
+
+            write_status(
+                bytes_to_gib(current_target_bytes or 0),
+                current_selected,
+                meminfo,
+                last_full_scan,
+            )
 
         except Exception:
             logging.exception("controller loop error")
@@ -1669,7 +1814,7 @@ def main() -> int:
             time.sleep(1)
 
     watcher.stop()
-    stop_proc(current_vmtouch)
+    stop_vmtouch_runs(current_vmtouch_runs)
     return 0
 
 
@@ -1705,10 +1850,12 @@ write_config() {
   "dirty_rescan_interval_seconds": 1800,
   "full_rescan_interval_seconds": 86400,
 
-  "target_available_bytes": "8G",
-  "target_shrink_to_available_bytes": "9G",
-  "target_grow_above_available_bytes": "10G",
-  "target_grow_to_available_bytes": "9G",
+  "target_available_bytes": "4G",
+  "target_shrink_to_available_bytes": "5G",
+  "target_grow_above_available_bytes": "6G",
+  "target_grow_to_available_bytes": "5G",
+  "vmtouch_chunk_target_bytes": "256M",
+  "vmtouch_chunk_max_paths": 4096,
 
   "target_relock_min_delta": "1G",
   "target_relock_min_delta_ratio": 0.07,
