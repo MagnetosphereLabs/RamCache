@@ -1758,10 +1758,6 @@ def main() -> int:
                     last_dirty_scan = now
                 watcher.mark_clean()
 
-            active_target_bytes = current_target_bytes
-            if current_vmtouch is None or current_vmtouch.poll() is not None:
-                active_target_bytes = None
-            
             any_vmtouch_dead = any(run.poll() is not None for run in current_vmtouch_runs)
             active_target_bytes = current_target_bytes
 
