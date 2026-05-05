@@ -1275,19 +1275,6 @@ def choose_target_bytes(
     # how much RAM is currently being held by this cache.
     locked_now = int(meminfo.get("Mlocked", 0))
 
-    # Hysteresis watermarks:
-    #
-    # - target_available_bytes is the hard floor. If MemAvailable falls below
-    #   this, shrink immediately.
-    #
-    # - target_shrink_to_available_bytes is where shrinking aims. This gives
-    #   breathing room so the machine does not hover right at the hard floor.
-    #
-    # - target_grow_above_available_bytes is the upper watermark. The cache only
-    #   grows again after MemAvailable clearly rises above this.
-    #
-    # - target_grow_to_available_bytes is where growth aims. Usually this should
-    #   match target_shrink_to_available_bytes.
     floor_available = parse_size(cfg.get("target_available_bytes", "8G")) or (8 * GIB)
     shrink_to_available = (
         parse_size(cfg.get("target_shrink_to_available_bytes", "9G"))
@@ -1308,27 +1295,9 @@ def choose_target_bytes(
     grow_above_available = max(grow_above_available, grow_to_available)
 
     def target_for_available_reserve(reserve_bytes: int) -> int:
-        # Control against the controller's current selected cache budget, not
-        # only Mlocked.
-        #
-        # Mlocked is useful status data, but it can understate the controller's
-        # effective cache target and it does not always move MemAvailable
-        # one-for-one on large systems. If MemAvailable is still above the
-        # grow watermark, grow from the current selected target by the extra
-        # available headroom.
-        #
-        # Example:
-        #   current target: 42G
-        #   MemAvailable: 21G
-        #   desired reserve: 5G
-        #   next target: 42G + (21G - 5G) = 58G
         baseline = int(current_target_bytes) if current_target_bytes is not None else locked_now
         target = baseline + available - reserve_bytes
 
-        # This is a file-selection budget, not guaranteed real locked RAM.
-        # On large systems, selected logical file bytes can be much larger than
-        # the pages that actually become Mlocked. Capping this at MemTotal can
-        # strand lots of available RAM unused.
         selection_budget_cap = parse_size(cfg.get("max_selection_budget_bytes"))
         if selection_budget_cap is None:
             selection_budget_cap = int(
@@ -1340,10 +1309,16 @@ def choose_target_bytes(
     initial_cap = parse_size(cfg.get("target_initial_max_bytes", "4G"))
     grow_step_cap = parse_size(cfg.get("target_max_grow_step_bytes", "2G"))
 
+    configured_max_inflight = parse_size(cfg.get("target_max_inflight_bytes"))
+
+    if configured_max_inflight is not None:
+        max_inflight = int(configured_max_inflight)
+    elif grow_step_cap is not None and grow_step_cap > 0:
+        max_inflight = max(int(grow_step_cap) * 2, int(initial_cap or 0))
+    else:
+        max_inflight = int(initial_cap or (8 * GIB))
+
     if current_target_bytes is None:
-        # First run / dead vmtouch / unknown state:
-        # Do NOT jump straight to MemAvailable - reserve. That can start a huge
-        # number of vmtouch locks before the next control loop sees pressure.
         target_bytes = target_for_available_reserve(grow_to_available)
 
         if initial_cap is not None and initial_cap > 0:
@@ -1355,15 +1330,28 @@ def choose_target_bytes(
         target_bytes = target_for_available_reserve(shrink_to_available)
 
     elif available > grow_above_available:
-        # Plenty of headroom: grow again, but rate-limit growth so startup and
-        # rescans ramp instead of slamming RAM all at once.
+        current = int(current_target_bytes)
         target_bytes = target_for_available_reserve(grow_to_available)
 
         if grow_step_cap is not None and grow_step_cap > 0:
             target_bytes = min(
                 target_bytes,
-                int(current_target_bytes) + int(grow_step_cap),
+                current + int(grow_step_cap),
             )
+
+        if max_inflight > 0:
+            planned_ahead = max(0, current - locked_now)
+            inflight_room = max(0, max_inflight - planned_ahead)
+
+            target_bytes = min(
+                target_bytes,
+                current + inflight_room,
+            )
+
+        # This is the grow branch. If vmtouch is still catching up, hold the
+        # current target. Do not shrink here; real shrinking belongs only in the
+        # available < floor_available branch above.
+        target_bytes = max(target_bytes, current)
 
     else:
         # Hysteresis band: do nothing. Keep the existing target.
@@ -1889,6 +1877,7 @@ write_config() {
 
   "target_initial_max_bytes": "8G",
   "target_max_grow_step_bytes": "4G",
+  "target_max_inflight_bytes": "8G",
 
   "vmtouch_chunk_target_bytes": "256M",
   "vmtouch_chunk_max_paths": 4096,
