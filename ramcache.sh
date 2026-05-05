@@ -1247,7 +1247,7 @@ def select_files(
         # If one high-priority file does not fit, skip it and keep filling the
         # budget with other useful files.
         if total + rec.size > budget_bytes:
-            continue
+            break
 
         selected.append(rec)
         total += rec.size
@@ -1337,15 +1337,6 @@ def choose_target_bytes(
             target_bytes = min(
                 target_bytes,
                 current + int(grow_step_cap),
-            )
-
-        if max_inflight > 0:
-            planned_ahead = max(0, current - locked_now)
-            inflight_room = max(0, max_inflight - planned_ahead)
-
-            target_bytes = min(
-                target_bytes,
-                current + inflight_room,
             )
 
         # This is the grow branch. If vmtouch is still catching up, hold the
