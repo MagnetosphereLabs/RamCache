@@ -1887,8 +1887,8 @@ write_config() {
   "target_grow_above_available_bytes": "7G",
   "target_grow_to_available_bytes": "6G",
 
-  "target_initial_max_bytes": "4G",
-  "target_max_grow_step_bytes": "2G",
+  "target_initial_max_bytes": "8G",
+  "target_max_grow_step_bytes": "4G",
 
   "vmtouch_chunk_target_bytes": "256M",
   "vmtouch_chunk_max_paths": 4096,
