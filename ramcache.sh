@@ -1337,10 +1337,17 @@ def choose_target_bytes(
 
         return max(0, min(int(target), int(selection_budget_cap)))
 
+    initial_cap = parse_size(cfg.get("target_initial_max_bytes", "4G"))
+    grow_step_cap = parse_size(cfg.get("target_max_grow_step_bytes", "2G"))
+
     if current_target_bytes is None:
-        # First run / dead vmtouch / unknown state: fill, but leave the normal
-        # reserve instead of pushing right to the hard floor.
+        # First run / dead vmtouch / unknown state:
+        # Do NOT jump straight to MemAvailable - reserve. That can start a huge
+        # number of vmtouch locks before the next control loop sees pressure.
         target_bytes = target_for_available_reserve(grow_to_available)
+
+        if initial_cap is not None and initial_cap > 0:
+            target_bytes = min(target_bytes, int(initial_cap))
 
     elif available < floor_available:
         # Memory pressure: shrink immediately and overshoot back to the safer
@@ -1348,9 +1355,15 @@ def choose_target_bytes(
         target_bytes = target_for_available_reserve(shrink_to_available)
 
     elif available > grow_above_available:
-        # Plenty of headroom: grow again, but only after crossing the upper
-        # watermark. This prevents oscillation.
+        # Plenty of headroom: grow again, but rate-limit growth so startup and
+        # rescans ramp instead of slamming RAM all at once.
         target_bytes = target_for_available_reserve(grow_to_available)
+
+        if grow_step_cap is not None and grow_step_cap > 0:
+            target_bytes = min(
+                target_bytes,
+                int(current_target_bytes) + int(grow_step_cap),
+            )
 
     else:
         # Hysteresis band: do nothing. Keep the existing target.
@@ -1873,7 +1886,11 @@ write_config() {
   "target_shrink_to_available_bytes": "6G",
   "target_grow_above_available_bytes": "7G",
   "target_grow_to_available_bytes": "6G",
-  "vmtouch_chunk_target_bytes": "512M",
+
+  "target_initial_max_bytes": "4G",
+  "target_max_grow_step_bytes": "2G",
+
+  "vmtouch_chunk_target_bytes": "256M",
   "vmtouch_chunk_max_paths": 4096,
   "max_selection_budget_total_ratio": 4.0,
 
@@ -1886,8 +1903,8 @@ write_config() {
   "memlock_limit_min": "1G",
 
   "vmtouch_max_file_size": "128G",
-  "vmtouch_feed_pause_seconds": 0,
-  "vmtouch_feed_target_extra_seconds": 0
+  "vmtouch_feed_pause_seconds": 0.005,
+  "vmtouch_feed_target_extra_seconds": 10
 }
 JSON
 }
