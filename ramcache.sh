@@ -1903,8 +1903,8 @@ write_config() {
   "memlock_limit_min": "1G",
 
   "vmtouch_max_file_size": "128G",
-  "vmtouch_feed_pause_seconds": 0.005,
-  "vmtouch_feed_target_extra_seconds": 10
+  "vmtouch_feed_pause_seconds": 0,
+  "vmtouch_feed_target_extra_seconds": 0
 }
 JSON
 }
