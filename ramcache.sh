@@ -1873,7 +1873,7 @@ write_config() {
   "target_shrink_to_available_bytes": "5G",
   "target_grow_above_available_bytes": "6G",
   "target_grow_to_available_bytes": "5G",
-  "vmtouch_chunk_target_bytes": "256M",
+  "vmtouch_chunk_target_bytes": "512M",
   "vmtouch_chunk_max_paths": 4096,
   "max_selection_budget_total_ratio": 4.0,
 
