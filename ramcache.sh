@@ -1865,7 +1865,7 @@ write_config() {
   "auto_include_common_app_paths": true,
   "cross_filesystem_include_roots": ["/snap"],
 
-  "check_interval_seconds": 10,
+  "check_interval_seconds": 3,
   "dirty_rescan_interval_seconds": 1800,
   "full_rescan_interval_seconds": 86400,
 
