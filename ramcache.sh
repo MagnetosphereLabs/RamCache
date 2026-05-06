@@ -1608,6 +1608,15 @@ def common_prefix_len(a: list[FileRec], b: list[FileRec]) -> int:
 
 
 def stop_vmtouch_runs(runs: list[VmtouchRun]) -> None:
+    # Terminate all concurrently for instant RAM release
+    for run in runs:
+        run.stop_event.set()
+        if run.proc.poll() is None:
+            try:
+                run.proc.terminate()
+            except ProcessLookupError:
+                pass
+                
     for run in reversed(runs):
         stop_proc(run)
     runs.clear()
@@ -1674,11 +1683,24 @@ def sync_vmtouch_cache(
 
     # Shrink path: do NOT rebuild. Just drop tail chunks until the locked cache
     # is under the desired budget. Because build_selection_order() puts small
-    # and high-priority files earlier, tail chunks are the correct things to
+    # and high priority files earlier, tail chunks are the correct things to
     # discard first under pressure.
     if desired_bytes < current_bytes:
+        to_stop = []
         while runs and run_bytes(runs) > desired_bytes:
-            run = runs.pop()
+            to_stop.append(runs.pop())
+
+        # Fire SIGTERM concurrently to all targeted chunks so the kernel begins unmapping instantly
+        for run in to_stop:
+            run.stop_event.set()
+            if run.proc.poll() is None:
+                try:
+                    run.proc.terminate()
+                except ProcessLookupError:
+                    pass
+
+        # Now wait for them to finish cleaning up
+        for run in to_stop:
             stop_proc(run)
 
         return runs, flatten_run_records(runs)
