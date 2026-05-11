@@ -625,15 +625,21 @@ STEAM_FAST_SUBSTRINGS = (
     "/package/",
     "/public/",
     "/resource/",
+    "/clientui/",
     "/ubuntu12_32/",
     "/ubuntu12_64/",
+    "/steamrt/",
+    "/steamrt64/",
+    "/steam-runtime/",
+    "/steam-runtime-heavy/",
     "/compatibilitytools.d/",
-    "/steamapps/compatdata/",
-    "/steamapps/shadercache/",
     "/steamapps/common/proton",
     "/steamapps/common/steamlinuxruntime",
     "/steamapps/common/steam linux runtime",
     "/steamapps/common/steamworks shared",
+    "/steamapps/common/vrchat/",
+    f"/steamapps/compatdata/{VRCHAT_APPID}/",
+    f"/steamapps/shadercache/{VRCHAT_APPID}/",
 )
 
 COSMIC_SUBSTRINGS = (
@@ -808,6 +814,138 @@ ELECTRON_RUNTIME_NAMES = {
     "chrome_200_percent.pak",
 }
 
+STEAM_UI_CACHE_SUBSTRINGS = (
+    "/config/htmlcache/default/cache/cache_data/",
+    "/config/htmlcache/default/code cache/",
+    "/config/htmlcache/default/local storage/leveldb/",
+    "/config/htmlcache/default/session storage/",
+    "/config/htmlcache/default/shared dictionary/",
+    "/config/htmlcache/default/gpucache/",
+)
+
+FIREFOX_WEB_CACHE_SUBSTRINGS = (
+    "/.cache/mozilla/firefox/",
+    "/.mozilla/firefox/",
+)
+
+FIREFOX_WEB_CACHE_TARGET_SUBSTRINGS = (
+    "/cache2/entries/",
+    "/cache2/index",
+    "/startupcache/",
+    "/offlinecache/",
+)
+
+HYTALE_SUBSTRINGS = (
+    "/.var/app/com.hypixel.hytalelauncher/data/hytale/",
+)
+
+HYTALE_WORLD_CHUNK_SUBSTRINGS = (
+    "/userdata/saves/",
+    "/universe/worlds/",
+    "/chunks/",
+)
+
+VRCHAT_APPID = "438100"
+
+VRCHAT_RUNTIME_SUBSTRINGS = (
+    "/steamapps/common/vrchat/",
+    f"/steamapps/compatdata/{VRCHAT_APPID}/",
+    f"/steamapps/shadercache/{VRCHAT_APPID}/",
+)
+
+VRCHAT_CONTENT_CACHE_SUBSTRINGS = (
+    f"/steamapps/compatdata/{VRCHAT_APPID}/pfx/drive_c/users/steamuser/appdata/locallow/vrchat/vrchat/cache-windowsplayer/",
+)
+
+SELECTIVE_STEAM_RUNTIME_SUBSTRINGS = (
+    "/clientui/",
+    "/steamrt/",
+    "/steamrt64/",
+    "/steam-runtime/",
+    "/steam-runtime-heavy/",
+    "/steamapps/common/proton",
+    "/steamapps/common/steamlinuxruntime",
+    "/steamapps/common/steam linux runtime",
+    "/steamapps/common/steamworks shared/",
+    "/compatibilitytools.d/",
+) + VRCHAT_RUNTIME_SUBSTRINGS
+
+STEAM_UI_CACHE_FILE_MAX = 64 * MIB
+FIREFOX_WEB_CACHE_FILE_MAX = 128 * MIB
+HYTALE_WORLD_FILE_MAX = 1 * GIB
+VRCHAT_CONTENT_CACHE_FILE_MAX = 1 * GIB
+
+RECENCY_FIRST_BUDGET_KEYS = {
+    "steam_htmlcache",
+    "firefox_webcache",
+    "hytale_world",
+    "vrchat_content_cache",
+}
+
+
+def is_steam_ui_cache_path(path: str) -> bool:
+    return path_contains_any(path, STEAM_UI_CACHE_SUBSTRINGS)
+
+
+def is_firefox_web_cache_path(path: str) -> bool:
+    return (
+        path_contains_any(path, FIREFOX_WEB_CACHE_SUBSTRINGS)
+        and path_contains_any(path, FIREFOX_WEB_CACHE_TARGET_SUBSTRINGS)
+    )
+
+
+def is_hytale_path(path: str) -> bool:
+    return path_contains_any(path, HYTALE_SUBSTRINGS)
+
+
+def is_hytale_world_chunk_path(path: str) -> bool:
+    return (
+        is_hytale_path(path)
+        and path_contains_any(path, HYTALE_WORLD_CHUNK_SUBSTRINGS)
+        and path.endswith(".region.bin")
+    )
+
+
+def is_hytale_runtime_path(path: str, name: str) -> bool:
+    if not is_hytale_path(path):
+        return False
+
+    return (
+        name in {
+            "hytale-launcher",
+            "hytaleclient",
+            "hytaleserver.jar",
+            "libjvm.so",
+            "libmsquic.so",
+            "libnoesis.so",
+            "libdiscord_partner_sdk.so",
+            "libquiche.so",
+        }
+        or "/package/game/latest/client/" in path
+        or "/package/game/latest/server/" in path
+        or "/package/jre/latest/" in path
+    )
+
+
+def is_vrchat_runtime_path(path: str) -> bool:
+    return path_contains_any(path, VRCHAT_RUNTIME_SUBSTRINGS)
+
+
+def is_vrchat_content_cache_path(path: str) -> bool:
+    return path_contains_any(path, VRCHAT_CONTENT_CACHE_SUBSTRINGS)
+
+
+def is_selective_steam_runtime_path(path: str) -> bool:
+    return path_contains_any(path, SELECTIVE_STEAM_RUNTIME_SUBSTRINGS)
+
+
+def is_targeted_browser_like_cache_path(path: str) -> bool:
+    return (
+        is_steam_ui_cache_path(path)
+        or is_firefox_web_cache_path(path)
+        or is_vrchat_content_cache_path(path)
+    )
+
 
 def file_is_executable(rec: FileRec) -> bool:
     return bool(rec.mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
@@ -851,7 +989,11 @@ def should_prune_dir(path: str) -> bool:
     if path_has_prefix(p, HARD_COLD_PREFIXES):
         return True
 
-    if is_browser_http_cache_path(p) and not is_shader_cache_path(p):
+    if (
+        is_browser_http_cache_path(p)
+        and not is_shader_cache_path(p)
+        and not is_targeted_browser_like_cache_path(p)
+    ):
         return True
 
     if path_contains_any(p, PRUNE_DIR_SUBSTRINGS):
@@ -870,16 +1012,13 @@ def is_hard_cold_file(path: str, name: str, size: int) -> bool:
     if path_has_prefix(path, HARD_COLD_PREFIXES):
         return True
 
-    if is_browser_http_cache_path(path) and not is_shader_cache_path(path):
+    if (
+        is_browser_http_cache_path(path)
+        and not is_shader_cache_path(path)
+        and not is_targeted_browser_like_cache_path(path)
+    ):
         return True
 
-    # These are early-priority cache targets, but they should not be
-    # hard-banned. On high-RAM desktops, after OS/app/runtime/Steam/desktop
-    # candidates are selected, they are valid late fallback files so the cache
-    # can actually use the available RAM instead of stopping early.
-    #
-    # Only reject huge cold blobs that are unlikely to help launch/system
-    # responsiveness and would make shrink chunks coarse.
     if name.endswith(MEDIA_SUFFIXES) and size > 2 * GIB:
         return True
 
@@ -922,6 +1061,70 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     user_app = path_contains_any(path, USER_APP_SUBSTRINGS)
     cosmic = path_contains_any(path, COSMIC_SUBSTRINGS)
 
+    # Targeted bounded caches and game/runtime paths.
+    # These are intentionally handled before broad Steam/browser/game logic.
+
+    if is_steam_ui_cache_path(path):
+        if size <= STEAM_UI_CACHE_FILE_MAX:
+            confidence = 1040
+            if "/code cache/" in path:
+                confidence += 120
+            if "/cache/cache_data/" in path:
+                confidence += 100
+            if name in {"index", "the-real-index"}:
+                confidence += 160
+            return (1, confidence, 0)
+        return (99, 0, 0)
+
+    if is_firefox_web_cache_path(path):
+        if size <= FIREFOX_WEB_CACHE_FILE_MAX:
+            confidence = 760
+            if "/startupcache/" in path:
+                confidence += 160
+            if "/cache2/index" in path:
+                confidence += 140
+            return (3, confidence, 0)
+        return (99, 0, 0)
+
+    if is_hytale_world_chunk_path(path):
+        if size <= HYTALE_WORLD_FILE_MAX:
+            return (2, 860, 0)
+        return (99, 0, 0)
+
+    if is_hytale_runtime_path(path, name):
+        confidence = 980
+        if name in {"hytaleserver.jar", "hytaleclient", "hytale-launcher", "libjvm.so"}:
+            confidence += 220
+        if shared_lib or executable or name.endswith((".jar", ".so")):
+            confidence += 140
+        return (1, confidence, 0)
+
+    if is_vrchat_content_cache_path(path):
+        if size <= VRCHAT_CONTENT_CACHE_FILE_MAX:
+            return (2, 840, 0)
+        return (99, 0, 0)
+
+    if is_vrchat_runtime_path(path):
+        confidence = 930
+        if name in {
+            "vrchat.exe",
+            "unityplayer.dll",
+            "gameassembly.dll",
+            "start_protected_game.exe",
+            "easyanticheat_eos_setup.exe",
+            "system.reg",
+            "user.reg",
+            "userdef.reg",
+        }:
+            confidence += 240
+        if "/easyanticheat/" in path:
+            confidence += 220
+        if shared_lib or executable or name.endswith((".dll", ".exe")):
+            confidence += 180
+        if name.endswith(CONFIG_SUFFIXES):
+            confidence += 120
+        return (1, confidence, 0)
+
     # Tier 0: core OS/runtime foundation. Keep the proven wins:
     # dynamic linker, system shared libs, core binaries, graphics/audio libs,
     # GTK/Qt/PipeWire/ALSA/Vulkan/Mesa, etc.
@@ -931,6 +1134,7 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
             shared_lib
             or executable
             or name in HOT_SPECIAL_NAMES
+            or name in ELECTRON_RUNTIME_NAMES
             or name.endswith(CONFIG_SUFFIXES)
             or name.endswith(RUNTIME_SUFFIXES)
         )
@@ -950,14 +1154,31 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
             confidence += 180
         return (0, confidence, 0)
 
-    # Tier 1: Steam / Proton / Wine / game / VR launch path.
-    # This must happen before generic app-runtime classification.
+    # Tier 1: Steam / Proton / Wine / selected game / VR launch path.
+    # Keep Steam itself, Proton runtimes, VRChat, selected shader caches, and non-Steam VR hot.
+    # Do NOT make every Steam game/prefix/shadercache hot just because it lives under steamapps.
     if steam or vr or shader:
+        selected_steam_runtime = is_selective_steam_runtime_path(path)
+        selected_vrchat_runtime = is_vrchat_runtime_path(path)
+        selected_steam_shader = f"/steamapps/shadercache/{VRCHAT_APPID}/" in path
+        broad_steam_game_area = path_contains_any(
+            path,
+            (
+                "/steamapps/common/",
+                "/steamapps/compatdata/",
+                "/steamapps/shadercache/",
+            ),
+        )
+
         if name.startswith("appmanifest_") and name.endswith(".acf"):
+            # App manifests are small and useful for Steam library startup.
             return (1, 1250, 0)
 
         if name in STEAM_STARTUP_NAMES:
-            return (1, 1220, 0)
+            # Keep Steam root startup files hot, but do not pull every game's
+            # Proton registry into tier 1 unless it is a selected game prefix.
+            if "/steamapps/compatdata/" not in path or selected_vrchat_runtime:
+                return (1, 1220, 0)
 
         if path_contains_any(path, STEAM_FAST_SUBSTRINGS):
             confidence = 980
@@ -971,19 +1192,38 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
                 confidence += 220
             return (1, confidence, 0)
 
-        # Game launch support: prefer executables, config, manifests.
-        # Do not spend early RAM on giant opaque game asset packs.
-        if shared_lib or executable or name.endswith((".dll", ".exe")):
-            return (1, 930, 0)
+        if selected_steam_runtime or selected_vrchat_runtime:
+            if shared_lib or executable or name.endswith((".dll", ".exe")):
+                return (1, 930, 0)
 
-        if name.endswith(CONFIG_SUFFIXES):
-            return (1, 850, 0)
+            if name.endswith(CONFIG_SUFFIXES):
+                return (1, 850, 0)
 
-        if shader and name.endswith(SHADER_SUFFIXES) and size <= 256 * MIB:
+            if size <= 16 * MIB:
+                return (2, 560, 0)
+
+            return (5, 120, 0)
+
+        if shader and selected_steam_shader and name.endswith(SHADER_SUFFIXES) and size <= 256 * MIB:
             return (1, 760, 0)
 
-        if size <= 8 * MIB:
-            return (2, 520, 0)
+        if shader and not broad_steam_game_area and name.endswith(SHADER_SUFFIXES) and size <= 256 * MIB:
+            # Keep global Mesa/NVIDIA shader caches useful, but avoid all Steam game shader caches.
+            return (1, 760, 0)
+
+        if vr and not steam:
+            # WiVRn / WayVR / Monado / ALVR-style native VR runtimes stay hot.
+            if shared_lib or executable or name.endswith((".dll", ".exe")):
+                return (1, 900, 0)
+            if name.endswith(CONFIG_SUFFIXES):
+                return (2, 680, 0)
+            if size <= 16 * MIB:
+                return (2, 520, 0)
+
+        if broad_steam_game_area:
+            # This is the big RAM saver: random Steam games, prefixes, and shader caches
+            # fall back instead of eating tier-1 RAM.
+            return (5, 40, 0)
 
         return (5, 120, 0)
 
@@ -1082,6 +1322,58 @@ def fallback_size_rank(size: int) -> int:
         return 9
     return 10
 
+def cache_budget_caps(cfg: dict) -> dict[str, int]:
+    return {
+        "steam_htmlcache": parse_size(cfg.get("steam_htmlcache_budget_bytes", "1G")) or GIB,
+        "firefox_webcache": parse_size(cfg.get("firefox_webcache_budget_bytes", "1G")) or GIB,
+        "hytale_world": parse_size(cfg.get("hytale_world_budget_bytes", "1G")) or GIB,
+        "vrchat_content_cache": parse_size(cfg.get("vrchat_content_cache_budget_bytes", "4G")) or (4 * GIB),
+    }
+
+
+def cache_budget_key(rec: FileRec) -> Optional[str]:
+    path = os.path.normpath(rec.path).lower()
+
+    if is_steam_ui_cache_path(path):
+        return "steam_htmlcache"
+
+    if is_firefox_web_cache_path(path):
+        return "firefox_webcache"
+
+    if is_hytale_world_chunk_path(path):
+        return "hytale_world"
+
+    if is_vrchat_content_cache_path(path):
+        return "vrchat_content_cache"
+
+    return None
+
+
+def hytale_save_root(path: str) -> Optional[str]:
+    norm = os.path.normpath(path)
+    lower = norm.lower()
+    marker = "/userdata/saves/"
+
+    idx = lower.find(marker)
+    if idx < 0:
+        return None
+
+    after = idx + len(marker)
+    next_sep = lower.find(os.sep, after)
+    if next_sep < 0:
+        return None
+
+    return lower[:next_sep]
+
+
+def dynamic_cache_root_key(rec: FileRec) -> Optional[str]:
+    path = os.path.normpath(rec.path).lower()
+
+    if is_hytale_world_chunk_path(path):
+        # Pick one active Hytale save per scan: the save with the newest selected region file.
+        return hytale_save_root(path)
+
+    return None
 
 def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
     include_paths = build_include_paths(cfg)
@@ -1221,6 +1513,9 @@ def build_selection_order(files: list[FileRec]) -> list[FileRec]:
         #
         # Tier 5 is the fallback and therefore behaves like the old algorithm:
         # smallest files first, then newer files.
+        budget_key = cache_budget_key(rec)
+        recency_first = budget_key in RECENCY_FIRST_BUDGET_KEYS
+
         if tier == 5:
             key = (
                 tier,
@@ -1228,6 +1523,15 @@ def build_selection_order(files: list[FileRec]) -> list[FileRec]:
                 rec.size,
                 0,
                 -rec.mtime,
+                rec.path,
+            )
+        elif recency_first:
+            key = (
+                tier,
+                -confidence,
+                -rec.mtime,
+                fallback_size_rank(rec.size),
+                rec.size,
                 rec.path,
             )
         else:
@@ -1246,6 +1550,7 @@ def build_selection_order(files: list[FileRec]) -> list[FileRec]:
     return [rec for _, rec in ranked]
 
 
+
 def select_files(
     ordered: list[FileRec],
     budget_bytes: int,
@@ -1258,6 +1563,10 @@ def select_files(
     total = 0
     steps = 0
 
+    group_caps = cache_budget_caps(cfg)
+    group_used: dict[str, int] = {}
+    chosen_dynamic_roots: dict[str, str] = {}
+
     for rec in ordered:
         steps += 1
         maybe_cooldown(
@@ -1269,20 +1578,38 @@ def select_files(
             default_sleep=0.001,
         )
 
-        # The list is now tier/priority sorted, not globally size-sorted.
-        # If one high-priority file does not fit, skip it and keep filling the
-        # budget with other useful files.
+        budget_key = cache_budget_key(rec)
+
+        if budget_key is not None:
+            cap = group_caps.get(budget_key)
+            used = group_used.get(budget_key, 0)
+
+            if cap is not None and used + rec.size > cap:
+                continue
+
+            root_key = dynamic_cache_root_key(rec)
+            if root_key is not None:
+                chosen = chosen_dynamic_roots.get(budget_key)
+                if chosen is None:
+                    chosen_dynamic_roots[budget_key] = root_key
+                elif chosen != root_key:
+                    continue
+
+        # The list is priority sorted, not globally size sorted.
+        # If one file does not fit, skip it and keep filling with later useful files.
         if total + rec.size > budget_bytes:
-            break
+            continue
 
         selected.append(rec)
         total += rec.size
+
+        if budget_key is not None:
+            group_used[budget_key] = group_used.get(budget_key, 0) + rec.size
 
         if total >= budget_bytes:
             break
 
     return selected
-
 
 def bytes_to_gib(n: int) -> float:
     return round(n / GIB, 2)
@@ -1939,6 +2266,11 @@ write_config() {
   "vmtouch_chunk_target_bytes": "256M",
   "vmtouch_chunk_max_paths": 4096,
   "max_selection_budget_total_ratio": 4.0,
+
+  "steam_htmlcache_budget_bytes": "1G",
+  "firefox_webcache_budget_bytes": "1G",
+  "hytale_world_budget_bytes": "1G",
+  "vrchat_content_cache_budget_bytes": "4G",
 
   "target_relock_min_delta": "1G",
   "target_relock_min_delta_ratio": 0.07,
