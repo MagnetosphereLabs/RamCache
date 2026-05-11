@@ -95,6 +95,30 @@ def parse_meminfo() -> dict[str, int]:
             data[name] = int(value.strip().split()[0]) * KIB
     return data
 
+
+class MemoryPressureAbort(Exception):
+    pass
+
+
+def memory_pressure_active(meminfo: dict[str, int], cfg: dict) -> bool:
+    floor_available = parse_size(cfg.get("target_available_bytes", "8G")) or (8 * GIB)
+    return int(meminfo["MemAvailable"]) < int(floor_available)
+
+
+def maybe_abort_for_memory_pressure(step: int, cfg: dict) -> None:
+    every = int(cfg.get("memory_pressure_abort_check_every", 128) or 0)
+    if every <= 0 or step % every != 0:
+        return
+
+    try:
+        if memory_pressure_active(parse_meminfo(), cfg):
+            raise MemoryPressureAbort
+    except MemoryPressureAbort:
+        raise
+    except Exception:
+        return
+
+
 def resolve_vmtouch_max_file_size_bytes(meminfo: dict[str, int], cfg: dict) -> Optional[int]:
     if "vmtouch_max_file_size_ratio" in cfg:
         return int(meminfo["MemTotal"] * float(cfg["vmtouch_max_file_size_ratio"]))
@@ -1090,6 +1114,7 @@ def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
                 default_every=4096,
                 default_sleep=0.0015,
             )
+            maybe_abort_for_memory_pressure(steps, cfg)
 
             dirpath = os.path.normpath(dirpath)
 
@@ -1130,6 +1155,7 @@ def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
                     default_every=4096,
                     default_sleep=0.0015,
                 )
+                maybe_abort_for_memory_pressure(steps, cfg)
 
                 full = os.path.normpath(os.path.join(dirpath, name))
 
@@ -1771,6 +1797,12 @@ def main() -> int:
             meminfo = parse_meminfo()
             max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
 
+            emergency_pressure = (
+                current_target_bytes is not None
+                and bool(current_vmtouch_runs)
+                and memory_pressure_active(meminfo, cfg)
+            )
+
             now = time.time()
             dirty_rescan_interval = int(cfg.get("dirty_rescan_interval_seconds", 1800))
             dirty_scan_due = (
@@ -1779,20 +1811,32 @@ def main() -> int:
             )
 
             need_scan = (
-                config_changed
-                or not inventory
-                or watcher.dead()
-                or dirty_scan_due
-                or now - last_full_scan >= int(cfg.get("full_rescan_interval_seconds", 86400))
+                not emergency_pressure
+                and (
+                    config_changed
+                    or not inventory
+                    or watcher.dead()
+                    or dirty_scan_due
+                    or now - last_full_scan >= int(cfg.get("full_rescan_interval_seconds", 86400))
+                )
             )
 
             if need_scan:
-                inventory = scan_files(cfg, max_file_size_bytes)
-                ordered = build_selection_order(inventory)
-                last_full_scan = now
-                if watcher.is_dirty():
-                    last_dirty_scan = now
-                watcher.mark_clean()
+                try:
+                    new_inventory = scan_files(cfg, max_file_size_bytes)
+                    new_ordered = build_selection_order(new_inventory)
+                except MemoryPressureAbort:
+                    logging.info("memory pressure detected during scan; aborting scan and shrinking existing cache first")
+                else:
+                    inventory = new_inventory
+                    ordered = new_ordered
+                    last_full_scan = now
+                    if watcher.is_dirty():
+                        last_dirty_scan = now
+                    watcher.mark_clean()
+
+                meminfo = parse_meminfo()
+                max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
 
             any_vmtouch_dead = any(run.poll() is not None for run in current_vmtouch_runs)
             active_target_bytes = current_target_bytes
@@ -1884,9 +1928,9 @@ write_config() {
   "full_rescan_interval_seconds": 86400,
 
   "target_available_bytes": "5G",
-  "target_shrink_to_available_bytes": "6G",
-  "target_grow_above_available_bytes": "7G",
-  "target_grow_to_available_bytes": "6G",
+  "target_shrink_to_available_bytes": "7G",
+  "target_grow_above_available_bytes": "8G",
+  "target_grow_to_available_bytes": "7G",
 
   "target_initial_max_bytes": "8G",
   "target_max_grow_step_bytes": "4G",
