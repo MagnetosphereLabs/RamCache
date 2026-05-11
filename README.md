@@ -25,7 +25,7 @@ It is designed for desktop Linux systems where application launch latency, game 
 * [What it does](#what-it-does)
 * [Why it exists](#why-it-exists)
 * [How it differs from normal Linux caching](#how-it-differs-from-normal-linux-caching)
-* [Why it can be faster](#why-it-can-be-faster)
+* [Why it is faster](#why-it-is-faster)
 * [How it works](#how-it-works)
 * [Architecture](#architecture)
 
