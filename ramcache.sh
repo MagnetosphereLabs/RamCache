@@ -606,6 +606,8 @@ ELECTRON_APP_SUBSTRINGS = (
     "/app.asar",
 )
 
+VRCHAT_APPID = "438100"
+
 STEAM_SUBSTRINGS = (
     "/.steam/root/",
     "/.steam/steam/",
@@ -844,8 +846,6 @@ HYTALE_WORLD_CHUNK_SUBSTRINGS = (
     "/universe/worlds/",
     "/chunks/",
 )
-
-VRCHAT_APPID = "438100"
 
 VRCHAT_RUNTIME_SUBSTRINGS = (
     "/steamapps/common/vrchat/",
