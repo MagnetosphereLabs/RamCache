@@ -847,6 +847,20 @@ HYTALE_WORLD_CHUNK_SUBSTRINGS = (
     "/chunks/",
 )
 
+HYTALE_WORLD_DATA_COLD_SUBSTRINGS = (
+    "/logs/",
+    "/telemetry/",
+    "/.sentry-cache/",
+)
+
+HYTALE_WORLD_DATA_COLD_SUFFIXES = (
+    ".log",
+    ".log.gz",
+    ".jsonl.gz",
+    ".tmp",
+    ".bak",
+)
+
 VRCHAT_RUNTIME_SUBSTRINGS = (
     "/steamapps/common/vrchat/",
     f"/steamapps/compatdata/{VRCHAT_APPID}/",
@@ -898,11 +912,48 @@ def is_hytale_path(path: str) -> bool:
     return path_contains_any(path, HYTALE_SUBSTRINGS)
 
 
-def is_hytale_world_chunk_path(path: str) -> bool:
+HYTALE_WORLD_ROOT_FILES = {
+    "bans.json",
+    "config.json",
+    "permissions.json",
+    "whitelist.json",
+    "client_metadata.json",
+}
+
+
+def is_hytale_world_save_path(path: str) -> bool:
     return (
         is_hytale_path(path)
+        and "/userdata/saves/" in path
+    )
+
+
+def is_hytale_world_chunk_path(path: str) -> bool:
+    return (
+        is_hytale_world_save_path(path)
         and path_contains_any(path, HYTALE_WORLD_CHUNK_SUBSTRINGS)
         and path.endswith(".region.bin")
+    )
+
+
+def is_hytale_world_data_path(path: str) -> bool:
+    if not is_hytale_world_save_path(path):
+        return False
+
+    name = os.path.basename(path)
+
+    if path_contains_any(path, HYTALE_WORLD_DATA_COLD_SUBSTRINGS):
+        return False
+
+    if name.endswith(HYTALE_WORLD_DATA_COLD_SUFFIXES):
+        return False
+
+    return (
+        is_hytale_world_chunk_path(path)
+        or "/universe/worlds/" in path
+        or "/universe/players/" in path
+        or "/mods/" in path
+        or name in HYTALE_WORLD_ROOT_FILES
     )
 
 
@@ -1086,9 +1137,30 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
             return (3, confidence, 0)
         return (99, 0, 0)
 
-    if is_hytale_world_chunk_path(path):
+    if is_hytale_world_data_path(path):
         if size <= HYTALE_WORLD_FILE_MAX:
-            return (2, 860, 0)
+            confidence = 820
+
+            if is_hytale_world_chunk_path(path):
+                confidence += 160
+
+            if "/universe/worlds/" in path:
+                confidence += 120
+
+            if "/universe/players/" in path:
+                confidence += 100
+
+            if name in {
+                "config.json",
+                "client_metadata.json",
+                "permissions.json",
+                "whitelist.json",
+                "bans.json",
+            }:
+                confidence += 120
+
+            return (2, confidence, 0)
+
         return (99, 0, 0)
 
     if is_hytale_runtime_path(path, name):
@@ -1325,9 +1397,9 @@ def fallback_size_rank(size: int) -> int:
 def cache_budget_caps(cfg: dict) -> dict[str, int]:
     return {
         "steam_htmlcache": parse_size(cfg.get("steam_htmlcache_budget_bytes", "1G")) or GIB,
-        "firefox_webcache": parse_size(cfg.get("firefox_webcache_budget_bytes", "1G")) or GIB,
-        "hytale_world": parse_size(cfg.get("hytale_world_budget_bytes", "1G")) or GIB,
-        "vrchat_content_cache": parse_size(cfg.get("vrchat_content_cache_budget_bytes", "4G")) or (4 * GIB),
+        "firefox_webcache": parse_size(cfg.get("firefox_webcache_budget_bytes", "2G")) or (2 * GIB),
+        "hytale_world": parse_size(cfg.get("hytale_world_budget_bytes", "2G")) or (2 * GIB),
+        "vrchat_content_cache": parse_size(cfg.get("vrchat_content_cache_budget_bytes", "2G")) or (2 * GIB),
     }
 
 
@@ -1340,7 +1412,7 @@ def cache_budget_key(rec: FileRec) -> Optional[str]:
     if is_firefox_web_cache_path(path):
         return "firefox_webcache"
 
-    if is_hytale_world_chunk_path(path):
+    if is_hytale_world_data_path(path):
         return "hytale_world"
 
     if is_vrchat_content_cache_path(path):
@@ -1369,11 +1441,26 @@ def hytale_save_root(path: str) -> Optional[str]:
 def dynamic_cache_root_key(rec: FileRec) -> Optional[str]:
     path = os.path.normpath(rec.path).lower()
 
-    if is_hytale_world_chunk_path(path):
-        # Pick one active Hytale save per scan: the save with the newest selected region file.
+    if is_hytale_world_data_path(path):
+        # Pick one active Hytale save per scan when the file belongs to a save.
+        # Shared PrefabCache files do not have a save root, so they are allowed
+        # inside the same Hytale world budget without forcing a different save.
         return hytale_save_root(path)
 
     return None
+
+def recency_timestamp_for_path(path: str, st: os.stat_result) -> float:
+    lower = os.path.normpath(path).lower()
+
+    if (
+        is_firefox_web_cache_path(lower)
+        or is_vrchat_content_cache_path(lower)
+        or is_hytale_world_data_path(lower)
+        or is_steam_ui_cache_path(lower)
+    ):
+        return max(float(st.st_mtime), float(st.st_atime))
+
+    return float(st.st_mtime)
 
 def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
     include_paths = build_include_paths(cfg)
@@ -1477,7 +1564,14 @@ def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
                     continue
 
                 seen_realpaths.add(real)
-                files.append(FileRec(path=full, size=size, mtime=st.st_mtime, mode=st.st_mode))
+                files.append(
+                    FileRec(
+                        path=full,
+                        size=size,
+                        mtime=recency_timestamp_for_path(full, st),
+                        mode=st.st_mode,
+                    )
+                )
 
     return files
 
@@ -2268,9 +2362,9 @@ write_config() {
   "max_selection_budget_total_ratio": 4.0,
 
   "steam_htmlcache_budget_bytes": "1G",
-  "firefox_webcache_budget_bytes": "1G",
-  "hytale_world_budget_bytes": "1G",
-  "vrchat_content_cache_budget_bytes": "4G",
+  "firefox_webcache_budget_bytes": "2G",
+  "hytale_world_budget_bytes": "2G",
+  "vrchat_content_cache_budget_bytes": "2G",
 
   "target_relock_min_delta": "1G",
   "target_relock_min_delta_ratio": 0.07,
