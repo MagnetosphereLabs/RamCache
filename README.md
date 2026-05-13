@@ -410,20 +410,20 @@ Default config:
   "cross_filesystem_include_roots": ["/snap"],
 
   "check_interval_seconds": 1,
-  "dirty_rescan_interval_seconds": 1800,
+  "dirty_rescan_interval_seconds": 10800,
   "full_rescan_interval_seconds": 86400,
 
-  "target_available_bytes": "5G",
-  "target_shrink_to_available_bytes": "7G",
-  "target_grow_above_available_bytes": "8G",
-  "target_grow_to_available_bytes": "7G",
+  "target_available_bytes": "7G",
+  "target_shrink_to_available_bytes": "8G",
+  "target_grow_above_available_bytes": "9G",
+  "target_grow_to_available_bytes": "8G",
 
   "target_initial_max_bytes": "8G",
   "target_max_grow_step_bytes": "4G",
   "target_max_inflight_bytes": "8G",
 
-  "vmtouch_chunk_target_bytes": "256M",
-  "vmtouch_chunk_max_paths": 4096,
+  "vmtouch_chunk_target_bytes": "512",
+  "vmtouch_chunk_max_paths": 8192,
   "max_selection_budget_total_ratio": 4.0,
 
   "target_relock_min_delta": "1G",
