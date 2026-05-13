@@ -2402,10 +2402,7 @@ PY
 }
 
 write_service() {
-  local cpu_quota
-  cpu_quota="$(cpu_quota_for_thread_ratio 0.70)"
-
-  cat > /etc/systemd/system/ramcache-controller.service <<UNIT
+  cat > /etc/systemd/system/ramcache-controller.service <<'UNIT'
 [Unit]
 Description=Adaptive RAM cache controller using vmtouch
 After=local-fs.target
@@ -2420,14 +2417,15 @@ Restart=always
 RestartSec=70
 KillMode=control-group
 
-# Cap the entire service cgroup to 50% of total logical CPU capacity.
+# Cap the entire service tree to 50% of ONE logical CPU thread.
+# This includes Python, inotifywait, and every vmtouch child process.
 CPUAccounting=true
-CPUQuota=${cpu_quota}
+CPUQuota=50%
+CPUQuotaPeriodSec=10ms
 
 # Be polite under load.
-Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=7
+Nice=15
+IOSchedulingClass=idle
 
 LimitNOFILE=infinity
 LimitMEMLOCK=infinity
