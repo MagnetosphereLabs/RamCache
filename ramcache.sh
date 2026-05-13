@@ -2381,8 +2381,31 @@ write_config() {
 JSON
 }
 
+cpu_quota_for_thread_ratio() {
+  local ratio="${1:-0.50}"
+  local threads
+
+  threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+
+  python3 - "$threads" "$ratio" <<'PY'
+import math
+import sys
+
+threads = max(1, int(sys.argv[1]))
+ratio = float(sys.argv[2])
+
+# systemd CPUQuota is measured as % of one logical CPU.
+quota = max(1, math.floor(threads * ratio * 100))
+
+print(f"{quota}%")
+PY
+}
+
 write_service() {
-  cat > /etc/systemd/system/ramcache-controller.service <<'UNIT'
+  local cpu_quota
+  cpu_quota="$(cpu_quota_for_thread_ratio 0.70)"
+
+  cat > /etc/systemd/system/ramcache-controller.service <<UNIT
 [Unit]
 Description=Adaptive RAM cache controller using vmtouch
 After=local-fs.target
@@ -2396,6 +2419,16 @@ ExecStart=/usr/bin/python3 /opt/ramcache-controller/ramcache_controller.py
 Restart=always
 RestartSec=70
 KillMode=control-group
+
+# Cap the entire service cgroup to 50% of total logical CPU capacity.
+CPUAccounting=true
+CPUQuota=${cpu_quota}
+
+# Be polite under load.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
 LimitNOFILE=infinity
 LimitMEMLOCK=infinity
 RuntimeDirectory=ramcache-controller
