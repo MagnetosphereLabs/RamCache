@@ -2345,7 +2345,7 @@ write_config() {
   "cross_filesystem_include_roots": ["/snap"],
 
   "check_interval_seconds": 1,
-  "dirty_rescan_interval_seconds": 1800,
+  "dirty_rescan_interval_seconds": 10800,
   "full_rescan_interval_seconds": 86400,
 
   "target_available_bytes": "7G",
