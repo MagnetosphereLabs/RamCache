@@ -2357,8 +2357,8 @@ write_config() {
   "target_max_grow_step_bytes": "4G",
   "target_max_inflight_bytes": "8G",
 
-  "vmtouch_chunk_target_bytes": "256M",
-  "vmtouch_chunk_max_paths": 4096,
+  "vmtouch_chunk_target_bytes": "512",
+  "vmtouch_chunk_max_paths": 8192,
   "max_selection_budget_total_ratio": 4.0,
 
   "steam_htmlcache_budget_bytes": "1G",
