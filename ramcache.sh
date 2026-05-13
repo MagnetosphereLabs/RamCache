@@ -2375,8 +2375,8 @@ write_config() {
   "memlock_limit_min": "1G",
 
   "vmtouch_max_file_size": "128G",
-  "vmtouch_feed_pause_seconds": 0,
-  "vmtouch_feed_target_extra_seconds": 0
+  "vmtouch_feed_pause_seconds": 0.005,
+  "vmtouch_feed_target_extra_seconds": 5
 }
 JSON
 }
@@ -2421,7 +2421,7 @@ KillMode=control-group
 # This includes Python, inotifywait, and every vmtouch child process.
 CPUAccounting=true
 CPUQuota=50%
-CPUQuotaPeriodSec=10ms
+CPUQuotaPeriodSec=2ms
 
 # Be polite under load.
 Nice=15
