@@ -2099,6 +2099,14 @@ def chunk_selected_records(selected: list[FileRec], cfg: dict) -> list[list[File
 
     return chunks
 
+def maybe_stagger_vmtouch_transition(cfg: dict, key: str) -> None:
+    try:
+        delay = float(cfg.get(key, 0) or 0.0)
+    except (TypeError, ValueError):
+        delay = 0.0
+
+    if delay > 0:
+        time.sleep(delay)
 
 def start_vmtouch_chunks(
     cfg: dict,
@@ -2106,10 +2114,13 @@ def start_vmtouch_chunks(
     selected: list[FileRec],
 ) -> list[VmtouchRun]:
     runs: list[VmtouchRun] = []
+    chunks = [chunk for chunk in chunk_selected_records(selected, cfg) if chunk]
 
-    for chunk in chunk_selected_records(selected, cfg):
-        if chunk:
-            runs.append(start_vmtouch(cfg, max_file_size_bytes, chunk))
+    for idx, chunk in enumerate(chunks):
+        runs.append(start_vmtouch(cfg, max_file_size_bytes, chunk))
+
+        if idx + 1 < len(chunks):
+            maybe_stagger_vmtouch_transition(cfg, "vmtouch_start_stagger_seconds")
 
     return runs
 
@@ -2137,18 +2148,19 @@ def sync_vmtouch_cache(
         while runs and run_bytes(runs) > desired_bytes:
             to_stop.append(runs.pop())
 
-        # Fire SIGTERM concurrently to all targeted chunks so the kernel begins unmapping instantly
-        for run in to_stop:
+        for idx, run in enumerate(to_stop):
             run.stop_event.set()
+
             if run.proc.poll() is None:
                 try:
                     run.proc.terminate()
                 except ProcessLookupError:
                     pass
 
-        # Now wait for them to finish cleaning up
-        for run in to_stop:
             stop_proc(run)
+
+            if idx + 1 < len(to_stop):
+                maybe_stagger_vmtouch_transition(cfg, "vmtouch_stop_stagger_seconds")
 
         return runs, flatten_run_records(runs)
 
@@ -2158,9 +2170,7 @@ def sync_vmtouch_cache(
     # the new suffix chunks.
     if prefix == len(current):
         extra = desired[prefix:]
-        for chunk in chunk_selected_records(extra, cfg):
-            if chunk:
-                runs.append(start_vmtouch(cfg, max_file_size_bytes, chunk))
+        runs.extend(start_vmtouch_chunks(cfg, max_file_size_bytes, extra))
 
         return runs, flatten_run_records(runs)
 
@@ -2268,23 +2278,44 @@ def main() -> int:
             desired_target_bytes, _, _ = choose_target_bytes(meminfo, cfg, active_target_bytes)
 
             effective_target_bytes = current_target_bytes
-            if target_change_is_meaningful(current_target_bytes, desired_target_bytes, cfg):
+            target_changed = target_change_is_meaningful(
+                current_target_bytes,
+                desired_target_bytes,
+                cfg,
+            )
+
+            if target_changed:
                 effective_target_bytes = desired_target_bytes
+
             if effective_target_bytes is None:
                 effective_target_bytes = desired_target_bytes
+                target_changed = True
 
-            desired_selected = select_files(ordered, effective_target_bytes, cfg)
-            ensure_limits_for_selection(desired_selected, cfg)
-
-            if any_vmtouch_dead:
-                stop_vmtouch_runs(current_vmtouch_runs)
-
-            current_vmtouch_runs, current_selected = sync_vmtouch_cache(
-                current_vmtouch_runs,
-                desired_selected,
-                cfg,
-                max_file_size_bytes,
+            # Do not rebuild the selected file list every controller tick.
+            # Selection is expensive on large inventories, so only recompute it
+            # when the inventory changed, the target changed, vmtouch died, or
+            # there is no active cache state yet.
+            selection_needs_refresh = (
+                need_scan
+                or target_changed
+                or any_vmtouch_dead
+                or not current_selected
+                or not current_vmtouch_runs
             )
+
+            if selection_needs_refresh:
+                desired_selected = select_files(ordered, effective_target_bytes, cfg)
+                ensure_limits_for_selection(desired_selected, cfg)
+
+                if any_vmtouch_dead:
+                    stop_vmtouch_runs(current_vmtouch_runs)
+
+                current_vmtouch_runs, current_selected = sync_vmtouch_cache(
+                    current_vmtouch_runs,
+                    desired_selected,
+                    cfg,
+                    max_file_size_bytes,
+                )
 
             current_target_bytes = effective_target_bytes
             current_locked_bytes = selected_bytes(current_selected)
@@ -2348,6 +2379,11 @@ write_config() {
   "dirty_rescan_interval_seconds": 10800,
   "full_rescan_interval_seconds": 86400,
 
+  "scan_cooldown_every": 512,
+  "scan_cooldown_seconds": 0.003,
+  "select_cooldown_every": 512,
+  "select_cooldown_seconds": 0.002,
+
   "target_available_bytes": "7G",
   "target_shrink_to_available_bytes": "8G",
   "target_grow_above_available_bytes": "9G",
@@ -2376,7 +2412,9 @@ write_config() {
 
   "vmtouch_max_file_size": "128G",
   "vmtouch_feed_pause_seconds": 0.005,
-  "vmtouch_feed_target_extra_seconds": 5
+  "vmtouch_feed_target_extra_seconds": 5,
+  "vmtouch_start_stagger_seconds": 0.15,
+  "vmtouch_stop_stagger_seconds": 0.05
 }
 JSON
 }
