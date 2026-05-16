@@ -2412,7 +2412,7 @@ write_config() {
 
   "target_initial_max_bytes": "8G",
   "target_max_grow_step_bytes": "8G",
-  "target_max_inflight_bytes": "2G",
+  "target_max_inflight_bytes": "8G",
 
   "vmtouch_chunk_target_bytes": "1024M",
   "vmtouch_chunk_max_paths": 8192,
@@ -2483,7 +2483,7 @@ CPUQuota=50%
 CPUQuotaPeriodSec=2ms
 
 # Be polite under load.
-Nice=15
+Nice=19
 IOSchedulingClass=idle
 
 LimitNOFILE=infinity
