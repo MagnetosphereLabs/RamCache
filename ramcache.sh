@@ -2410,11 +2410,11 @@ write_config() {
   "target_grow_above_available_bytes": "11G",
   "target_grow_to_available_bytes": "10G",
 
-  "target_initial_max_bytes": "4G",
-  "target_max_grow_step_bytes": "4G",
+  "target_initial_max_bytes": "8G",
+  "target_max_grow_step_bytes": "8G",
   "target_max_inflight_bytes": "2G",
 
-  "vmtouch_chunk_target_bytes": "512M",
+  "vmtouch_chunk_target_bytes": "1024M",
   "vmtouch_chunk_max_paths": 8192,
   "max_selection_budget_total_ratio": 4.0,
 
