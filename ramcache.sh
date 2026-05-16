@@ -1765,6 +1765,26 @@ def choose_target_bytes(
     else:
         max_inflight = int(initial_cap or (8 * GIB))
 
+    def cap_growth_to_inflight_limit(target: int) -> int:
+        if max_inflight <= 0:
+            return target
+
+        if current_target_bytes is None:
+            return min(target, locked_now + max_inflight)
+
+        current = int(current_target_bytes)
+
+        if target <= current:
+            return target
+
+        already_inflight = max(0, current - locked_now)
+        remaining_inflight_room = max(0, max_inflight - already_inflight)
+
+        if remaining_inflight_room <= 0:
+            return current
+
+        return min(target, current + remaining_inflight_room)
+
     if current_target_bytes is None:
         target_bytes = target_for_available_reserve(grow_to_available)
 
@@ -1795,6 +1815,7 @@ def choose_target_bytes(
         # Hysteresis band: do nothing. Keep the existing target.
         target_bytes = int(current_target_bytes)
 
+    target_bytes = cap_growth_to_inflight_limit(int(target_bytes))
     return target_bytes, int(working_used), int(available)
 
 def target_change_is_meaningful(
@@ -2384,14 +2405,14 @@ write_config() {
   "select_cooldown_every": 512,
   "select_cooldown_seconds": 0.002,
 
-  "target_available_bytes": "7G",
-  "target_shrink_to_available_bytes": "8G",
-  "target_grow_above_available_bytes": "9G",
-  "target_grow_to_available_bytes": "8G",
+  "target_available_bytes": "8G",
+  "target_shrink_to_available_bytes": "10G",
+  "target_grow_above_available_bytes": "11G",
+  "target_grow_to_available_bytes": "10G",
 
-  "target_initial_max_bytes": "8G",
+  "target_initial_max_bytes": "4G",
   "target_max_grow_step_bytes": "4G",
-  "target_max_inflight_bytes": "8G",
+  "target_max_inflight_bytes": "2G",
 
   "vmtouch_chunk_target_bytes": "512M",
   "vmtouch_chunk_max_paths": 8192,
