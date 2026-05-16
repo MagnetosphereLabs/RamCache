@@ -641,7 +641,6 @@ STEAM_FAST_SUBSTRINGS = (
     "/steamapps/common/steamworks shared",
     "/steamapps/common/vrchat/",
     f"/steamapps/compatdata/{VRCHAT_APPID}/",
-    f"/steamapps/shadercache/{VRCHAT_APPID}/",
 )
 
 COSMIC_SUBSTRINGS = (
@@ -864,7 +863,6 @@ HYTALE_WORLD_DATA_COLD_SUFFIXES = (
 VRCHAT_RUNTIME_SUBSTRINGS = (
     "/steamapps/common/vrchat/",
     f"/steamapps/compatdata/{VRCHAT_APPID}/",
-    f"/steamapps/shadercache/{VRCHAT_APPID}/",
 )
 
 VRCHAT_CONTENT_CACHE_SUBSTRINGS = (
@@ -895,6 +893,259 @@ RECENCY_FIRST_BUDGET_KEYS = {
     "hytale_world",
     "vrchat_content_cache",
 }
+
+VIP_FULL_APP_PREFIXES = (
+    # COSMIC built-ins.
+    "/usr/bin/cosmic-files",
+    "/usr/bin/cosmic-files-applet",
+    "/usr/bin/cosmic-settings",
+    "/usr/bin/cosmic-settings-daemon",
+    "/usr/bin/cosmic-store",
+    "/usr/share/cosmic/com.system76.cosmicsettings.shortcuts",
+    "/usr/share/cosmic/com.system76.cosmicsettings.windowrules",
+
+    # FileZilla.
+    "/usr/bin/filezilla",
+    "/usr/bin/fzsftp",
+    "/usr/bin/fzputtygen",
+    "/usr/share/filezilla",
+
+    # OBS.
+    "/usr/bin/obs",
+    "/usr/lib/x86_64-linux-gnu/obs-plugins",
+    "/usr/lib/x86_64-linux-gnu/obs-scripting",
+    "/usr/lib/x86_64-linux-gnu/libobs.so",
+    "/usr/share/obs",
+
+    # RustDesk.
+    "/usr/bin/rustdesk",
+    "/usr/share/rustdesk",
+
+    # Vesktop.
+    "/opt/vesktop",
+    "/usr/bin/vesktop",
+
+    # Shotcut system Flatpak install.
+    "/var/lib/flatpak/app/org.shotcut.shotcut",
+    "/var/lib/flatpak/exports/bin/org.shotcut.shotcut",
+
+    # WiVRn system Flatpak install.
+    "/var/lib/flatpak/app/io.github.wivrn.wivrn",
+    "/var/lib/flatpak/exports/bin/io.github.wivrn.wivrn",
+)
+
+VIP_FULL_APP_HOME_MARKERS = (
+    # COSMIC user state.
+    "/.config/cosmic/com.system76.cosmicfiles",
+    "/.config/cosmic/com.system76.cosmicsettings",
+    "/.config/cosmic/com.system76.cosmicstore",
+    "/.cache/cosmic-settings",
+    "/.cache/cosmic-store",
+
+    # FileZilla user state.
+    "/.cache/filezilla",
+    "/.config/filezilla",
+
+    # Kdenlive user Flatpak install/state.
+    "/.local/share/flatpak/app/org.kde.kdenlive",
+    "/.local/share/flatpak/exports/bin/org.kde.kdenlive",
+    "/.var/app/org.kde.kdenlive",
+
+    # OBS user state.
+    "/.config/obs-studio",
+
+    # RustDesk user state.
+    "/.config/rustdesk",
+
+    # Shotcut user Flatpak state.
+    "/.var/app/org.shotcut.shotcut",
+
+    # Vesktop app/user state.
+    "/.config/vesktop",
+
+    # VLC user Flatpak install/state.
+    "/.local/share/flatpak/app/org.videolan.vlc",
+    "/.local/share/flatpak/exports/bin/org.videolan.vlc",
+    "/.var/app/org.videolan.vlc",
+
+    # WiVRn runtime/user state.
+    "/.cache/wivrn",
+    "/.config/openvr",
+    "/.config/openxr",
+    "/.var/app/io.github.wivrn.wivrn",
+)
+
+VIP_FULL_APP_PATH_NEEDLES = (
+    # App desktop files, icons, metainfo, translations, and package-adjacent data.
+    "/com.system76.cosmicfiles",
+    "/com.system76.cosmicsettings",
+    "/com.system76.cosmicstore",
+    "/filezilla.",
+    "/filezilla/",
+    "/libfilezilla",
+    "/libfzclient",
+    "/lc_messages/filezilla.mo",
+    "/org.kde.kdenlive",
+    "/com.obsproject.studio",
+    "/rustdesk.",
+    "/rustdesk/",
+    "/org.shotcut.shotcut",
+    "/vesktop.",
+    "/org.videolan.vlc",
+    "/io.github.wivrn.wivrn",
+)
+
+STEAM_CLIENT_VIP_TOPLEVEL_DIRS = {
+    "appcache",
+    "clientui",
+    "config",
+    "friends",
+    "graphics",
+    "linux32",
+    "linux64",
+    "package",
+    "public",
+    "resource",
+    "steamrt64",
+    "ubuntu12_32",
+    "ubuntu12_64",
+}
+
+STEAM_CLIENT_VIP_TOPLEVEL_FILES = {
+    "steam",
+    "steam.sh",
+    "steam_msg.sh",
+}
+
+STEAM_ROOT_MARKERS = (
+    "/.steam/root/",
+    "/.steam/steam/",
+    "/.steam/debian-installation/",
+    "/.local/share/steam/",
+    "/.var/app/com.valvesoftware.steam/.local/share/steam/",
+)
+
+
+def marker_root_match(path: str, marker: str) -> bool:
+    idx = path.find(marker)
+    if idx < 0:
+        return False
+
+    end = idx + len(marker)
+    return end == len(path) or path[end] == os.sep
+
+
+def path_contains_root_marker(path: str, markers: tuple[str, ...]) -> bool:
+    return any(marker_root_match(path, marker) for marker in markers)
+
+
+def steam_root_tail(path: str) -> Optional[str]:
+    lower = os.path.normpath(path).lower()
+
+    for marker in STEAM_ROOT_MARKERS:
+        idx = lower.find(marker)
+        if idx >= 0:
+            return lower[idx + len(marker):].strip(os.sep)
+
+    return None
+
+
+def is_vip_steam_client_path(path: str) -> bool:
+    tail = steam_root_tail(path)
+    if not tail:
+        return False
+
+    if tail in STEAM_CLIENT_VIP_TOPLEVEL_FILES:
+        return True
+
+    if tail == "steamapps/libraryfolders.vdf":
+        return True
+
+    if tail.startswith("steamapps/appmanifest_") and tail.endswith(".acf"):
+        return os.sep not in tail[len("steamapps/"):]
+
+    top = tail.split(os.sep, 1)[0]
+    return top in STEAM_CLIENT_VIP_TOPLEVEL_DIRS
+
+
+def is_vip_full_app_path(path: str) -> bool:
+    path = os.path.normpath(path).lower()
+
+    for prefix in VIP_FULL_APP_PREFIXES:
+        prefix = os.path.normpath(prefix).lower()
+        if path == prefix or path.startswith(prefix + os.sep):
+            return True
+
+    if path_contains_root_marker(path, VIP_FULL_APP_HOME_MARKERS):
+        return True
+
+    if path_contains_any(path, VIP_FULL_APP_PATH_NEEDLES):
+        return True
+
+    return False
+
+
+def is_vip_vrchat_runtime_path(path: str) -> bool:
+    path = os.path.normpath(path).lower()
+
+    if is_vrchat_content_cache_path(path):
+        return False
+
+    if f"/steamapps/shadercache/{VRCHAT_APPID}/" in path:
+        return False
+
+    if path.endswith(f"/steamapps/appmanifest_{VRCHAT_APPID}.acf"):
+        return True
+
+    return (
+        f"/steamapps/common/vrchat/" in path
+        or f"/steamapps/compatdata/{VRCHAT_APPID}/" in path
+    )
+
+
+def vrchat_content_cache_unit_root(path: str) -> Optional[str]:
+    lower = os.path.normpath(path).lower()
+    marker = VRCHAT_CONTENT_CACHE_SUBSTRINGS[0]
+
+    idx = lower.find(marker)
+    if idx < 0:
+        return None
+
+    after = idx + len(marker)
+    next_sep = lower.find(os.sep, after)
+
+    if next_sep < 0:
+        return lower
+
+    return lower[:next_sep]
+
+
+def is_vip_path(path: str) -> bool:
+    path = os.path.normpath(path).lower()
+    return (
+        is_vip_full_app_path(path)
+        or is_vip_steam_client_path(path)
+        or is_vip_vrchat_runtime_path(path)
+        or is_vrchat_content_cache_path(path)
+    )
+
+
+def vip_classification(path: str, name: str, size: int) -> Optional[tuple[int, int, int]]:
+    if is_vrchat_content_cache_path(path):
+        if size <= VRCHAT_CONTENT_CACHE_FILE_MAX:
+            # VIP, but after full app/runtime VIP. select_files() enforces the
+            # recent-unit, >=1M unit, and 2G total cap.
+            return (-90, 10000, 0)
+        return (99, 0, 0)
+
+    if (
+        is_vip_full_app_path(path)
+        or is_vip_steam_client_path(path)
+        or is_vip_vrchat_runtime_path(path)
+    ):
+        return (-100, 10000, 0)
+
+    return None
 
 
 def is_steam_ui_cache_path(path: str) -> bool:
@@ -1037,6 +1288,11 @@ def is_app_runtime_path(path: str) -> bool:
 def should_prune_dir(path: str) -> bool:
     p = os.path.normpath(path).lower()
 
+    # VIP paths must survive pruning, especially Vesktop/Electron cache trees
+    # and Flatpak/app payload folders that look like generic browser/app data.
+    if is_vip_path(p):
+        return False
+
     if path_has_prefix(p, HARD_COLD_PREFIXES):
         return True
 
@@ -1060,6 +1316,9 @@ def should_prune_dir(path: str) -> bool:
 
 
 def is_hard_cold_file(path: str, name: str, size: int) -> bool:
+    if is_vip_path(path):
+        return False
+
     if path_has_prefix(path, HARD_COLD_PREFIXES):
         return True
 
@@ -1099,6 +1358,10 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     path = os.path.normpath(rec.path).lower()
     name = os.path.basename(path)
     size = rec.size
+
+    vip = vip_classification(path, name, size)
+    if vip is not None:
+        return vip
 
     if is_hard_cold_file(path, name, size):
         return (99, 0, 0)
@@ -1447,6 +1710,12 @@ def dynamic_cache_root_key(rec: FileRec) -> Optional[str]:
         # inside the same Hytale world budget without forcing a different save.
         return hytale_save_root(path)
 
+    if is_vrchat_content_cache_path(path):
+        # Treat each Cache-WindowsPlayer first-level directory as one content
+        # unit. select_files() can then keep whole recent units, skip tiny
+        # marker units, and enforce the total 2G cap.
+        return vrchat_content_cache_unit_root(path)
+
     return None
 
 def recency_timestamp_for_path(path: str, st: os.stat_result) -> float:
@@ -1655,11 +1924,32 @@ def select_files(
 
     selected: list[FileRec] = []
     total = 0
+    reserved_total = 0
     steps = 0
 
     group_caps = cache_budget_caps(cfg)
     group_used: dict[str, int] = {}
     chosen_dynamic_roots: dict[str, str] = {}
+
+    # Precompute VRChat cache unit sizes so the 2G cap is applied to whole
+    # recent units, not random individual __data files. This preserves our
+    # "newest units first, >=1M each, up to 2G" goal.
+    vrchat_unit_sizes: dict[str, int] = {}
+    for rec in ordered:
+        if cache_budget_key(rec) != "vrchat_content_cache":
+            continue
+
+        root_key = dynamic_cache_root_key(rec)
+        if root_key is None:
+            continue
+
+        vrchat_unit_sizes[root_key] = vrchat_unit_sizes.get(root_key, 0) + rec.size
+
+    vrchat_chosen_units: set[str] = set()
+    vrchat_min_unit_bytes = (
+        parse_size(cfg.get("vrchat_content_cache_min_unit_bytes", "1M"))
+        or MIB
+    )
 
     for rec in ordered:
         steps += 1
@@ -1674,7 +1964,31 @@ def select_files(
 
         budget_key = cache_budget_key(rec)
 
-        if budget_key is not None:
+        if budget_key == "vrchat_content_cache":
+            root_key = dynamic_cache_root_key(rec)
+            if root_key is None:
+                continue
+
+            unit_size = vrchat_unit_sizes.get(root_key, rec.size)
+            if unit_size < vrchat_min_unit_bytes:
+                continue
+
+            if root_key not in vrchat_chosen_units:
+                cap = group_caps.get(budget_key)
+                used = group_used.get(budget_key, 0)
+
+                if cap is not None and used + unit_size > cap:
+                    continue
+
+                reserved_total = max(reserved_total, total)
+                if reserved_total + unit_size > budget_bytes:
+                    continue
+
+                vrchat_chosen_units.add(root_key)
+                group_used[budget_key] = used + unit_size
+                reserved_total += unit_size
+
+        elif budget_key is not None:
             cap = group_caps.get(budget_key)
             used = group_used.get(budget_key, 0)
 
@@ -1697,7 +2011,7 @@ def select_files(
         selected.append(rec)
         total += rec.size
 
-        if budget_key is not None:
+        if budget_key is not None and budget_key != "vrchat_content_cache":
             group_used[budget_key] = group_used.get(budget_key, 0) + rec.size
 
         if total >= budget_bytes:
@@ -2414,7 +2728,7 @@ write_config() {
   "target_max_grow_step_bytes": "8G",
   "target_max_inflight_bytes": "8G",
 
-  "vmtouch_chunk_target_bytes": "1024M",
+  "vmtouch_chunk_target_bytes": "2048M",
   "vmtouch_chunk_max_paths": 8192,
   "max_selection_budget_total_ratio": 4.0,
 
