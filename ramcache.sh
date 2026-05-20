@@ -63,7 +63,7 @@ def handle_signal(signum, frame):
 def load_config() -> tuple[str, dict]:
     raw = CONFIG_PATH.read_text(encoding="utf-8")
     cfg = json.loads(raw)
-    return raw, cfg
+    return raw, apply_memory_size_profile(cfg)
 
 
 def parse_size(value):
@@ -95,6 +95,74 @@ def parse_meminfo() -> dict[str, int]:
             data[name] = int(value.strip().split()[0]) * KIB
     return data
 
+LOW_RAM_PROFILE_DEFAULTS = {
+    # Leave more headroom and only grow when the machine is very idle.
+    "target_available_bytes": "9G",
+    "target_shrink_to_available_bytes": "10G",
+    "target_grow_to_available_bytes": "11G",
+    "target_grow_above_available_bytes": "12G",
+
+    # Much smaller growth/lock bursts.
+    "target_initial_max_bytes": "2G",
+    "target_max_grow_step_bytes": "512M",
+    "target_max_inflight_bytes": "1G",
+
+    # Smaller chunks make pressure release much more surgical.
+    "vmtouch_chunk_target_bytes": "256M",
+    "vmtouch_chunk_max_paths": 2048,
+
+    # React to smaller meaningful changes.
+    "target_relock_min_delta": "256M",
+
+    # Keep opportunistic cache categories bounded on small systems.
+    "steam_htmlcache_budget_bytes": "256M",
+    "firefox_webcache_budget_bytes": "512M",
+    "hytale_world_budget_bytes": "512M",
+    "vrchat_content_cache_budget_bytes": "512M",
+
+    # Avoid trying huge files on low-RAM systems.
+    "vmtouch_max_file_size": "2G",
+
+    # Feed vmtouch more slowly.
+    "vmtouch_feed_pause_seconds": 0.02,
+    "vmtouch_feed_target_extra_seconds": 20,
+
+    # Slightly more polite scan/selection pacing.
+    "scan_cooldown_every": 256,
+    "scan_cooldown_seconds": 0.005,
+    "select_cooldown_every": 256,
+    "select_cooldown_seconds": 0.003,
+}
+
+
+def apply_memory_size_profile(cfg: dict) -> dict:
+    effective = dict(cfg)
+    effective["memory_profile"] = "normal"
+
+    if not bool(effective.get("low_ram_profile_enabled", True)):
+        return effective
+
+    try:
+        meminfo = parse_meminfo()
+        threshold = (
+            parse_size(effective.get("low_ram_total_threshold_bytes", "20G"))
+            or (20 * GIB)
+        )
+    except Exception:
+        return effective
+
+    if int(meminfo.get("MemTotal", 0)) >= int(threshold):
+        return effective
+
+    profile = dict(LOW_RAM_PROFILE_DEFAULTS)
+
+    custom = effective.get("low_ram_profile_overrides", {})
+    if isinstance(custom, dict):
+        profile.update(custom)
+
+    effective.update(profile)
+    effective["memory_profile"] = "low_ram"
+    return effective
 
 class MemoryPressureAbort(Exception):
     pass
@@ -2516,11 +2584,18 @@ def sync_vmtouch_cache(
     runs.extend(start_vmtouch_chunks(cfg, max_file_size_bytes, desired))
     return runs, flatten_run_records(runs)
 
-def write_status(target_gib: int, selected: list[FileRec], meminfo: dict[str, int], last_scan_epoch: float) -> None:
+def write_status(
+    target_gib: int,
+    selected: list[FileRec],
+    meminfo: dict[str, int],
+    last_scan_epoch: float,
+    cfg: dict,
+) -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     selected_bytes = sum(r.size for r in selected)
     payload = {
         "timestamp": int(time.time()),
+        "memory_profile": cfg.get("memory_profile", "normal"),
         "target_locked_gib": target_gib,
         "selected_files": len(selected),
         "selected_gib": bytes_to_gib(selected_bytes),
@@ -2660,6 +2735,7 @@ def main() -> int:
                 current_selected,
                 meminfo,
                 last_full_scan,
+                cfg,
             )
 
         except Exception:
@@ -2750,6 +2826,10 @@ write_config() {
   "vmtouch_feed_target_extra_seconds": 5,
   "vmtouch_start_stagger_seconds": 0.15,
   "vmtouch_stop_stagger_seconds": 0.05
+
+  "low_ram_profile_enabled": true,
+  "low_ram_total_threshold_bytes": "20G",
+  "low_ram_profile_overrides": {},
 }
 JSON
 }
