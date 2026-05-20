@@ -2638,6 +2638,15 @@ def main() -> int:
             meminfo = parse_meminfo()
             max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
 
+            if not STATUS_PATH.exists():
+                write_status(
+                    0,
+                    [],
+                    meminfo,
+                    last_full_scan,
+                    cfg,
+                )
+
             emergency_pressure = (
                 current_target_bytes is not None
                 and bool(current_vmtouch_runs)
