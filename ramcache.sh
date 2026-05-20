@@ -2825,11 +2825,11 @@ write_config() {
   "vmtouch_feed_pause_seconds": 0.005,
   "vmtouch_feed_target_extra_seconds": 5,
   "vmtouch_start_stagger_seconds": 0.15,
-  "vmtouch_stop_stagger_seconds": 0.05
+  "vmtouch_stop_stagger_seconds": 0.05,
 
   "low_ram_profile_enabled": true,
   "low_ram_total_threshold_bytes": "20G",
-  "low_ram_profile_overrides": {},
+  "low_ram_profile_overrides": {}
 }
 JSON
 }
