@@ -96,44 +96,33 @@ def parse_meminfo() -> dict[str, int]:
     return data
 
 LOW_RAM_PROFILE_DEFAULTS = {
-    # Laptop / low-DRAM behavior:
-    # Use RAM aggressively, but preserve about 8 GiB MemAvailable for the system.
-    #
-    # If MemAvailable is above 8 GiB, the controller may lock the excess.
-    # If MemAvailable drops below 8 GiB, the controller shrinks immediately.
-    "target_available_bytes": "8G",
-    "target_shrink_to_available_bytes": "8G",
-    "target_grow_to_available_bytes": "8G",
-    "target_grow_above_available_bytes": "8G",
+    "target_available_bytes": "4G",
+    "target_shrink_to_available_bytes": "6G",
+    "target_grow_to_available_bytes": "5G",
+    "target_grow_above_available_bytes": "6G",
 
-    # Let laptops actually fill available headroom.
-    # On a 16 GiB machine with ~11 GiB available, this can target ~3 GiB immediately.
     "target_initial_max_bytes": "8G",
     "target_max_grow_step_bytes": "8G",
     "target_max_inflight_bytes": "8G",
 
     # Keep chunks small so pressure release is still surgical.
-    "vmtouch_chunk_target_bytes": "256M",
-    "vmtouch_chunk_max_paths": 2048,
+    "vmtouch_chunk_target_bytes": "512M",
+    "vmtouch_chunk_max_paths": 4096,
 
     # React quickly to smaller changes.
-    "target_relock_min_delta": "128M",
+    "target_relock_min_delta": "256M",
 
-    # Do not starve useful cache categories on laptops.
-    # The global 8 GiB available-RAM target is the real safety limit.
     "steam_htmlcache_budget_bytes": "1G",
     "firefox_webcache_budget_bytes": "2G",
-    "hytale_world_budget_bytes": "2G",
-    "vrchat_content_cache_budget_bytes": "2G",
+    "hytale_world_budget_bytes": "1G",
+    "vrchat_content_cache_budget_bytes": "1G",
 
-    # Still avoid giant single files on low-DRAM systems.
+    # Avoid giant single files on low-DRAM systems.
     "vmtouch_max_file_size": "2G",
 
-    # Feed vmtouch reasonably quickly. The service CPU/IO limits still keep it polite.
     "vmtouch_feed_pause_seconds": 0.005,
     "vmtouch_feed_target_extra_seconds": 5,
 
-    # Slightly polite scan/selection pacing, but not so slow it feels broken.
     "scan_cooldown_every": 512,
     "scan_cooldown_seconds": 0.003,
     "select_cooldown_every": 512,
