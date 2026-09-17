@@ -131,8 +131,8 @@ def parse_memory_psi_totals() -> tuple[int, int]:
 LOW_RAM_PROFILE_DEFAULTS = {
     "target_available_bytes": "4G",
     "target_shrink_to_available_bytes": "6G",
-    "target_grow_to_available_bytes": "5G",
-    "target_grow_above_available_bytes": "6G",
+    "target_grow_to_available_bytes": "6G",
+    "target_grow_above_available_bytes": "7G",
 
     "target_initial_max_bytes": "8G",
     "target_max_grow_step_bytes": "8G",
@@ -200,7 +200,7 @@ class MemoryPressureAbort(Exception):
 
 
 def memory_pressure_active(meminfo: dict[str, int], cfg: dict) -> bool:
-    floor_available = parse_size(cfg.get("target_available_bytes", "8G")) or (8 * GIB)
+    floor_available = parse_size(cfg.get("target_available_bytes", "4G")) or (4 * GIB)
     return int(meminfo["MemAvailable"]) < int(floor_available)
 
 
@@ -2947,17 +2947,17 @@ def choose_target_bytes(
     # how much RAM is currently being held by this cache.
     locked_now = int(meminfo.get("Mlocked", 0))
 
-    floor_available = parse_size(cfg.get("target_available_bytes", "8G")) or (8 * GIB)
+    floor_available = parse_size(cfg.get("target_available_bytes", "4G")) or (4 * GIB)
     shrink_to_available = (
-        parse_size(cfg.get("target_shrink_to_available_bytes", "9G"))
-        or (9 * GIB)
+        parse_size(cfg.get("target_shrink_to_available_bytes", "6G"))
+        or (6 * GIB)
     )
     grow_above_available = (
-        parse_size(cfg.get("target_grow_above_available_bytes", "10G"))
-        or (10 * GIB)
+        parse_size(cfg.get("target_grow_above_available_bytes", "7G"))
+        or (7 * GIB)
     )
     grow_to_available = (
-        parse_size(cfg.get("target_grow_to_available_bytes", "9G"))
+        parse_size(cfg.get("target_grow_to_available_bytes", "6G"))
         or shrink_to_available
     )
 
@@ -4149,10 +4149,10 @@ write_config() {
   "psi_memory_release_bytes": "2G",
   "memory_pressure_abort_check_every": 64,
 
-  "target_available_bytes": "8G",
-  "target_shrink_to_available_bytes": "10G",
-  "target_grow_above_available_bytes": "11G",
-  "target_grow_to_available_bytes": "10G",
+  "target_available_bytes": "4G",
+  "target_shrink_to_available_bytes": "6G",
+  "target_grow_above_available_bytes": "7G",
+  "target_grow_to_available_bytes": "6G",
 
   "target_initial_max_bytes": "8G",
   "target_max_grow_step_bytes": "8G",
