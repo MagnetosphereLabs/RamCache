@@ -14,15 +14,20 @@ write_controller() {
   install -d -m 755 /opt/ramcache-controller
   cat > /opt/ramcache-controller/ramcache_controller.py <<'PY'
 #!/usr/bin/env python3
+import bisect
 import json
 import logging
+import math
 import os
+import queue
 import resource
+import shutil
 import signal
 import stat
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -180,6 +185,173 @@ def maybe_abort_for_memory_pressure(step: int, cfg: dict) -> None:
         raise
     except Exception:
         return
+
+
+
+class MemoryMonitor:
+    """Continuously sample memory so long scans cannot blind the controller."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.cfg: dict = {}
+        self.samples: deque[tuple[float, int]] = deque(maxlen=4096)
+        self.latest: dict[str, int] = {}
+        self.ack_pressure_used: Optional[int] = None
+
+    @staticmethod
+    def _pressure_used(meminfo: dict[str, int]) -> int:
+        # MemAvailable already discounts reclaimable page cache. Subtracting
+        # Mlocked prevents our own vmtouch growth from looking like an external
+        # RAM spike. Hard MemAvailable protection still catches all pressure.
+        return max(
+            0,
+            int(meminfo.get("MemTotal", 0))
+            - int(meminfo.get("MemAvailable", 0))
+            - int(meminfo.get("Mlocked", 0)),
+        )
+
+    def update_config(self, cfg: dict) -> None:
+        with self.lock:
+            self.cfg = dict(cfg)
+
+    def start(self, cfg: dict) -> None:
+        self.update_config(cfg)
+        if self.thread is not None and self.thread.is_alive():
+            return
+
+        self.stop_event.clear()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="ramcache-memory-monitor",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                meminfo = parse_meminfo()
+                now = time.monotonic()
+                pressure_used = self._pressure_used(meminfo)
+
+                with self.lock:
+                    self.latest = meminfo
+                    self.samples.append((now, pressure_used))
+                    cfg = dict(self.cfg)
+
+                    window = float(cfg.get("rapid_memory_window_seconds", 60) or 60)
+                    cutoff = now - max(10.0, window * 2.0)
+                    while self.samples and self.samples[0][0] < cutoff:
+                        self.samples.popleft()
+            except Exception:
+                pass
+
+            with self.lock:
+                interval = float(
+                    self.cfg.get("memory_monitor_interval_seconds", 0.5)
+                    or 0.5
+                )
+
+            self.stop_event.wait(max(0.1, interval))
+
+    def meminfo(self) -> dict[str, int]:
+        with self.lock:
+            latest = dict(self.latest)
+        return latest if latest else parse_meminfo()
+
+    def _recent_floor_locked(self, now: float, cfg: dict) -> tuple[int, int]:
+        if not self.samples:
+            return 0, 0
+
+        window = float(cfg.get("rapid_memory_window_seconds", 60) or 60)
+        cutoff = now - max(1.0, window)
+        recent = [value for ts, value in self.samples if ts >= cutoff]
+        if not recent:
+            recent = [self.samples[-1][1]]
+
+        current = self.samples[-1][1]
+        return current, min(recent)
+
+    def pending_growth_bytes(self, cfg: dict) -> int:
+        with self.lock:
+            now = time.monotonic()
+            current, recent_floor = self._recent_floor_locked(now, cfg)
+
+            if self.ack_pressure_used is None:
+                self.ack_pressure_used = recent_floor
+
+            if current < self.ack_pressure_used:
+                self.ack_pressure_used = current
+
+            if self.ack_pressure_used < recent_floor:
+                self.ack_pressure_used = recent_floor
+
+            baseline = max(recent_floor, self.ack_pressure_used)
+            return max(0, current - baseline)
+
+    def recent_growth_bytes(self, cfg: dict) -> int:
+        with self.lock:
+            current, recent_floor = self._recent_floor_locked(
+                time.monotonic(),
+                cfg,
+            )
+            return max(0, current - recent_floor)
+
+    def consume_rapid_release_bytes(self, cfg: dict) -> tuple[int, int]:
+        threshold = (
+            parse_size(cfg.get("rapid_memory_growth_threshold_bytes", "2G"))
+            or (2 * GIB)
+        )
+
+        with self.lock:
+            now = time.monotonic()
+            current, recent_floor = self._recent_floor_locked(now, cfg)
+
+            if self.ack_pressure_used is None:
+                self.ack_pressure_used = recent_floor
+
+            if current < self.ack_pressure_used:
+                self.ack_pressure_used = current
+
+            if self.ack_pressure_used < recent_floor:
+                self.ack_pressure_used = recent_floor
+
+            baseline = max(recent_floor, self.ack_pressure_used)
+            growth = max(0, current - baseline)
+
+            if growth < threshold:
+                return 0, growth
+
+            self.ack_pressure_used = current
+
+        multiplier = float(cfg.get("rapid_memory_release_multiplier", 1.0) or 1.0)
+        margin = (
+            parse_size(cfg.get("rapid_memory_release_margin_bytes", "512M"))
+            or (512 * MIB)
+        )
+        release = int(growth * max(1.0, multiplier)) + int(margin)
+        return release, growth
+
+    def should_abort_scan(self, cfg: dict) -> bool:
+        try:
+            meminfo = self.meminfo()
+            if memory_pressure_active(meminfo, cfg):
+                return True
+
+            threshold = (
+                parse_size(cfg.get("rapid_memory_growth_threshold_bytes", "2G"))
+                or (2 * GIB)
+            )
+            return self.pending_growth_bytes(cfg) >= threshold
+        except Exception:
+            return False
 
 
 def resolve_vmtouch_max_file_size_bytes(meminfo: dict[str, int], cfg: dict) -> Optional[int]:
@@ -567,6 +739,8 @@ BROWSER_RUNTIME_PREFIXES = (
 )
 
 DESKTOP_SUPPORT_PREFIXES = (
+    "/etc/xdg",
+    "/etc/fonts",
     "/usr/share/applications",
     "/usr/local/share/applications",
     "/usr/share/appdata",
@@ -577,6 +751,8 @@ DESKTOP_SUPPORT_PREFIXES = (
     "/usr/share/mime",
     "/usr/share/glib-2.0",
     "/usr/share/dbus-1",
+    "/usr/share/xdg-desktop-portal",
+    "/usr/share/xdg-desktop-portal-portals",
     "/usr/share/systemd",
     "/usr/share/polkit-1",
     "/usr/share/fonts",
@@ -586,6 +762,12 @@ DESKTOP_SUPPORT_PREFIXES = (
     "/usr/share/thumbnailers",
     "/usr/share/wayland",
     "/usr/share/wayland-sessions",
+    "/usr/share/gtk-3.0",
+    "/usr/share/gtk-4.0",
+    "/usr/share/qt5",
+    "/usr/share/qt6",
+    "/usr/share/libinput",
+    "/usr/share/hwdata",
     "/usr/share/xsessions",
     "/usr/share/x11",
     "/usr/share/vulkan",
@@ -599,9 +781,15 @@ DESKTOP_SUPPORT_PREFIXES = (
     "/usr/share/kxmlgui5",
     "/usr/share/plasma",
     "/usr/share/gnome-shell",
+    "/usr/share/nautilus",
+    "/usr/share/cosmic",
     "/usr/share/cinnamon",
+    "/usr/share/nemo",
     "/usr/share/mate",
+    "/usr/share/caja",
     "/usr/share/xfce4",
+    "/usr/share/thunar",
+    "/usr/share/gvfs",
     "/var/cache/fontconfig",
 )
 
@@ -631,6 +819,16 @@ HOT_USER_SUBSTRINGS = (
     "/.local/share/flatpak/exports/",
     "/.config/autostart/",
     "/.config/systemd/",
+    "/.config/dconf/",
+    "/.config/gtk-3.0/",
+    "/.config/gtk-4.0/",
+    "/.config/fontconfig/",
+    "/.config/nautilus/",
+    "/.config/cinnamon/",
+    "/.config/nemo/",
+    "/.config/mate/",
+    "/.config/xfce4/",
+    "/.local/share/gvfs-metadata/",
     "/.themes/",
     "/.icons/",
     "/.fonts/",
@@ -1794,118 +1992,390 @@ def recency_timestamp_for_path(path: str, st: os.stat_result) -> float:
 
     return float(st.st_mtime)
 
-def scan_files(cfg: dict, max_file_size: Optional[int]) -> list[FileRec]:
-    include_paths = build_include_paths(cfg)
-    excludes = [os.path.normpath(p) for p in cfg["exclude_prefixes"]]
-    seen_realpaths: set[str] = set()
-    files: list[FileRec] = []
-    steps = 0
+def resolve_scan_worker_count(cfg: dict) -> int:
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except Exception:
+        allowed = os.cpu_count() or 1
 
-    for root in include_paths:
-        if path_is_excluded(root, excludes):
+    logical = os.cpu_count() or allowed
+    fraction = float(cfg.get("scan_max_thread_fraction", 0.50) or 0.50)
+    max_workers = int(cfg.get("scan_worker_max", 32) or 32)
+
+    wanted = max(1, math.ceil(logical * min(1.0, max(0.05, fraction))))
+    return max(1, min(allowed, wanted, max_workers))
+
+
+def governing_include_root(path: str, include_paths: list[str]) -> Optional[str]:
+    matches = [root for root in include_paths if path_is_under(path, root)]
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def file_record_for_path(
+    path: str,
+    cfg: dict,
+    max_file_size: Optional[int],
+    include_paths: Optional[list[str]] = None,
+) -> Optional[FileRec]:
+    full = os.path.normpath(path)
+    excludes = [os.path.normpath(p) for p in cfg["exclude_prefixes"]]
+
+    if path_is_excluded(full, excludes):
+        return None
+
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return None
+
+    if not stat.S_ISREG(st.st_mode):
+        return None
+
+    include_paths = include_paths or build_include_paths(cfg)
+    root = governing_include_root(full, include_paths)
+    if root is None:
+        return None
+
+    if (
+        cfg.get("stay_on_filesystem", True)
+        and not root_allows_cross_filesystem(root, cfg)
+    ):
+        root_dev = safe_dev(root)
+        if root_dev is not None and st.st_dev != root_dev:
+            return None
+
+    size = st.st_size
+    if size <= 0:
+        return None
+
+    if max_file_size is not None and size > max_file_size:
+        return None
+
+    return FileRec(
+        path=full,
+        size=size,
+        mtime=recency_timestamp_for_path(full, st),
+        mode=st.st_mode,
+    )
+
+
+def scan_files(
+    cfg: dict,
+    max_file_size: Optional[int],
+    memory_monitor: Optional[MemoryMonitor] = None,
+    roots: Optional[list[str]] = None,
+) -> list[FileRec]:
+    """Parallel scandir walk bounded by service affinity/quota.
+
+    The scan is I/O-heavy, so threads are useful here despite Python's GIL.
+    We intentionally use no realpath() call per file; symlinks are already
+    rejected, and build_include_paths() removes redundant same-filesystem roots.
+    """
+    include_paths = build_include_paths(cfg)
+    scan_roots = include_paths if roots is None else [
+        os.path.normpath(p) for p in roots
+    ]
+    excludes = [os.path.normpath(p) for p in cfg["exclude_prefixes"]]
+
+    work: queue.Queue = queue.Queue()
+    files: list[FileRec] = []
+    files_lock = threading.Lock()
+    abort_event = threading.Event()
+    workers = resolve_scan_worker_count(cfg)
+
+    for requested_root in scan_roots:
+        if path_is_excluded(requested_root, excludes):
+            continue
+
+        governing = governing_include_root(requested_root, include_paths)
+        if governing is None:
             continue
 
         try:
-            root_dev = os.stat(root).st_dev
+            requested_stat = os.lstat(requested_root)
         except OSError:
+            continue
+
+        if stat.S_ISLNK(requested_stat.st_mode):
+            continue
+
+        governing_dev = safe_dev(governing)
+        if governing_dev is None:
             continue
 
         stay_on_this_filesystem = (
             cfg.get("stay_on_filesystem", True)
-            and not root_allows_cross_filesystem(root, cfg)
+            and not root_allows_cross_filesystem(governing, cfg)
         )
 
-        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-            steps += 1
-            maybe_cooldown(
-                steps,
+        if stay_on_this_filesystem and requested_stat.st_dev != governing_dev:
+            continue
+
+        if stat.S_ISREG(requested_stat.st_mode):
+            rec = file_record_for_path(
+                requested_root,
                 cfg,
-                every_key="scan_cooldown_every",
-                sleep_key="scan_cooldown_seconds",
-                default_every=4096,
-                default_sleep=0.0015,
+                max_file_size,
+                include_paths,
             )
-            maybe_abort_for_memory_pressure(steps, cfg)
+            if rec is not None:
+                files.append(rec)
+            continue
 
-            dirpath = os.path.normpath(dirpath)
+        if not stat.S_ISDIR(requested_stat.st_mode):
+            continue
 
-            if path_is_excluded(dirpath, excludes) or should_prune_dir(dirpath):
-                dirnames[:] = []
-                continue
+        if should_prune_dir(requested_root):
+            continue
 
-            kept_dirs: list[str] = []
-            for d in dirnames:
-                full = os.path.normpath(os.path.join(dirpath, d))
-                full_l = full.lower()
+        work.put((requested_root, governing_dev, stay_on_this_filesystem))
 
-                if path_is_excluded(full, excludes) or should_prune_dir(full_l):
+    def worker() -> None:
+        local_files: list[FileRec] = []
+        steps = 0
+
+        while True:
+            item = work.get()
+            if item is None:
+                work.task_done()
+                break
+
+            dirpath, root_dev, stay_on_this_filesystem = item
+
+            try:
+                if abort_event.is_set():
                     continue
 
-                try:
-                    st = os.lstat(full)
-                except OSError:
+                if not RUNNING:
+                    abort_event.set()
                     continue
 
-                if stat.S_ISLNK(st.st_mode):
-                    continue
-
-                if stay_on_this_filesystem and st.st_dev != root_dev:
-                    continue
-
-                kept_dirs.append(d)
-
-            dirnames[:] = kept_dirs
-
-            for name in filenames:
                 steps += 1
+                if (
+                    memory_monitor is not None
+                    and steps % int(cfg.get("memory_pressure_abort_check_every", 128) or 128) == 0
+                    and memory_monitor.should_abort_scan(cfg)
+                ):
+                    abort_event.set()
+                    continue
+
                 maybe_cooldown(
                     steps,
                     cfg,
                     every_key="scan_cooldown_every",
                     sleep_key="scan_cooldown_seconds",
                     default_every=4096,
-                    default_sleep=0.0015,
+                    default_sleep=0.001,
                 )
-                maybe_abort_for_memory_pressure(steps, cfg)
-
-                full = os.path.normpath(os.path.join(dirpath, name))
-
-                if path_is_excluded(full, excludes):
-                    continue
 
                 try:
-                    st = os.lstat(full)
+                    entries = os.scandir(dirpath)
                 except OSError:
                     continue
 
-                if not stat.S_ISREG(st.st_mode):
-                    continue
+                with entries:
+                    for entry in entries:
+                        if abort_event.is_set():
+                            break
 
-                if stay_on_this_filesystem and st.st_dev != root_dev:
-                    continue
+                        steps += 1
+                        if (
+                            memory_monitor is not None
+                            and steps % int(cfg.get("memory_pressure_abort_check_every", 128) or 128) == 0
+                            and memory_monitor.should_abort_scan(cfg)
+                        ):
+                            abort_event.set()
+                            break
 
-                size = st.st_size
-                if size <= 0:
-                    continue
+                        maybe_cooldown(
+                            steps,
+                            cfg,
+                            every_key="scan_cooldown_every",
+                            sleep_key="scan_cooldown_seconds",
+                            default_every=4096,
+                            default_sleep=0.001,
+                        )
 
-                if max_file_size is not None and size > max_file_size:
-                    continue
+                        full = os.path.normpath(entry.path)
+                        full_l = full.lower()
 
-                real = os.path.realpath(full)
-                if real in seen_realpaths:
-                    continue
+                        if path_is_excluded(full, excludes):
+                            continue
 
-                seen_realpaths.add(real)
-                files.append(
-                    FileRec(
-                        path=full,
-                        size=size,
-                        mtime=recency_timestamp_for_path(full, st),
-                        mode=st.st_mode,
-                    )
-                )
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+
+                        if stat.S_ISLNK(st.st_mode):
+                            continue
+
+                        if stay_on_this_filesystem and st.st_dev != root_dev:
+                            continue
+
+                        if stat.S_ISDIR(st.st_mode):
+                            if should_prune_dir(full_l):
+                                continue
+                            work.put((full, root_dev, stay_on_this_filesystem))
+                            continue
+
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+
+                        size = st.st_size
+                        if size <= 0:
+                            continue
+
+                        if max_file_size is not None and size > max_file_size:
+                            continue
+
+                        local_files.append(
+                            FileRec(
+                                path=full,
+                                size=size,
+                                mtime=recency_timestamp_for_path(full, st),
+                                mode=st.st_mode,
+                            )
+                        )
+            except Exception:
+                logging.exception("scan worker error in %s", dirpath)
+            finally:
+                work.task_done()
+
+        if local_files:
+            with files_lock:
+                files.extend(local_files)
+
+    threads = [
+        threading.Thread(
+            target=worker,
+            name=f"ramcache-scan-{idx}",
+            daemon=True,
+        )
+        for idx in range(workers)
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    work.join()
+
+    for _ in threads:
+        work.put(None)
+    work.join()
+
+    for thread in threads:
+        thread.join()
+
+    if abort_event.is_set():
+        raise MemoryPressureAbort
 
     return files
+
+
+def remove_inventory_prefix(
+    inventory: dict[str, FileRec],
+    prefix: str,
+) -> list[FileRec]:
+    prefix = os.path.normpath(prefix)
+    prefix_with_sep = prefix + os.sep
+    doomed = [
+        path
+        for path in inventory
+        if path == prefix or path.startswith(prefix_with_sep)
+    ]
+
+    removed: list[FileRec] = []
+    for path in doomed:
+        rec = inventory.pop(path, None)
+        if rec is not None:
+            removed.append(rec)
+
+    return removed
+
+
+def apply_fs_changes(
+    inventory: dict[str, FileRec],
+    changes: list[tuple[str, str]],
+    cfg: dict,
+    max_file_size: Optional[int],
+    memory_monitor: Optional[MemoryMonitor],
+) -> tuple[list[FileRec], list[FileRec]]:
+    """Apply inotify changes without rescanning the whole filesystem."""
+    if not changes:
+        return [], []
+
+    include_paths = build_include_paths(cfg)
+    removed: list[FileRec] = []
+    added: list[FileRec] = []
+    directory_rescans: set[str] = set()
+    file_paths: set[str] = set()
+
+    for events, raw_path in changes:
+        path = os.path.normpath(raw_path)
+        event_set = {event.strip().upper() for event in events.split(",") if event.strip()}
+        is_dir = "ISDIR" in event_set
+
+        if is_dir:
+            if "DELETE" in event_set or "MOVED_FROM" in event_set:
+                removed.extend(remove_inventory_prefix(inventory, path))
+                continue
+
+            if "CREATE" in event_set or "MOVED_TO" in event_set:
+                directory_rescans.add(path)
+                continue
+
+            # Attribute-only directory changes do not alter file contents.
+            continue
+
+        file_paths.add(path)
+
+    # If a parent directory is being rescanned, child paths are covered by it.
+    ordered_dirs = sorted(directory_rescans, key=lambda p: (p.count(os.sep), len(p)))
+    pruned_dirs: list[str] = []
+    for path in ordered_dirs:
+        if any(path_is_under(path, parent) for parent in pruned_dirs):
+            continue
+        pruned_dirs.append(path)
+
+    for directory in pruned_dirs:
+        removed.extend(remove_inventory_prefix(inventory, directory))
+
+        if not os.path.isdir(directory):
+            continue
+
+        subtree = scan_files(
+            cfg,
+            max_file_size,
+            memory_monitor=memory_monitor,
+            roots=[directory],
+        )
+
+        for rec in subtree:
+            inventory[rec.path] = rec
+            added.append(rec)
+
+    for path in file_paths:
+        if any(path_is_under(path, directory) for directory in pruned_dirs):
+            continue
+
+        old = inventory.pop(path, None)
+        if old is not None:
+            removed.append(old)
+
+        rec = file_record_for_path(
+            path,
+            cfg,
+            max_file_size,
+            include_paths=include_paths,
+        )
+        if rec is not None:
+            inventory[rec.path] = rec
+            added.append(rec)
+
+    return removed, added
 
 
 def maybe_cooldown(
@@ -1923,57 +2393,106 @@ def maybe_cooldown(
         time.sleep(delay)
 
 
-def build_selection_order(files: list[FileRec]) -> list[FileRec]:
-    ranked: list[tuple[tuple[int, int, int, int, float, str], FileRec]] = []
+def selection_sort_key(rec: FileRec) -> Optional[tuple]:
+    tier, confidence, _ = classify_file(rec)
+
+    if tier >= 99:
+        return None
+
+    # Priority tiers first. Inside each tier:
+    # - higher confidence wins
+    # - smaller files win
+    # - newer files win
+    #
+    # Tier 5 is the fallback and therefore behaves like the old algorithm:
+    # smallest files first, then newer files.
+    budget_key = cache_budget_key(rec)
+    recency_first = budget_key in RECENCY_FIRST_BUDGET_KEYS
+
+    if tier == 5:
+        return (
+            tier,
+            fallback_size_rank(rec.size),
+            rec.size,
+            0,
+            -rec.mtime,
+            rec.path,
+        )
+
+    if recency_first:
+        return (
+            tier,
+            -confidence,
+            -rec.mtime,
+            fallback_size_rank(rec.size),
+            rec.size,
+            rec.path,
+        )
+
+    return (
+        tier,
+        fallback_size_rank(rec.size),
+        -confidence,
+        rec.size,
+        -rec.mtime,
+        rec.path,
+    )
+
+
+def build_selection_index(
+    files,
+) -> tuple[list[FileRec], list[tuple]]:
+    ranked: list[tuple[tuple, FileRec]] = []
 
     for rec in files:
-        tier, confidence, _ = classify_file(rec)
-
-        if tier >= 99:
-            continue
-
-        # Priority tiers first. Inside each tier:
-        # - higher confidence wins
-        # - smaller files win
-        # - newer files win
-        #
-        # Tier 5 is the fallback and therefore behaves like the old algorithm:
-        # smallest files first, then newer files.
-        budget_key = cache_budget_key(rec)
-        recency_first = budget_key in RECENCY_FIRST_BUDGET_KEYS
-
-        if tier == 5:
-            key = (
-                tier,
-                fallback_size_rank(rec.size),
-                rec.size,
-                0,
-                -rec.mtime,
-                rec.path,
-            )
-        elif recency_first:
-            key = (
-                tier,
-                -confidence,
-                -rec.mtime,
-                fallback_size_rank(rec.size),
-                rec.size,
-                rec.path,
-            )
-        else:
-            key = (
-                tier,
-                fallback_size_rank(rec.size),
-                -confidence,
-                rec.size,
-                -rec.mtime,
-                rec.path,
-            )
-
-        ranked.append((key, rec))
+        key = selection_sort_key(rec)
+        if key is not None:
+            ranked.append((key, rec))
 
     ranked.sort(key=lambda item: item[0])
-    return [rec for _, rec in ranked]
+    return [rec for _, rec in ranked], [key for key, _ in ranked]
+
+
+def build_selection_order(files: list[FileRec]) -> list[FileRec]:
+    ordered, _ = build_selection_index(files)
+    return ordered
+
+
+def update_selection_index(
+    ordered: list[FileRec],
+    ordered_keys: list[tuple],
+    inventory: dict[str, FileRec],
+    removed: list[FileRec],
+    added: list[FileRec],
+    cfg: dict,
+) -> tuple[list[FileRec], list[tuple]]:
+    changed_count = len(removed) + len(added)
+    rebuild_threshold = int(cfg.get("selection_incremental_rebuild_threshold", 256) or 256)
+
+    if changed_count >= rebuild_threshold:
+        # Still entirely in RAM: no filesystem rescan, just a fresh ordering.
+        return build_selection_index(inventory.values())
+
+    for rec in removed:
+        key = selection_sort_key(rec)
+        if key is None:
+            continue
+
+        idx = bisect.bisect_left(ordered_keys, key)
+        if idx < len(ordered_keys) and ordered_keys[idx] == key:
+            ordered_keys.pop(idx)
+            ordered.pop(idx)
+
+    for rec in added:
+        key = selection_sort_key(rec)
+        if key is None:
+            continue
+
+        idx = bisect.bisect_right(ordered_keys, key)
+        ordered_keys.insert(idx, key)
+        ordered.insert(idx, rec)
+
+    return ordered, ordered_keys
 
 
 
@@ -2260,32 +2779,61 @@ class Watcher:
         self.proc: Optional[subprocess.Popen] = None
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
-        self.dirty_event = threading.Event()
+        self.lock = threading.Lock()
+        self.pending: dict[str, set[str]] = {}
+        self.resync_event = threading.Event()
+        self.cfg: dict = {}
+        self.include_paths: list[str] = []
+        self.mode = "none"
+        self.fanotify_disabled = False
 
     def _write_watch_list(self, cfg: dict) -> None:
         WATCH_LIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         lines = []
+
         for p in build_include_paths(cfg):
             lines.append(os.path.normpath(p))
-        for p in cfg["exclude_prefixes"]:
-            lines.append("@" + os.path.normpath(p))
+
+        excluded = {
+            os.path.normpath(p)
+            for p in cfg["exclude_prefixes"]
+        }
+        excluded.update(os.path.normpath(p) for p in HARD_COLD_PREFIXES)
+
+        for p in sorted(excluded):
+            lines.append("@" + p)
+
         WATCH_LIST_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def start(self, cfg: dict) -> None:
-        self.stop()
-        self._write_watch_list(cfg)
-        cmd = [
-            "inotifywait",
-            "-m",
-            "-r",
-            "-q",
-            "-e",
-            "close_write,create,delete,move,attrib",
-            "--format",
-            "%w%f",
-            "--fromfile",
-            str(WATCH_LIST_PATH),
-        ]
+    def _fanotify_roots(self) -> list[str]:
+        roots: list[str] = []
+        seen_devs: set[int] = set()
+
+        for path in self.include_paths:
+            dev = safe_dev(path)
+            if dev is None or dev in seen_devs:
+                continue
+            seen_devs.add(dev)
+            roots.append(path)
+
+        return roots
+
+    def _path_allowed(self, path: str) -> bool:
+        if not path:
+            return False
+
+        path = os.path.normpath(path)
+        excludes = [os.path.normpath(p) for p in self.cfg.get("exclude_prefixes", [])]
+
+        if path_is_excluded(path, excludes):
+            return False
+
+        if should_prune_dir(path):
+            return False
+
+        return any(path_is_under(path, root) for root in self.include_paths)
+
+    def _start_process(self, cmd: list[str], mode: str) -> bool:
         self.proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -2293,21 +2841,134 @@ class Watcher:
             text=True,
             bufsize=1,
         )
-        self.stop_event.clear()
-        self.dirty_event.set()
+        self.mode = mode
 
-        def reader():
+        # fanotify setup is essentially immediate. If this binary/kernel
+        # combination rejects the request, fall back to recursive inotify.
+        time.sleep(0.05)
+        return self.proc.poll() is None
+
+    def start(self, cfg: dict) -> None:
+        if (
+            self.mode == "fanotify-filesystem"
+            and self.proc is not None
+            and self.proc.poll() is not None
+        ):
+            self.fanotify_disabled = True
+
+        self.stop()
+        self.cfg = dict(cfg)
+        self.include_paths = build_include_paths(cfg)
+        self._write_watch_list(cfg)
+        self.stop_event.clear()
+
+        event_spec = "close_write,create,delete,move,attrib"
+        started = False
+
+        fsnotifywait = shutil.which("fsnotifywait")
+        if (
+            bool(cfg.get("prefer_fanotify_filesystem_watch", True))
+            and fsnotifywait
+            and not self.fanotify_disabled
+        ):
+            roots = self._fanotify_roots()
+            if roots:
+                cmd = [
+                    fsnotifywait,
+                    "-m",
+                    "-q",
+                    "-S",
+                    "-e",
+                    event_spec,
+                    "--format",
+                    "%e|%w%f",
+                    *roots,
+                ]
+                try:
+                    started = self._start_process(cmd, "fanotify-filesystem")
+                except Exception:
+                    started = False
+
+                if not started:
+                    self.fanotify_disabled = True
+                    if self.proc is not None:
+                        stop_proc(self.proc)
+                        self.proc = None
+
+        if not started:
+            cmd = [
+                "inotifywait",
+                "-m",
+                "-r",
+                "-q",
+                "-P",
+                "-e",
+                event_spec,
+                "--format",
+                "%e|%w%f",
+                "--fromfile",
+                str(WATCH_LIST_PATH),
+            ]
+            self._start_process(cmd, "inotify-recursive")
+
+        with self.lock:
+            self.pending.clear()
+
+        def reader() -> None:
             assert self.proc is not None
+
             try:
+                assert self.proc.stdout is not None
                 for line in self.proc.stdout:
                     if self.stop_event.is_set():
                         break
-                    if line:
-                        self.dirty_event.set()
-            except Exception:
-                self.dirty_event.set()
 
-        self.thread = threading.Thread(target=reader, daemon=True)
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+
+                    if "|" not in line:
+                        self.resync_event.set()
+                        continue
+
+                    events, path = line.split("|", 1)
+                    event_set = {
+                        event.strip().upper()
+                        for event in events.split(",")
+                        if event.strip()
+                    }
+
+                    if "Q_OVERFLOW" in event_set or "UNMOUNT" in event_set:
+                        self.resync_event.set()
+                        continue
+
+                    path = os.path.normpath(path)
+                    if not self._path_allowed(path):
+                        continue
+
+                    max_pending = int(
+                        self.cfg.get("max_pending_fs_events", 100000)
+                        or 100000
+                    )
+
+                    with self.lock:
+                        existing = self.pending.setdefault(path, set())
+                        existing.update(event_set)
+
+                        if len(self.pending) > max_pending:
+                            # Losing precision is never silently accepted.
+                            # Force one recovery scan rather than pretending
+                            # the incremental inventory is still authoritative.
+                            self.pending.clear()
+                            self.resync_event.set()
+            except Exception:
+                self.resync_event.set()
+
+        self.thread = threading.Thread(
+            target=reader,
+            name="ramcache-fs-watcher",
+            daemon=True,
+        )
         self.thread.start()
 
     def stop(self) -> None:
@@ -2316,14 +2977,42 @@ class Watcher:
             stop_proc(self.proc)
         self.proc = None
 
-    def mark_clean(self) -> None:
-        self.dirty_event.clear()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=1)
+        self.thread = None
 
-    def is_dirty(self) -> bool:
-        return self.dirty_event.is_set()
+    def take_changes(self) -> list[tuple[str, str]]:
+        with self.lock:
+            changes = [
+                (",".join(sorted(events)), path)
+                for path, events in self.pending.items()
+            ]
+            self.pending.clear()
+        return changes
+
+    def requeue_changes(self, changes: list[tuple[str, str]]) -> None:
+        with self.lock:
+            for events, path in changes:
+                bucket = self.pending.setdefault(path, set())
+                bucket.update(
+                    event.strip().upper()
+                    for event in events.split(",")
+                    if event.strip()
+                )
+
+    def pending_count(self) -> int:
+        with self.lock:
+            return len(self.pending)
+
+    def needs_resync(self) -> bool:
+        return self.resync_event.is_set()
+
+    def mark_resynced(self) -> None:
+        self.resync_event.clear()
 
     def dead(self) -> bool:
         return self.proc is None or self.proc.poll() is not None
+
 
 def compute_vmtouch_pause_plan(path_count: int, cfg: dict) -> tuple[float, int]:
     pause_seconds = float(cfg.get("vmtouch_feed_pause_seconds", 0.02) or 0.0)
@@ -2468,8 +3157,8 @@ def stop_vmtouch_runs(runs: list[VmtouchRun]) -> None:
 
 
 def chunk_selected_records(selected: list[FileRec], cfg: dict) -> list[list[FileRec]]:
-    # Smaller chunks make shrink more surgical. 256M means shrink usually
-    # releases only what it needs plus at most roughly one chunk.
+    # Smaller chunks make shrink more surgical. The normal profile uses 1G
+    # chunks; low-RAM systems use 512M chunks for finer pressure release.
     max_chunk_bytes = (
         parse_size(cfg.get("vmtouch_chunk_target_bytes", "256M"))
         or (256 * MIB)
@@ -2531,69 +3220,119 @@ def sync_vmtouch_cache(
 ) -> tuple[list[VmtouchRun], list[FileRec]]:
     current = flatten_run_records(runs)
 
-    if [record_identity(r) for r in current] == [record_identity(r) for r in desired]:
+    desired_identities = [record_identity(r) for r in desired]
+    current_identities = [record_identity(r) for r in current]
+
+    if current_identities == desired_identities:
         return runs, current
 
-    current_bytes = run_bytes(runs)
     desired_bytes = selected_bytes(desired)
 
-    # Shrink path: do NOT rebuild. Just drop tail chunks until the locked cache
-    # is under the desired budget. Because build_selection_order() puts small
-    # and high priority files earlier, tail chunks are the correct things to
-    # discard first under pressure.
-    if desired_bytes < current_bytes:
-        to_stop = []
-        while runs and run_bytes(runs) > desired_bytes:
-            to_stop.append(runs.pop())
+    # Fast pressure path: stop tail chunks until we are at or below the new
+    # budget. We then surgically refill only the desired portion of the final
+    # dropped chunk, avoiding the old all-or-nothing cache rebuild.
+    to_stop: list[VmtouchRun] = []
+    while runs and run_bytes(runs) > desired_bytes:
+        to_stop.append(runs.pop())
 
-        for idx, run in enumerate(to_stop):
-            run.stop_event.set()
+    for idx, run in enumerate(to_stop):
+        run.stop_event.set()
 
-            if run.proc.poll() is None:
-                try:
-                    run.proc.terminate()
-                except ProcessLookupError:
-                    pass
+        if run.proc.poll() is None:
+            try:
+                run.proc.terminate()
+            except ProcessLookupError:
+                pass
 
-            stop_proc(run)
+        stop_proc(run)
 
-            if idx + 1 < len(to_stop):
-                maybe_stagger_vmtouch_transition(cfg, "vmtouch_stop_stagger_seconds")
+        if idx + 1 < len(to_stop):
+            maybe_stagger_vmtouch_transition(cfg, "vmtouch_stop_stagger_seconds")
 
-        return runs, flatten_run_records(runs)
+    desired_set = set(desired_identities)
 
-    prefix = common_prefix_len(current, desired)
+    # If a file changed in-place, only recycle chunks that contain a stale
+    # record. Unchanged chunks remain locked and are never needlessly rebuilt.
+    stale_runs: list[VmtouchRun] = []
+    kept_runs: list[VmtouchRun] = []
 
-    # Grow path: if the desired cache extends the current cache, append only
-    # the new suffix chunks.
-    if prefix == len(current):
-        extra = desired[prefix:]
-        runs.extend(start_vmtouch_chunks(cfg, max_file_size_bytes, extra))
+    for run in runs:
+        if all(record_identity(rec) in desired_set for rec in run.records):
+            kept_runs.append(run)
+        else:
+            stale_runs.append(run)
 
-        return runs, flatten_run_records(runs)
+    for idx, run in enumerate(stale_runs):
+        run.stop_event.set()
 
-    # Reorder/config/rescan path: full rebuild only when the desired file order
-    # changed in a non-prefix way. This should be caused by rescans/config
-    # changes, not normal memory-pressure shrink.
-    stop_vmtouch_runs(runs)
-    runs.extend(start_vmtouch_chunks(cfg, max_file_size_bytes, desired))
+        if run.proc.poll() is None:
+            try:
+                run.proc.terminate()
+            except ProcessLookupError:
+                pass
+
+        stop_proc(run)
+
+        if idx + 1 < len(stale_runs):
+            maybe_stagger_vmtouch_transition(cfg, "vmtouch_stop_stagger_seconds")
+
+    runs = kept_runs
+    locked_set = {
+        record_identity(rec)
+        for rec in flatten_run_records(runs)
+    }
+
+    missing = [
+        rec
+        for rec in desired
+        if record_identity(rec) not in locked_set
+    ]
+
+    if missing:
+        runs.extend(start_vmtouch_chunks(cfg, max_file_size_bytes, missing))
+
+    # Process order is only metadata used by our shrink strategy. Reordering
+    # the handles costs nothing and keeps future pressure releases priority-
+    # correct even after incremental file updates.
+    desired_position = {
+        identity: idx
+        for idx, identity in enumerate(desired_identities)
+    }
+    runs.sort(
+        key=lambda run: min(
+            (
+                desired_position.get(record_identity(rec), len(desired_position))
+                for rec in run.records
+            ),
+            default=len(desired_position),
+        )
+    )
+
     return runs, flatten_run_records(runs)
 
+
 def write_status(
-    target_gib: int,
+    target_gib: float,
     selected: list[FileRec],
     meminfo: dict[str, int],
     last_scan_epoch: float,
     cfg: dict,
+    *,
+    last_incremental_scan_epoch: float = 0.0,
+    inventory_files: int = 0,
+    pending_fs_events: int = 0,
+    watcher_mode: str = "none",
+    rapid_growth_bytes: int = 0,
 ) -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    selected_bytes = sum(r.size for r in selected)
+    selected_total_bytes = sum(r.size for r in selected)
     payload = {
         "timestamp": int(time.time()),
         "memory_profile": cfg.get("memory_profile", "normal"),
         "target_locked_gib": target_gib,
         "selected_files": len(selected),
-        "selected_gib": bytes_to_gib(selected_bytes),
+        "selected_gib": bytes_to_gib(selected_total_bytes),
+        "inventory_files": int(inventory_files),
         "memtotal_gib": bytes_to_gib(meminfo["MemTotal"]),
         "memavailable_gib": bytes_to_gib(meminfo["MemAvailable"]),
         "working_used_gib": bytes_to_gib(meminfo["MemTotal"] - meminfo["MemAvailable"]),
@@ -2602,7 +3341,12 @@ def write_status(
         "inactive_file_gib": bytes_to_gib(meminfo.get("Inactive(file)", 0)),
         "mlocked_gib": bytes_to_gib(meminfo.get("Mlocked", 0)),
         "unevictable_gib": bytes_to_gib(meminfo.get("Unevictable", 0)),
+        "rapid_memory_growth_gib": bytes_to_gib(rapid_growth_bytes),
         "last_scan_epoch": int(last_scan_epoch),
+        "last_incremental_scan_epoch": int(last_incremental_scan_epoch),
+        "pending_fs_events": int(pending_fs_events),
+        "watcher_mode": watcher_mode,
+        "scan_workers": resolve_scan_worker_count(cfg),
     }
     STATUS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -2613,24 +3357,52 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
 
     watcher = Watcher()
+    memory_monitor = MemoryMonitor()
+
     current_config_text = None
-    inventory: list[FileRec] = []
+    watcher_started_once = False
+    full_scan_required_reason: Optional[str] = "startup"
+
+    inventory: dict[str, FileRec] = {}
     ordered: list[FileRec] = []
+    ordered_keys: list[tuple] = []
+
     current_target_bytes: Optional[int] = None
     current_vmtouch_runs: list[VmtouchRun] = []
     current_selected: list[FileRec] = []
+
     last_full_scan = 0.0
-    last_dirty_scan = 0.0
+    last_incremental_scan = 0.0
 
     while RUNNING:
         try:
             config_text, cfg = load_config()
             config_changed = config_text != current_config_text
-            if config_changed or watcher.dead():
+
+            memory_monitor.start(cfg)
+            memory_monitor.update_config(cfg)
+
+            watcher_was_dead = watcher.dead()
+
+            if config_changed:
+                full_scan_required_reason = (
+                    "startup" if current_config_text is None else "configuration changed"
+                )
+
+            elif watcher_started_once and watcher_was_dead:
+                # A watcher gap can lose events. Reliability wins here: recover
+                # with one authoritative scan instead of trusting stale state.
+                full_scan_required_reason = "filesystem watcher recovery"
+
+            if config_changed or watcher_was_dead:
                 current_config_text = config_text
                 watcher.start(cfg)
+                watcher_started_once = True
 
-            meminfo = parse_meminfo()
+            if watcher.needs_resync():
+                full_scan_required_reason = "filesystem event overflow/recovery"
+
+            meminfo = memory_monitor.meminfo()
             max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
 
             if not STATUS_PATH.exists():
@@ -2640,56 +3412,168 @@ def main() -> int:
                     meminfo,
                     last_full_scan,
                     cfg,
+                    last_incremental_scan_epoch=last_incremental_scan,
+                    inventory_files=len(inventory),
+                    pending_fs_events=watcher.pending_count(),
+                    watcher_mode=watcher.mode,
+                    rapid_growth_bytes=memory_monitor.recent_growth_bytes(cfg),
                 )
-
-            emergency_pressure = (
-                current_target_bytes is not None
-                and bool(current_vmtouch_runs)
-                and memory_pressure_active(meminfo, cfg)
-            )
 
             now = time.time()
-            dirty_rescan_interval = int(cfg.get("dirty_rescan_interval_seconds", 1800))
-            dirty_scan_due = (
-                watcher.is_dirty()
-                and now - last_dirty_scan >= dirty_rescan_interval
+            full_rescan_interval = int(cfg.get("full_rescan_interval_seconds", 0) or 0)
+
+            if (
+                full_rescan_interval > 0
+                and last_full_scan > 0
+                and now - last_full_scan >= full_rescan_interval
+            ):
+                full_scan_required_reason = "configured periodic verification"
+
+            rapid_threshold = (
+                parse_size(cfg.get("rapid_memory_growth_threshold_bytes", "2G"))
+                or (2 * GIB)
+            )
+            pending_growth = memory_monitor.pending_growth_bytes(cfg)
+
+            emergency_pressure = (
+                memory_pressure_active(meminfo, cfg)
+                or pending_growth >= rapid_threshold
             )
 
-            need_scan = (
-                not emergency_pressure
+            inventory_changed = False
+
+            if full_scan_required_reason is not None and not emergency_pressure:
+                reason = full_scan_required_reason
+                logging.info(
+                    "starting full inventory scan (%s) with %d workers",
+                    reason,
+                    resolve_scan_worker_count(cfg),
+                )
+                scan_started = time.monotonic()
+
+                # Clear an old overflow marker before scanning. If another
+                # overflow happens during the scan it will be set again and
+                # force one more recovery pass.
+                watcher.mark_resynced()
+
+                try:
+                    new_inventory = scan_files(
+                        cfg,
+                        max_file_size_bytes,
+                        memory_monitor=memory_monitor,
+                    )
+                    new_ordered, new_ordered_keys = build_selection_index(
+                        new_inventory
+                    )
+                except MemoryPressureAbort:
+                    logging.info(
+                        "memory growth/pressure detected during scan; "
+                        "aborting scan so cache pressure can be released first"
+                    )
+                else:
+                    inventory = {rec.path: rec for rec in new_inventory}
+                    ordered = new_ordered
+                    ordered_keys = new_ordered_keys
+                    last_full_scan = time.time()
+                    inventory_changed = True
+
+                    if watcher.needs_resync():
+                        full_scan_required_reason = "filesystem event overflow during scan"
+                    else:
+                        full_scan_required_reason = None
+
+                    logging.info(
+                        "inventory scan complete: %d files in %.2fs",
+                        len(inventory),
+                        time.monotonic() - scan_started,
+                    )
+
+                meminfo = memory_monitor.meminfo()
+                max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
+
+            # Normal updates are event-driven. No whole-filesystem walk occurs:
+            # only files/directories reported by the kernel are re-statted.
+            incremental_interval = float(
+                cfg.get("incremental_rescan_interval_seconds", 5)
+                or 5
+            )
+            incremental_due = (
+                full_scan_required_reason is None
+                and watcher.pending_count() > 0
                 and (
-                    config_changed
-                    or not inventory
-                    or watcher.dead()
-                    or dirty_scan_due
-                    or now - last_full_scan >= int(cfg.get("full_rescan_interval_seconds", 86400))
+                    inventory_changed
+                    or time.time() - last_incremental_scan >= incremental_interval
                 )
             )
 
-            if need_scan:
+            if incremental_due and not emergency_pressure:
+                changes = watcher.take_changes()
+
                 try:
-                    new_inventory = scan_files(cfg, max_file_size_bytes)
-                    new_ordered = build_selection_order(new_inventory)
+                    removed, added = apply_fs_changes(
+                        inventory,
+                        changes,
+                        cfg,
+                        max_file_size_bytes,
+                        memory_monitor,
+                    )
                 except MemoryPressureAbort:
-                    logging.info("memory pressure detected during scan; aborting scan and shrinking existing cache first")
+                    watcher.requeue_changes(changes)
+                    logging.info(
+                        "memory growth/pressure detected during incremental scan; "
+                        "deferring changed-file refresh"
+                    )
                 else:
-                    inventory = new_inventory
-                    ordered = new_ordered
-                    last_full_scan = now
-                    if watcher.is_dirty():
-                        last_dirty_scan = now
-                    watcher.mark_clean()
+                    if removed or added:
+                        ordered, ordered_keys = update_selection_index(
+                            ordered,
+                            ordered_keys,
+                            inventory,
+                            removed,
+                            added,
+                            cfg,
+                        )
+                        inventory_changed = True
 
-                meminfo = parse_meminfo()
-                max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
+                    last_incremental_scan = time.time()
 
-            any_vmtouch_dead = any(run.poll() is not None for run in current_vmtouch_runs)
+            # Re-sample after any scan work. The memory monitor continues
+            # sampling while scans run, so a long scan cannot hide a RAM spike.
+            meminfo = memory_monitor.meminfo()
+            max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
+
+            rapid_release_bytes, rapid_growth_bytes = (
+                memory_monitor.consume_rapid_release_bytes(cfg)
+            )
+
+            any_vmtouch_dead = any(
+                run.poll() is not None
+                for run in current_vmtouch_runs
+            )
             active_target_bytes = current_target_bytes
 
             if not current_vmtouch_runs or any_vmtouch_dead:
                 active_target_bytes = None
 
-            desired_target_bytes, _, _ = choose_target_bytes(meminfo, cfg, active_target_bytes)
+            desired_target_bytes, _, _ = choose_target_bytes(
+                meminfo,
+                cfg,
+                active_target_bytes,
+            )
+
+            if rapid_release_bytes > 0 and current_vmtouch_runs:
+                locked_estimate = selected_bytes(current_selected)
+                proactive_target = max(0, locked_estimate - rapid_release_bytes)
+                desired_target_bytes = min(
+                    desired_target_bytes,
+                    proactive_target,
+                )
+                logging.info(
+                    "rapid RAM growth detected (%.2f GiB recent increase); "
+                    "proactively releasing %.2f GiB of cache",
+                    bytes_to_gib(rapid_growth_bytes),
+                    bytes_to_gib(rapid_release_bytes),
+                )
 
             effective_target_bytes = current_target_bytes
             target_changed = target_change_is_meaningful(
@@ -2705,12 +3589,8 @@ def main() -> int:
                 effective_target_bytes = desired_target_bytes
                 target_changed = True
 
-            # Do not rebuild the selected file list every controller tick.
-            # Selection is expensive on large inventories, so only recompute it
-            # when the inventory changed, the target changed, vmtouch died, or
-            # there is no active cache state yet.
             selection_needs_refresh = (
-                need_scan
+                inventory_changed
                 or target_changed
                 or any_vmtouch_dead
                 or not current_selected
@@ -2718,7 +3598,11 @@ def main() -> int:
             )
 
             if selection_needs_refresh:
-                desired_selected = select_files(ordered, effective_target_bytes, cfg)
+                desired_selected = select_files(
+                    ordered,
+                    effective_target_bytes,
+                    cfg,
+                )
                 ensure_limits_for_selection(desired_selected, cfg)
 
                 if any_vmtouch_dead:
@@ -2740,15 +3624,20 @@ def main() -> int:
                 meminfo,
                 last_full_scan,
                 cfg,
+                last_incremental_scan_epoch=last_incremental_scan,
+                inventory_files=len(inventory),
+                pending_fs_events=watcher.pending_count(),
+                watcher_mode=watcher.mode,
+                rapid_growth_bytes=memory_monitor.recent_growth_bytes(cfg),
             )
 
         except Exception:
             logging.exception("controller loop error")
 
-        sleep_for = 10
+        sleep_for = 1
         try:
             _, cfg = load_config()
-            sleep_for = int(cfg.get("check_interval_seconds", 10))
+            sleep_for = int(cfg.get("check_interval_seconds", 1))
         except Exception:
             pass
 
@@ -2757,6 +3646,7 @@ def main() -> int:
                 break
             time.sleep(1)
 
+    memory_monitor.stop()
     watcher.stop()
     stop_vmtouch_runs(current_vmtouch_runs)
     return 0
@@ -2791,13 +3681,25 @@ write_config() {
   "cross_filesystem_include_roots": ["/snap"],
 
   "check_interval_seconds": 1,
-  "dirty_rescan_interval_seconds": 10800,
-  "full_rescan_interval_seconds": 86400,
+  "incremental_rescan_interval_seconds": 5,
+  "full_rescan_interval_seconds": 0,
+  "prefer_fanotify_filesystem_watch": true,
+  "max_pending_fs_events": 100000,
 
-  "scan_cooldown_every": 512,
-  "scan_cooldown_seconds": 0.003,
-  "select_cooldown_every": 512,
-  "select_cooldown_seconds": 0.002,
+  "scan_max_thread_fraction": 0.50,
+  "scan_worker_max": 32,
+  "scan_cooldown_every": 4096,
+  "scan_cooldown_seconds": 0.001,
+  "select_cooldown_every": 4096,
+  "select_cooldown_seconds": 0.0005,
+  "selection_incremental_rebuild_threshold": 256,
+
+  "memory_monitor_interval_seconds": 0.5,
+  "rapid_memory_window_seconds": 60,
+  "rapid_memory_growth_threshold_bytes": "2G",
+  "rapid_memory_release_multiplier": 1.0,
+  "rapid_memory_release_margin_bytes": "512M",
+  "memory_pressure_abort_check_every": 128,
 
   "target_available_bytes": "8G",
   "target_shrink_to_available_bytes": "10G",
@@ -2808,7 +3710,7 @@ write_config() {
   "target_max_grow_step_bytes": "8G",
   "target_max_inflight_bytes": "8G",
 
-  "vmtouch_chunk_target_bytes": "2048M",
+  "vmtouch_chunk_target_bytes": "1024M",
   "vmtouch_chunk_max_paths": 8192,
   "max_selection_budget_total_ratio": 4.0,
 
@@ -2839,27 +3741,89 @@ JSON
 }
 
 cpu_quota_for_thread_ratio() {
-  local ratio="${1:-0.50}"
-  local threads
+  local ratio="${1:-0.25}"
 
-  threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
-
-  python3 - "$threads" "$ratio" <<'PY'
+  python3 - "$ratio" <<'PY'
 import math
+import os
 import sys
 
-threads = max(1, int(sys.argv[1]))
-ratio = float(sys.argv[2])
+ratio = float(sys.argv[1])
 
-# systemd CPUQuota is measured as % of one logical CPU.
-quota = max(1, math.floor(threads * ratio * 100))
+try:
+    threads = len(os.sched_getaffinity(0))
+except Exception:
+    threads = os.cpu_count() or 1
 
+# systemd CPUQuota is measured as a percentage of one logical CPU.
+# 24 logical CPUs * 25% = 600%, i.e. six CPU-cores worth of aggregate time.
+quota = max(1, math.floor(max(1, threads) * ratio * 100))
 print(f"{quota}%")
 PY
 }
 
+cpu_affinity_for_thread_ratio() {
+  local ratio="${1:-0.50}"
+
+  python3 - "$ratio" <<'PY'
+import math
+import os
+import sys
+from pathlib import Path
+
+ratio = float(sys.argv[1])
+
+try:
+    cpus = sorted(os.sched_getaffinity(0))
+except Exception:
+    cpus = list(range(os.cpu_count() or 1))
+
+target = max(1, math.ceil(len(cpus) * ratio))
+
+def topology_key(cpu):
+    base = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+    try:
+        package = (base / "physical_package_id").read_text().strip()
+        core = (base / "core_id").read_text().strip()
+        return (package, core)
+    except Exception:
+        return ("cpu", str(cpu))
+
+# Prefer one SMT sibling from each physical core first. On a 12C/24T 3900X,
+# this normally chooses 12 logical CPUs spanning all 12 physical cores.
+chosen = []
+seen_cores = set()
+
+for cpu in cpus:
+    key = topology_key(cpu)
+    if key in seen_cores:
+        continue
+    seen_cores.add(key)
+    chosen.append(cpu)
+    if len(chosen) >= target:
+        break
+
+if len(chosen) < target:
+    chosen_set = set(chosen)
+    for cpu in cpus:
+        if cpu in chosen_set:
+            continue
+        chosen.append(cpu)
+        if len(chosen) >= target:
+            break
+
+print(" ".join(str(cpu) for cpu in chosen[:target]))
+PY
+}
+
 write_service() {
-  cat > /etc/systemd/system/ramcache-controller.service <<'UNIT'
+  local cpu_quota
+  local cpu_affinity
+
+  cpu_quota="$(cpu_quota_for_thread_ratio 0.25)"
+  cpu_affinity="$(cpu_affinity_for_thread_ratio 0.50)"
+
+  cat > /etc/systemd/system/ramcache-controller.service <<UNIT
 [Unit]
 Description=Adaptive RAM cache controller using vmtouch
 After=local-fs.target
@@ -2871,16 +3835,18 @@ User=root
 Group=root
 ExecStart=/usr/bin/python3 /opt/ramcache-controller/ramcache_controller.py
 Restart=always
-RestartSec=70
+RestartSec=5
 KillMode=control-group
 
-# Cap the entire service tree to 50% of ONE logical CPU thread.
-# This includes Python, inotifywait, and every vmtouch child process.
+# Use at most half of the machine's logical CPUs, preferring one SMT sibling
+# per physical core, while capping aggregate CPU time to 25% of the machine.
+# Example on a 24-thread CPU: 12 eligible CPUs, 600% aggregate quota.
 CPUAccounting=true
-CPUQuota=50%
-CPUQuotaPeriodSec=2ms
+CPUAffinity=$cpu_affinity
+CPUQuota=$cpu_quota
+CPUQuotaPeriodSec=20ms
 
-# Be polite under load.
+# Foreground/user work wins scheduling and I/O contention.
 Nice=19
 IOSchedulingClass=idle
 
@@ -2896,6 +3862,8 @@ UNIT
 write_sysctls() {
   cat > /etc/sysctl.d/99-ramcache-inotify.conf <<'EOF'
 fs.inotify.max_user_watches=1048576
+fs.inotify.max_user_instances=1024
+fs.inotify.max_queued_events=262144
 EOF
 
   if [[ ! -f /etc/sysctl.d/99-cache-aggressive.conf ]]; then
@@ -2908,11 +3876,34 @@ EOF
   sysctl --system >/dev/null
 }
 
+ensure_fs_watch_tools() {
+  # inotify-tools provides both the universal inotify fallback and, on modern
+  # Ubuntu/Pop!/Mint releases, fsnotifywait for fanotify filesystem watching.
+  # Only touch apt when one of the required commands is actually absent.
+  if ! command -v inotifywait >/dev/null 2>&1 || ! command -v fsnotifywait >/dev/null 2>&1; then
+    echo "Installing Linux filesystem notification tools (inotify-tools)..."
+    apt install -y inotify-tools
+  fi
+
+  if ! command -v inotifywait >/dev/null 2>&1; then
+    echo "ERROR: inotifywait is unavailable even after installing inotify-tools." >&2
+    return 1
+  fi
+
+  if command -v fsnotifywait >/dev/null 2>&1 \
+    && fsnotifywait --help 2>&1 | grep -q -- '--filesystem'; then
+    echo "Filesystem watcher: fsnotifywait/fanotify is available; it will be preferred."
+  else
+    echo "Filesystem watcher: fanotify userspace support is unavailable; recursive inotify will be used."
+  fi
+}
+
 install_all() {
   need_root
   export DEBIAN_FRONTEND=noninteractive
   apt update
-  apt install -y python3 vmtouch inotify-tools
+  apt install -y python3 vmtouch
+  ensure_fs_watch_tools
   write_controller
   write_config
   write_service
@@ -2963,6 +3954,50 @@ status_all() {
   fi
   echo
   grep -E 'MemAvailable|Cached|Active\(file\)|Inactive\(file\)|Mlocked|Unevictable' /proc/meminfo || true
+
+  echo
+  echo "Filesystem watcher capabilities:"
+  if command -v inotifywait >/dev/null 2>&1; then
+    echo "  inotifywait:  $(command -v inotifywait)"
+  else
+    echo "  inotifywait:  missing"
+  fi
+
+  if command -v fsnotifywait >/dev/null 2>&1; then
+    echo "  fsnotifywait: $(command -v fsnotifywait)"
+    if fsnotifywait --help 2>&1 | grep -q -- '--filesystem'; then
+      echo "  fanotify filesystem mode (-S): userspace tool supports it"
+    else
+      echo "  fanotify filesystem mode (-S): not supported by this fsnotifywait build"
+    fi
+  else
+    echo "  fsnotifywait: missing (controller will use recursive inotify)"
+  fi
+
+  kernel_config="/boot/config-$(uname -r)"
+  if [[ -r "$kernel_config" ]]; then
+    if grep -q '^CONFIG_FANOTIFY=y' "$kernel_config"; then
+      echo "  kernel CONFIG_FANOTIFY: enabled"
+    else
+      echo "  kernel CONFIG_FANOTIFY: not reported as enabled"
+    fi
+  else
+    echo "  kernel CONFIG_FANOTIFY: config file unavailable; runtime watcher result is authoritative"
+  fi
+
+  if [[ -f /run/ramcache-controller/status.json ]]; then
+    python3 - <<'PY' 2>/dev/null || true
+import json
+from pathlib import Path
+
+try:
+    data = json.loads(Path("/run/ramcache-controller/status.json").read_text())
+    mode = data.get("watcher_mode", "unknown")
+    print(f"  active controller watcher: {mode}")
+except Exception:
+    pass
+PY
+  fi
 }
 
 case "$ACTION" in
