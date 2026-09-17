@@ -41,6 +41,7 @@ MIB = 1024 ** 2
 GIB = 1024 ** 3
 
 RUNNING = True
+PRESSURE_WAKE_EVENT = threading.Event()
 
 @dataclass(frozen=True)
 class FileRec:
@@ -63,6 +64,7 @@ class VmtouchRun:
 def handle_signal(signum, frame):
     global RUNNING
     RUNNING = False
+    PRESSURE_WAKE_EVENT.set()
 
 
 def load_config() -> tuple[str, dict]:
@@ -100,6 +102,32 @@ def parse_meminfo() -> dict[str, int]:
             data[name] = int(value.strip().split()[0]) * KIB
     return data
 
+
+def parse_memory_psi_totals() -> tuple[int, int]:
+    """Return system-wide memory PSI some/full cumulative stall time in usec."""
+    some_total = 0
+    full_total = 0
+
+    try:
+        with open("/proc/pressure/memory", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                total = 0
+                for part in parts[1:]:
+                    if part.startswith("total="):
+                        total = int(part.split("=", 1)[1])
+                        break
+                if parts[0] == "some":
+                    some_total = total
+                elif parts[0] == "full":
+                    full_total = total
+    except (OSError, ValueError):
+        pass
+
+    return some_total, full_total
+
 LOW_RAM_PROFILE_DEFAULTS = {
     "target_available_bytes": "4G",
     "target_shrink_to_available_bytes": "6G",
@@ -128,6 +156,9 @@ LOW_RAM_PROFILE_DEFAULTS = {
     "vmtouch_feed_pause_seconds": 0.005,
     "vmtouch_feed_target_extra_seconds": 5,
 
+    "scan_worker_max": 16,
+    "scan_io_worker_multiplier_nonrotational": 1.5,
+    "scan_io_worker_multiplier_unknown": 1.25,
     "scan_cooldown_every": 512,
     "scan_cooldown_seconds": 0.003,
     "select_cooldown_every": 512,
@@ -189,22 +220,31 @@ def maybe_abort_for_memory_pressure(step: int, cfg: dict) -> None:
 
 
 class MemoryMonitor:
-    """Continuously sample memory so long scans cannot blind the controller."""
+    """Continuously sample memory so long operations cannot blind the controller.
+
+    The controller reacts to three independent signals: a hard MemAvailable
+    floor, fast external RAM growth, and Linux PSI memory stalls.
+    """
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.cfg: dict = {}
-        self.samples: deque[tuple[float, int]] = deque(maxlen=4096)
+        self.samples: deque[tuple[float, int]] = deque(maxlen=8192)
         self.latest: dict[str, int] = {}
         self.ack_pressure_used: Optional[int] = None
+        self.growth_guard_until = 0.0
+        self.last_psi_some_total: Optional[int] = None
+        self.last_psi_full_total: Optional[int] = None
+        self.pending_psi_release_bytes = 0
+        self.last_psi_some_delta = 0
+        self.last_psi_full_delta = 0
 
     @staticmethod
     def _pressure_used(meminfo: dict[str, int]) -> int:
-        # MemAvailable already discounts reclaimable page cache. Subtracting
-        # Mlocked prevents our own vmtouch growth from looking like an external
-        # RAM spike. Hard MemAvailable protection still catches all pressure.
+        # Do not count our own mlocked vmtouch cache as "external growth".
+        # Hard MemAvailable and PSI still account for real system pressure.
         return max(
             0,
             int(meminfo.get("MemTotal", 0))
@@ -231,13 +271,59 @@ class MemoryMonitor:
 
     def stop(self) -> None:
         self.stop_event.set()
+        PRESSURE_WAKE_EVENT.set()
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2)
 
+    def _window_floor_locked(
+        self,
+        now: float,
+        seconds: float,
+    ) -> tuple[int, int, float]:
+        if not self.samples:
+            return 0, 0, 0.0
+
+        cutoff = now - max(0.1, seconds)
+        recent = [(ts, value) for ts, value in self.samples if ts >= cutoff]
+        if not recent:
+            recent = [self.samples[-1]]
+
+        current_ts, current = self.samples[-1]
+        floor_ts, floor = min(recent, key=lambda item: item[1])
+        return current, floor, max(0.001, current_ts - floor_ts)
+
+    def _pending_growth_locked(
+        self,
+        now: float,
+        cfg: dict,
+    ) -> tuple[int, int, int, float]:
+        rapid_window = float(cfg.get("rapid_memory_window_seconds", 60) or 60)
+        fast_window = float(cfg.get("fast_memory_growth_window_seconds", 10) or 10)
+
+        current, recent_floor, _ = self._window_floor_locked(now, rapid_window)
+        _, fast_floor, fast_span = self._window_floor_locked(now, fast_window)
+
+        if self.ack_pressure_used is None:
+            self.ack_pressure_used = recent_floor
+
+        if current < self.ack_pressure_used:
+            self.ack_pressure_used = current
+
+        if self.ack_pressure_used < recent_floor:
+            self.ack_pressure_used = recent_floor
+
+        baseline = max(recent_floor, self.ack_pressure_used)
+        unacked_growth = max(0, current - baseline)
+        fast_growth = max(0, current - fast_floor)
+        return current, unacked_growth, fast_growth, fast_span
+
     def _run(self) -> None:
         while not self.stop_event.is_set():
+            wake_controller = False
+
             try:
                 meminfo = parse_meminfo()
+                psi_some, psi_full = parse_memory_psi_totals()
                 now = time.monotonic()
                 pressure_used = self._pressure_used(meminfo)
 
@@ -246,98 +332,215 @@ class MemoryMonitor:
                     self.samples.append((now, pressure_used))
                     cfg = dict(self.cfg)
 
-                    window = float(cfg.get("rapid_memory_window_seconds", 60) or 60)
-                    cutoff = now - max(10.0, window * 2.0)
+                    longest_window = max(
+                        float(cfg.get("rapid_memory_window_seconds", 60) or 60),
+                        float(cfg.get("fast_memory_growth_window_seconds", 10) or 10),
+                    )
+                    cutoff = now - max(20.0, longest_window * 2.0)
                     while self.samples and self.samples[0][0] < cutoff:
                         self.samples.popleft()
+
+                    _, unacked_growth, fast_growth, _ = self._pending_growth_locked(now, cfg)
+
+                    rapid_threshold = (
+                        parse_size(cfg.get("rapid_memory_growth_threshold_bytes", "2G"))
+                        or (2 * GIB)
+                    )
+                    fast_threshold = (
+                        parse_size(cfg.get("fast_memory_growth_threshold_bytes", "1G"))
+                        or GIB
+                    )
+                    fast_min_unacked = (
+                        parse_size(cfg.get("fast_memory_growth_min_unacked_bytes", "512M"))
+                        or (512 * MIB)
+                    )
+
+                    hard_pressure = memory_pressure_active(meminfo, cfg)
+                    fast_pressure = (
+                        unacked_growth >= fast_min_unacked
+                        and fast_growth >= fast_threshold
+                    )
+                    rapid_pressure = unacked_growth >= rapid_threshold
+
+                    some_delta = 0
+                    full_delta = 0
+                    if self.last_psi_some_total is not None:
+                        some_delta = max(0, psi_some - self.last_psi_some_total)
+                    if self.last_psi_full_total is not None:
+                        full_delta = max(0, psi_full - self.last_psi_full_total)
+
+                    self.last_psi_some_total = psi_some
+                    self.last_psi_full_total = psi_full
+                    self.last_psi_some_delta = some_delta
+                    self.last_psi_full_delta = full_delta
+
+                    some_threshold = int(
+                        cfg.get("psi_memory_some_stall_threshold_us", 100000)
+                        or 100000
+                    )
+                    full_threshold = int(
+                        cfg.get("psi_memory_full_stall_threshold_us", 20000)
+                        or 20000
+                    )
+                    psi_pressure = (
+                        (some_threshold > 0 and some_delta >= some_threshold)
+                        or (full_threshold > 0 and full_delta >= full_threshold)
+                    )
+
+                    if psi_pressure:
+                        release = (
+                            parse_size(cfg.get("psi_memory_release_bytes", "2G"))
+                            or (2 * GIB)
+                        )
+                        self.pending_psi_release_bytes = max(
+                            self.pending_psi_release_bytes,
+                            int(release),
+                        )
+
+                    wake_controller = (
+                        hard_pressure
+                        or fast_pressure
+                        or rapid_pressure
+                        or psi_pressure
+                    )
             except Exception:
                 pass
 
+            if wake_controller:
+                PRESSURE_WAKE_EVENT.set()
+
             with self.lock:
                 interval = float(
-                    self.cfg.get("memory_monitor_interval_seconds", 0.5)
-                    or 0.5
+                    self.cfg.get("memory_monitor_interval_seconds", 0.25)
+                    or 0.25
                 )
-
-            self.stop_event.wait(max(0.1, interval))
+            self.stop_event.wait(max(0.05, interval))
 
     def meminfo(self) -> dict[str, int]:
         with self.lock:
             latest = dict(self.latest)
         return latest if latest else parse_meminfo()
 
-    def _recent_floor_locked(self, now: float, cfg: dict) -> tuple[int, int]:
-        if not self.samples:
-            return 0, 0
-
-        window = float(cfg.get("rapid_memory_window_seconds", 60) or 60)
-        cutoff = now - max(1.0, window)
-        recent = [value for ts, value in self.samples if ts >= cutoff]
-        if not recent:
-            recent = [self.samples[-1][1]]
-
-        current = self.samples[-1][1]
-        return current, min(recent)
-
     def pending_growth_bytes(self, cfg: dict) -> int:
         with self.lock:
-            now = time.monotonic()
-            current, recent_floor = self._recent_floor_locked(now, cfg)
-
-            if self.ack_pressure_used is None:
-                self.ack_pressure_used = recent_floor
-
-            if current < self.ack_pressure_used:
-                self.ack_pressure_used = current
-
-            if self.ack_pressure_used < recent_floor:
-                self.ack_pressure_used = recent_floor
-
-            baseline = max(recent_floor, self.ack_pressure_used)
-            return max(0, current - baseline)
+            _, growth, _, _ = self._pending_growth_locked(time.monotonic(), cfg)
+            return growth
 
     def recent_growth_bytes(self, cfg: dict) -> int:
         with self.lock:
-            current, recent_floor = self._recent_floor_locked(
+            current, recent_floor, _ = self._window_floor_locked(
                 time.monotonic(),
-                cfg,
+                float(cfg.get("rapid_memory_window_seconds", 60) or 60),
+            )
+            return max(0, current - recent_floor)
+
+    def recent_fast_growth_bytes(self, cfg: dict) -> int:
+        with self.lock:
+            current, recent_floor, _ = self._window_floor_locked(
+                time.monotonic(),
+                float(cfg.get("fast_memory_growth_window_seconds", 10) or 10),
             )
             return max(0, current - recent_floor)
 
     def consume_rapid_release_bytes(self, cfg: dict) -> tuple[int, int]:
-        threshold = (
+        rapid_threshold = (
             parse_size(cfg.get("rapid_memory_growth_threshold_bytes", "2G"))
             or (2 * GIB)
+        )
+        fast_threshold = (
+            parse_size(cfg.get("fast_memory_growth_threshold_bytes", "1G"))
+            or GIB
+        )
+        fast_min_unacked = (
+            parse_size(cfg.get("fast_memory_growth_min_unacked_bytes", "512M"))
+            or (512 * MIB)
         )
 
         with self.lock:
             now = time.monotonic()
-            current, recent_floor = self._recent_floor_locked(now, cfg)
+            current, growth, fast_growth, fast_span = self._pending_growth_locked(now, cfg)
 
-            if self.ack_pressure_used is None:
-                self.ack_pressure_used = recent_floor
-
-            if current < self.ack_pressure_used:
-                self.ack_pressure_used = current
-
-            if self.ack_pressure_used < recent_floor:
-                self.ack_pressure_used = recent_floor
-
-            baseline = max(recent_floor, self.ack_pressure_used)
-            growth = max(0, current - baseline)
-
-            if growth < threshold:
+            rapid_trigger = growth >= rapid_threshold
+            fast_trigger = (
+                growth >= fast_min_unacked
+                and fast_growth >= fast_threshold
+            )
+            if not rapid_trigger and not fast_trigger:
                 return 0, growth
 
-            self.ack_pressure_used = current
+            multiplier = float(cfg.get("rapid_memory_release_multiplier", 1.0) or 1.0)
+            margin = (
+                parse_size(cfg.get("rapid_memory_release_margin_bytes", "512M"))
+                or (512 * MIB)
+            )
+            prediction_seconds = float(
+                cfg.get("rapid_memory_prediction_seconds", 5)
+                or 5
+            )
+            max_release = (
+                parse_size(cfg.get("rapid_memory_max_release_bytes", "6G"))
+                or (6 * GIB)
+            )
 
-        multiplier = float(cfg.get("rapid_memory_release_multiplier", 1.0) or 1.0)
-        margin = (
-            parse_size(cfg.get("rapid_memory_release_margin_bytes", "512M"))
-            or (512 * MIB)
-        )
-        release = int(growth * max(1.0, multiplier)) + int(margin)
+            # Stay ahead of a loader that is still allocating instead of only
+            # compensating for memory it has already consumed.
+            rate = fast_growth / max(0.25, fast_span)
+            predicted_headroom = int(
+                max(0.0, rate) * max(0.0, prediction_seconds)
+            )
+            release = (
+                int(growth * max(1.0, multiplier))
+                + int(margin)
+                + predicted_headroom
+            )
+            release = min(int(max_release), max(int(margin), release))
+
+            self.ack_pressure_used = current
+            cooldown = float(
+                cfg.get("memory_pressure_regrow_cooldown_seconds", 30)
+                or 30
+            )
+            self.growth_guard_until = max(
+                self.growth_guard_until,
+                now + max(0.0, cooldown),
+            )
+
         return release, growth
+
+    def consume_psi_release_bytes(self, cfg: dict) -> int:
+        with self.lock:
+            release = int(self.pending_psi_release_bytes)
+            self.pending_psi_release_bytes = 0
+
+            if release > 0:
+                cooldown = float(
+                    cfg.get("memory_pressure_regrow_cooldown_seconds", 30)
+                    or 30
+                )
+                self.growth_guard_until = max(
+                    self.growth_guard_until,
+                    time.monotonic() + max(0.0, cooldown),
+                )
+        return release
+
+    def arm_regrow_guard(self, cfg: dict) -> None:
+        with self.lock:
+            cooldown = float(
+                cfg.get("memory_pressure_regrow_cooldown_seconds", 30)
+                or 30
+            )
+            self.growth_guard_until = max(
+                self.growth_guard_until,
+                time.monotonic() + max(0.0, cooldown),
+            )
+
+    def growth_guard_active(self) -> bool:
+        with self.lock:
+            return time.monotonic() < self.growth_guard_until
+
+    def psi_stall_deltas(self) -> tuple[int, int]:
+        with self.lock:
+            return self.last_psi_some_delta, self.last_psi_full_delta
 
     def should_abort_scan(self, cfg: dict) -> bool:
         try:
@@ -345,11 +548,30 @@ class MemoryMonitor:
             if memory_pressure_active(meminfo, cfg):
                 return True
 
-            threshold = (
+            rapid_threshold = (
                 parse_size(cfg.get("rapid_memory_growth_threshold_bytes", "2G"))
                 or (2 * GIB)
             )
-            return self.pending_growth_bytes(cfg) >= threshold
+            fast_threshold = (
+                parse_size(cfg.get("fast_memory_growth_threshold_bytes", "1G"))
+                or GIB
+            )
+            fast_min_unacked = (
+                parse_size(cfg.get("fast_memory_growth_min_unacked_bytes", "512M"))
+                or (512 * MIB)
+            )
+
+            pending = self.pending_growth_bytes(cfg)
+            fast = self.recent_fast_growth_bytes(cfg)
+
+            with self.lock:
+                psi_pending = self.pending_psi_release_bytes > 0
+
+            return (
+                pending >= rapid_threshold
+                or (pending >= fast_min_unacked and fast >= fast_threshold)
+                or psi_pending
+            )
         except Exception:
             return False
 
@@ -1992,18 +2214,105 @@ def recency_timestamp_for_path(path: str, st: os.stat_result) -> float:
 
     return float(st.st_mtime)
 
-def resolve_scan_worker_count(cfg: dict) -> int:
+def _rotational_for_path(path: str) -> Optional[bool]:
+    """Best-effort backing-device rotational detection through sysfs."""
     try:
-        allowed = len(os.sched_getaffinity(0))
+        st = os.stat(path)
+        resolved = Path(
+            f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
+        ).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+    candidates = [resolved / "queue/rotational"]
+    candidates.extend(parent / "queue/rotational" for parent in resolved.parents)
+
+    for candidate in candidates:
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value == "0":
+            return False
+        if value == "1":
+            return True
+
+    return None
+
+
+def resolve_scan_storage_profile(cfg: dict) -> str:
+    """Return nonrotational, rotational, mixed, or unknown.
+
+    Use configured roots only here. This function is also called by status
+    reporting, so it must never rediscover Steam/app paths every controller tick.
+    """
+    flags: set[bool] = set()
+    roots = [
+        os.path.normpath(path)
+        for path in cfg.get("include_paths", ["/"])
+    ]
+
+    seen_devs: set[int] = set()
+
+    for root in roots:
+        try:
+            dev = os.stat(root).st_dev
+        except OSError:
+            continue
+        if dev in seen_devs:
+            continue
+        seen_devs.add(dev)
+
+        rotational = _rotational_for_path(root)
+        if rotational is not None:
+            flags.add(rotational)
+
+    if flags == {False}:
+        return "nonrotational"
+    if flags == {True}:
+        return "rotational"
+    if len(flags) > 1:
+        return "mixed"
+    return "unknown"
+
+
+def resolve_scan_worker_count(cfg: dict) -> int:
+    """Choose metadata-I/O concurrency independently from CPU parallelism.
+
+    CPUAffinity/CPUQuota bound actual compute. SSD/NVMe directory walking is
+    dominated by metadata waits, so it benefits from more outstanding workers
+    than eligible CPUs. Rotational media stays deliberately conservative.
+    """
+    try:
+        allowed_cpus = len(os.sched_getaffinity(0))
     except Exception:
-        allowed = os.cpu_count() or 1
+        allowed_cpus = os.cpu_count() or 1
 
-    logical = os.cpu_count() or allowed
-    fraction = float(cfg.get("scan_max_thread_fraction", 0.50) or 0.50)
-    max_workers = int(cfg.get("scan_worker_max", 32) or 32)
+    profile = resolve_scan_storage_profile(cfg)
+    max_workers = int(cfg.get("scan_worker_max", 64) or 64)
 
-    wanted = max(1, math.ceil(logical * min(1.0, max(0.05, fraction))))
-    return max(1, min(allowed, wanted, max_workers))
+    if profile == "rotational":
+        rotational_max = int(cfg.get("scan_rotational_worker_max", 4) or 4)
+        return max(1, min(max_workers, rotational_max))
+
+    if profile == "nonrotational":
+        multiplier = float(
+            cfg.get("scan_io_worker_multiplier_nonrotational", 3.0) or 3.0
+        )
+    elif profile == "mixed":
+        multiplier = float(
+            cfg.get("scan_io_worker_multiplier_mixed", 1.5) or 1.5
+        )
+    else:
+        multiplier = float(
+            cfg.get("scan_io_worker_multiplier_unknown", 2.0) or 2.0
+        )
+
+    wanted = max(
+        1,
+        math.ceil(max(1, allowed_cpus) * max(1.0, multiplier)),
+    )
+    return max(1, min(wanted, max_workers))
 
 
 def governing_include_root(path: str, include_paths: list[str]) -> Optional[str]:
@@ -2067,11 +2376,11 @@ def scan_files(
     memory_monitor: Optional[MemoryMonitor] = None,
     roots: Optional[list[str]] = None,
 ) -> list[FileRec]:
-    """Parallel scandir walk bounded by service affinity/quota.
+    """Parallel scandir walk with storage-aware metadata concurrency.
 
-    The scan is I/O-heavy, so threads are useful here despite Python's GIL.
-    We intentionally use no realpath() call per file; symlinks are already
-    rejected, and build_include_paths() removes redundant same-filesystem roots.
+    CPU affinity/quota still bounds actual compute. On SSD/NVMe we intentionally
+    run more metadata workers than eligible CPUs because most worker lifetime is
+    spent waiting on filesystem syscalls. Rotational media is conservative.
     """
     include_paths = build_include_paths(cfg)
     scan_roots = include_paths if roots is None else [
@@ -2198,10 +2507,42 @@ def scan_files(
                             default_sleep=0.001,
                         )
 
-                        full = os.path.normpath(entry.path)
-                        full_l = full.lower()
+                        # scandir gives us the child path already. Query d_type
+                        # first so normal Linux filesystems avoid unnecessary
+                        # stat calls merely to determine entry type.
+                        full = entry.path
 
                         if path_is_excluded(full, excludes):
+                            continue
+
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            is_dir = entry.is_dir(follow_symlinks=False)
+                            is_file = (
+                                False
+                                if is_dir
+                                else entry.is_file(follow_symlinks=False)
+                            )
+                        except OSError:
+                            continue
+
+                        if is_dir:
+                            if should_prune_dir(full.lower()):
+                                continue
+
+                            if stay_on_this_filesystem:
+                                try:
+                                    dir_stat = entry.stat(follow_symlinks=False)
+                                except OSError:
+                                    continue
+                                if dir_stat.st_dev != root_dev:
+                                    continue
+
+                            work.put((full, root_dev, stay_on_this_filesystem))
+                            continue
+
+                        if not is_file:
                             continue
 
                         try:
@@ -2209,19 +2550,7 @@ def scan_files(
                         except OSError:
                             continue
 
-                        if stat.S_ISLNK(st.st_mode):
-                            continue
-
                         if stay_on_this_filesystem and st.st_dev != root_dev:
-                            continue
-
-                        if stat.S_ISDIR(st.st_mode):
-                            if should_prune_dir(full_l):
-                                continue
-                            work.put((full, root_dev, stay_on_this_filesystem))
-                            continue
-
-                        if not stat.S_ISREG(st.st_mode):
                             continue
 
                         size = st.st_size
@@ -3156,6 +3485,37 @@ def stop_vmtouch_runs(runs: list[VmtouchRun]) -> None:
     runs.clear()
 
 
+def urgent_shrink_vmtouch_runs(
+    runs: list[VmtouchRun],
+    desired_bytes: int,
+) -> tuple[list[VmtouchRun], list[FileRec], int]:
+    """Unlock enough low-priority chunks immediately and concurrently."""
+    before = run_bytes(runs)
+    if before <= desired_bytes:
+        return runs, flatten_run_records(runs), 0
+
+    to_stop: list[VmtouchRun] = []
+
+    while runs and run_bytes(runs) > desired_bytes:
+        to_stop.append(runs.pop())
+
+    # Signal every locker first so multi-GiB releases are parallel rather than
+    # serialized one vmtouch process at a time.
+    for run in to_stop:
+        run.stop_event.set()
+        if run.proc.poll() is None:
+            try:
+                run.proc.terminate()
+            except ProcessLookupError:
+                pass
+
+    for run in to_stop:
+        stop_proc(run)
+
+    after = run_bytes(runs)
+    return runs, flatten_run_records(runs), max(0, before - after)
+
+
 def chunk_selected_records(selected: list[FileRec], cfg: dict) -> list[list[FileRec]]:
     # Smaller chunks make shrink more surgical. The normal profile uses 1G
     # chunks; low-RAM systems use 512M chunks for finer pressure release.
@@ -3323,6 +3683,9 @@ def write_status(
     pending_fs_events: int = 0,
     watcher_mode: str = "none",
     rapid_growth_bytes: int = 0,
+    fast_growth_bytes: int = 0,
+    psi_some_delta_us: int = 0,
+    psi_full_delta_us: int = 0,
 ) -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     selected_total_bytes = sum(r.size for r in selected)
@@ -3342,11 +3705,15 @@ def write_status(
         "mlocked_gib": bytes_to_gib(meminfo.get("Mlocked", 0)),
         "unevictable_gib": bytes_to_gib(meminfo.get("Unevictable", 0)),
         "rapid_memory_growth_gib": bytes_to_gib(rapid_growth_bytes),
+        "fast_memory_growth_gib": bytes_to_gib(fast_growth_bytes),
+        "psi_memory_some_stall_delta_us": int(psi_some_delta_us),
+        "psi_memory_full_stall_delta_us": int(psi_full_delta_us),
         "last_scan_epoch": int(last_scan_epoch),
         "last_incremental_scan_epoch": int(last_incremental_scan_epoch),
         "pending_fs_events": int(pending_fs_events),
         "watcher_mode": watcher_mode,
         "scan_workers": resolve_scan_worker_count(cfg),
+        "scan_storage_profile": resolve_scan_storage_profile(cfg),
     }
     STATUS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -3417,6 +3784,9 @@ def main() -> int:
                     pending_fs_events=watcher.pending_count(),
                     watcher_mode=watcher.mode,
                     rapid_growth_bytes=memory_monitor.recent_growth_bytes(cfg),
+                    fast_growth_bytes=memory_monitor.recent_fast_growth_bytes(cfg),
+                    psi_some_delta_us=memory_monitor.psi_stall_deltas()[0],
+                    psi_full_delta_us=memory_monitor.psi_stall_deltas()[1],
                 )
 
             now = time.time()
@@ -3429,16 +3799,9 @@ def main() -> int:
             ):
                 full_scan_required_reason = "configured periodic verification"
 
-            rapid_threshold = (
-                parse_size(cfg.get("rapid_memory_growth_threshold_bytes", "2G"))
-                or (2 * GIB)
-            )
-            pending_growth = memory_monitor.pending_growth_bytes(cfg)
-
-            emergency_pressure = (
-                memory_pressure_active(meminfo, cfg)
-                or pending_growth >= rapid_threshold
-            )
+            # Do not begin expensive discovery work while any of the memory
+            # safety signals are already asking us to yield.
+            emergency_pressure = memory_monitor.should_abort_scan(cfg)
 
             inventory_changed = False
 
@@ -3462,6 +3825,10 @@ def main() -> int:
                         max_file_size_bytes,
                         memory_monitor=memory_monitor,
                     )
+
+                    if memory_monitor.should_abort_scan(cfg):
+                        raise MemoryPressureAbort
+
                     new_ordered, new_ordered_keys = build_selection_index(
                         new_inventory
                     )
@@ -3545,6 +3912,11 @@ def main() -> int:
             rapid_release_bytes, rapid_growth_bytes = (
                 memory_monitor.consume_rapid_release_bytes(cfg)
             )
+            psi_release_bytes = memory_monitor.consume_psi_release_bytes(cfg)
+            proactive_release_bytes = max(
+                rapid_release_bytes,
+                psi_release_bytes,
+            )
 
             any_vmtouch_dead = any(
                 run.poll() is not None
@@ -3561,18 +3933,73 @@ def main() -> int:
                 active_target_bytes,
             )
 
-            if rapid_release_bytes > 0 and current_vmtouch_runs:
+            # Do not fight an application by immediately growing the cache back
+            # while it is still in its loading/allocation burst.
+            if (
+                memory_monitor.growth_guard_active()
+                and current_target_bytes is not None
+                and desired_target_bytes > current_target_bytes
+            ):
+                desired_target_bytes = current_target_bytes
+
+            if proactive_release_bytes > 0 and current_vmtouch_runs:
                 locked_estimate = selected_bytes(current_selected)
-                proactive_target = max(0, locked_estimate - rapid_release_bytes)
+                proactive_target = max(
+                    0,
+                    locked_estimate - proactive_release_bytes,
+                )
                 desired_target_bytes = min(
                     desired_target_bytes,
                     proactive_target,
                 )
+
+                reasons = []
+                if rapid_release_bytes > 0:
+                    reasons.append(
+                        f"rapid RAM growth {bytes_to_gib(rapid_growth_bytes):.2f} GiB"
+                    )
+                if psi_release_bytes > 0:
+                    reasons.append("kernel PSI memory stall")
+
                 logging.info(
-                    "rapid RAM growth detected (%.2f GiB recent increase); "
-                    "proactively releasing %.2f GiB of cache",
-                    bytes_to_gib(rapid_growth_bytes),
-                    bytes_to_gib(rapid_release_bytes),
+                    "%s; requesting %.2f GiB immediate cache release",
+                    " + ".join(reasons) or "memory pressure",
+                    bytes_to_gib(proactive_release_bytes),
+                )
+
+            urgent_pressure = (
+                memory_pressure_active(meminfo, cfg)
+                or proactive_release_bytes > 0
+            )
+
+            if urgent_pressure:
+                memory_monitor.arm_regrow_guard(cfg)
+
+            # Critical latency path: unlock before doing expensive reselection.
+            # Several vmtouch processes are terminated concurrently.
+            if (
+                urgent_pressure
+                and current_vmtouch_runs
+                and desired_target_bytes < selected_bytes(current_selected)
+            ):
+                (
+                    current_vmtouch_runs,
+                    current_selected,
+                    actually_released,
+                ) = urgent_shrink_vmtouch_runs(
+                    current_vmtouch_runs,
+                    desired_target_bytes,
+                )
+
+                actual_locked = selected_bytes(current_selected)
+                current_target_bytes = actual_locked
+                desired_target_bytes = actual_locked
+
+                logging.info(
+                    "urgent cache release completed: %.2f GiB unlocked; "
+                    "%.2f GiB remains locked",
+                    bytes_to_gib(actually_released),
+                    bytes_to_gib(actual_locked),
                 )
 
             effective_target_bytes = current_target_bytes
@@ -3596,6 +4023,11 @@ def main() -> int:
                 or not current_selected
                 or not current_vmtouch_runs
             )
+
+            # A pressure response is deliberately release-only. Refill can
+            # resume after the short regrowth guard expires.
+            if urgent_pressure and current_vmtouch_runs:
+                selection_needs_refresh = False
 
             if selection_needs_refresh:
                 desired_selected = select_files(
@@ -3629,22 +4061,26 @@ def main() -> int:
                 pending_fs_events=watcher.pending_count(),
                 watcher_mode=watcher.mode,
                 rapid_growth_bytes=memory_monitor.recent_growth_bytes(cfg),
+                fast_growth_bytes=memory_monitor.recent_fast_growth_bytes(cfg),
+                psi_some_delta_us=memory_monitor.psi_stall_deltas()[0],
+                psi_full_delta_us=memory_monitor.psi_stall_deltas()[1],
             )
 
         except Exception:
             logging.exception("controller loop error")
 
-        sleep_for = 1
+        sleep_for = 1.0
         try:
             _, cfg = load_config()
-            sleep_for = int(cfg.get("check_interval_seconds", 1))
+            sleep_for = float(cfg.get("check_interval_seconds", 1) or 1)
         except Exception:
             pass
 
-        for _ in range(max(1, sleep_for)):
-            if not RUNNING:
-                break
-            time.sleep(1)
+        if RUNNING:
+            # The normal loop is cheap, but memory pressure can wake it
+            # immediately rather than waiting for the next controller tick.
+            PRESSURE_WAKE_EVENT.wait(timeout=max(0.05, sleep_for))
+            PRESSURE_WAKE_EVENT.clear()
 
     memory_monitor.stop()
     watcher.stop()
@@ -3686,20 +4122,32 @@ write_config() {
   "prefer_fanotify_filesystem_watch": true,
   "max_pending_fs_events": 100000,
 
-  "scan_max_thread_fraction": 0.50,
-  "scan_worker_max": 32,
-  "scan_cooldown_every": 4096,
-  "scan_cooldown_seconds": 0.001,
-  "select_cooldown_every": 4096,
-  "select_cooldown_seconds": 0.0005,
+  "scan_worker_max": 64,
+  "scan_io_worker_multiplier_nonrotational": 3.0,
+  "scan_io_worker_multiplier_mixed": 1.5,
+  "scan_io_worker_multiplier_unknown": 2.0,
+  "scan_rotational_worker_max": 4,
+  "scan_cooldown_every": 0,
+  "scan_cooldown_seconds": 0.0,
+  "select_cooldown_every": 0,
+  "select_cooldown_seconds": 0.0,
   "selection_incremental_rebuild_threshold": 256,
 
-  "memory_monitor_interval_seconds": 0.5,
+  "memory_monitor_interval_seconds": 0.25,
+  "fast_memory_growth_window_seconds": 10,
+  "fast_memory_growth_threshold_bytes": "1G",
+  "fast_memory_growth_min_unacked_bytes": "512M",
   "rapid_memory_window_seconds": 60,
   "rapid_memory_growth_threshold_bytes": "2G",
   "rapid_memory_release_multiplier": 1.0,
   "rapid_memory_release_margin_bytes": "512M",
-  "memory_pressure_abort_check_every": 128,
+  "rapid_memory_prediction_seconds": 5,
+  "rapid_memory_max_release_bytes": "6G",
+  "memory_pressure_regrow_cooldown_seconds": 30,
+  "psi_memory_some_stall_threshold_us": 100000,
+  "psi_memory_full_stall_threshold_us": 20000,
+  "psi_memory_release_bytes": "2G",
+  "memory_pressure_abort_check_every": 64,
 
   "target_available_bytes": "8G",
   "target_shrink_to_available_bytes": "10G",
@@ -3728,10 +4176,10 @@ write_config() {
   "memlock_limit_min": "1G",
 
   "vmtouch_max_file_size": "128G",
-  "vmtouch_feed_pause_seconds": 0.005,
-  "vmtouch_feed_target_extra_seconds": 5,
-  "vmtouch_start_stagger_seconds": 0.15,
-  "vmtouch_stop_stagger_seconds": 0.05,
+  "vmtouch_feed_pause_seconds": 0.002,
+  "vmtouch_feed_target_extra_seconds": 1,
+  "vmtouch_start_stagger_seconds": 0.05,
+  "vmtouch_stop_stagger_seconds": 0.02,
 
   "low_ram_profile_enabled": true,
   "low_ram_total_threshold_bytes": "20G",
@@ -3838,8 +4286,10 @@ Restart=always
 RestartSec=5
 KillMode=control-group
 
-# Use at most half of the machine's logical CPUs, preferring one SMT sibling
-# per physical core, while capping aggregate CPU time to 25% of the machine.
+# Execute only on half of the machine's logical CPUs, preferring one SMT
+# sibling per physical core, while capping aggregate CPU time to 25% of the
+# whole machine. Metadata scanning may use more *threads* than eligible CPUs
+# because most are blocked on storage syscalls; the quota still caps compute.
 # Example on a 24-thread CPU: 12 eligible CPUs, 600% aggregate quota.
 CPUAccounting=true
 CPUAffinity=$cpu_affinity
