@@ -41,7 +41,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.3.1"
+CONTROLLER_VERSION = "1.3.2"
 _SCAN_STORAGE_PROFILE_CACHE: dict[tuple[str, ...], str] = {}
 
 @dataclass(frozen=True, slots=True)
@@ -4444,7 +4444,7 @@ write_config() {
   "full_rescan_interval_seconds": 0,
   "prefer_fanotify_filesystem_watch": true,
   "watch_attribute_events": false,
-  "max_pending_fs_events": 100000,
+  "max_pending_fs_events": 350000,
 
   "scan_worker_max": 64,
   "scan_io_worker_multiplier_nonrotational": 3.0,
@@ -4457,7 +4457,7 @@ write_config() {
   "select_cooldown_seconds": 0.0,
   "selection_small_update_threshold": 32,
 
-  "memory_monitor_interval_seconds": 0.25,
+  "memory_monitor_interval_seconds": 0.50,
   "fast_memory_growth_window_seconds": 10,
   "fast_memory_growth_threshold_bytes": "1G",
   "fast_memory_growth_min_unacked_bytes": "512M",
@@ -4687,6 +4687,38 @@ ensure_dependencies() {
   fi
 }
 
+fsnotifywait_has_filesystem_option() {
+  # IMPORTANT: fsnotifywait --help intentionally exits non-zero upstream.
+  # Capture its text first instead of piping it under `set -o pipefail`,
+  # otherwise a perfectly valid --filesystem/-S option is reported missing.
+  local help_text
+  command -v fsnotifywait >/dev/null 2>&1 || return 1
+  help_text="$(fsnotifywait --help 2>&1 || true)"
+  grep -q -- '--filesystem' <<<"$help_text"
+}
+
+probe_fanotify_filesystem_watch() {
+  # Test the real capability, not just whether the binary advertises -S.
+  # fsnotifywait exit codes:
+  #   0 = a requested event occurred (watch worked)
+  #   2 = timeout with no event (watch also worked)
+  #   1 = setup/runtime error (unsupported, denied, etc.)
+  #
+  # Installation runs as root, which is required for fanotify on modern
+  # kernels. /tmp is only used to identify a mounted filesystem; -S places a
+  # filesystem mark rather than recursively creating one watch per directory.
+  local rc
+  command -v fsnotifywait >/dev/null 2>&1 || return 1
+  fsnotifywait_has_filesystem_option || return 1
+
+  set +e
+  fsnotifywait -q -S -t 1 -e create /tmp >/dev/null 2>&1
+  rc=$?
+  set -e
+
+  [[ "$rc" -eq 0 || "$rc" -eq 2 ]]
+}
+
 ensure_fs_watch_tools() {
   # inotifywait is the reliable baseline. fsnotifywait/fanotify is optional
   # and preferred automatically when the installed inotify-tools build and
@@ -4702,11 +4734,14 @@ ensure_fs_watch_tools() {
     return 1
   fi
 
-  if command -v fsnotifywait >/dev/null 2>&1 \
-    && fsnotifywait --help 2>&1 | grep -q -- '--filesystem'; then
-    echo "Filesystem watcher: fsnotifywait/fanotify is available; it will be preferred."
+  if probe_fanotify_filesystem_watch; then
+    echo "Filesystem watcher: fanotify filesystem mode (-S) verified working; it will be preferred."
+  elif fsnotifywait_has_filesystem_option; then
+    echo "Filesystem watcher: fsnotifywait supports fanotify -S, but the runtime probe failed; recursive inotify will be the safe fallback."
+  elif command -v fsnotifywait >/dev/null 2>&1; then
+    echo "Filesystem watcher: fsnotifywait is installed but this build does not expose -S/--filesystem; recursive inotify will be used."
   else
-    echo "Filesystem watcher: fanotify userspace support is unavailable; recursive inotify will be used."
+    echo "Filesystem watcher: fsnotifywait is not installed; recursive inotify will be used."
   fi
 }
 
@@ -4726,7 +4761,7 @@ install_all() {
   systemctl restart ramcache-controller.service
 
   echo
-  echo "Installed RAM cache controller v1.3.1."
+  echo "Installed RAM cache controller v1.3.2."
   echo "Status:"
   echo "  systemctl status ramcache-controller.service --no-pager"
   echo "  python3 -m json.tool /run/ramcache-controller/status.json"
@@ -4769,7 +4804,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.3.1"
+  echo "RAM cache controller installer: v1.3.2"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
@@ -4804,10 +4839,19 @@ status_all() {
 
   if command -v fsnotifywait >/dev/null 2>&1; then
     echo "  fsnotifywait: $(command -v fsnotifywait)"
-    if fsnotifywait --help 2>&1 | grep -q -- '--filesystem'; then
-      echo "  fanotify filesystem mode (-S): userspace tool supports it"
+    if fsnotifywait_has_filesystem_option; then
+      echo "  fanotify filesystem option (-S): advertised by userspace tool"
+      if [[ "$(id -u)" -eq 0 ]]; then
+        if probe_fanotify_filesystem_watch; then
+          echo "  fanotify filesystem runtime probe: PASS"
+        else
+          echo "  fanotify filesystem runtime probe: FAIL (controller will fall back safely)"
+        fi
+      else
+        echo "  fanotify filesystem runtime probe: skipped (run status with sudo for privileged probe)"
+      fi
     else
-      echo "  fanotify filesystem mode (-S): not supported by this fsnotifywait build"
+      echo "  fanotify filesystem option (-S): not supported by this fsnotifywait build"
     fi
   else
     echo "  fsnotifywait: missing (controller will use recursive inotify)"
