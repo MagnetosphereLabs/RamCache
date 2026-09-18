@@ -14,7 +14,6 @@ write_controller() {
   install -d -m 755 /opt/ramcache-controller
   cat > /opt/ramcache-controller/ramcache_controller.py <<'PY'
 #!/usr/bin/env python3
-import bisect
 import json
 import logging
 import math
@@ -41,9 +40,11 @@ MIB = 1024 ** 2
 GIB = 1024 ** 3
 
 RUNNING = True
-PRESSURE_WAKE_EVENT = threading.Event()
+CONTROLLER_WAKE_EVENT = threading.Event()
+CONTROLLER_VERSION = "1.3"
+_SCAN_STORAGE_PROFILE_CACHE: dict[tuple[str, ...], str] = {}
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FileRec:
     path: str
     size: int
@@ -64,7 +65,7 @@ class VmtouchRun:
 def handle_signal(signum, frame):
     global RUNNING
     RUNNING = False
-    PRESSURE_WAKE_EVENT.set()
+    CONTROLLER_WAKE_EVENT.set()
 
 
 def load_config() -> tuple[str, dict]:
@@ -145,8 +146,10 @@ LOW_RAM_PROFILE_DEFAULTS = {
     # React quickly to smaller changes.
     "target_relock_min_delta": "256M",
 
-    "steam_htmlcache_budget_bytes": "1G",
-    "firefox_webcache_budget_bytes": "2G",
+    "steam_htmlcache_budget_bytes": "768M",
+    "steam_htmlcache_max_files": 2500,
+    "firefox_webcache_budget_bytes": "1G",
+    "firefox_webcache_max_files": 1200,
     "hytale_world_budget_bytes": "1G",
     "vrchat_content_cache_budget_bytes": "1G",
 
@@ -271,7 +274,7 @@ class MemoryMonitor:
 
     def stop(self) -> None:
         self.stop_event.set()
-        PRESSURE_WAKE_EVENT.set()
+        CONTROLLER_WAKE_EVENT.set()
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2)
 
@@ -280,16 +283,24 @@ class MemoryMonitor:
         now: float,
         seconds: float,
     ) -> tuple[int, int, float]:
+        """Find the recent minimum without allocating a temporary sample list."""
         if not self.samples:
             return 0, 0, 0.0
 
         cutoff = now - max(0.1, seconds)
-        recent = [(ts, value) for ts, value in self.samples if ts >= cutoff]
-        if not recent:
-            recent = [self.samples[-1]]
-
         current_ts, current = self.samples[-1]
-        floor_ts, floor = min(recent, key=lambda item: item[1])
+        floor_ts = current_ts
+        floor = current
+
+        # Samples are time-ordered. Walk backward only through the requested
+        # window; this keeps the 250 ms pressure monitor allocation-free.
+        for ts, value in reversed(self.samples):
+            if ts < cutoff:
+                break
+            if value < floor:
+                floor = value
+                floor_ts = ts
+
         return current, floor, max(0.001, current_ts - floor_ts)
 
     def _pending_growth_locked(
@@ -407,7 +418,7 @@ class MemoryMonitor:
                 pass
 
             if wake_controller:
-                PRESSURE_WAKE_EVENT.set()
+                CONTROLLER_WAKE_EVENT.set()
 
             with self.lock:
                 interval = float(
@@ -753,6 +764,7 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
             home / ".local/share/flatpak/app",
             home / ".local/share/flatpak/runtime",
             home / ".local/share/flatpak/exports",
+            home / ".var/app/org.mozilla.firefox",
 
             # Browser profile startup state.
             home / ".mozilla/firefox",
@@ -950,6 +962,8 @@ APP_RUNTIME_PREFIXES = (
 
 BROWSER_RUNTIME_PREFIXES = (
     "/usr/lib/firefox",
+    "/usr/lib/firefox-esr",
+    "/usr/share/firefox",
     "/usr/lib/thunderbird",
     "/usr/lib/chromium",
     "/usr/lib/chromium-browser",
@@ -958,6 +972,7 @@ BROWSER_RUNTIME_PREFIXES = (
     "/opt/microsoft/msedge",
     "/snap/firefox",
     "/snap/chromium",
+    "/var/lib/flatpak/app/org.mozilla.firefox",
 )
 
 DESKTOP_SUPPORT_PREFIXES = (
@@ -1007,6 +1022,7 @@ DESKTOP_SUPPORT_PREFIXES = (
     "/usr/share/cosmic",
     "/usr/share/cinnamon",
     "/usr/share/nemo",
+    "/usr/share/xapps",
     "/usr/share/mate",
     "/usr/share/caja",
     "/usr/share/xfce4",
@@ -1050,6 +1066,7 @@ HOT_USER_SUBSTRINGS = (
     "/.config/nemo/",
     "/.config/mate/",
     "/.config/xfce4/",
+    "/.config/gnome-shell/",
     "/.local/share/gvfs-metadata/",
     "/.themes/",
     "/.icons/",
@@ -1232,8 +1249,33 @@ CONFIG_SUFFIXES = (
 RUNTIME_SUFFIXES = (
     ".so", ".dll", ".exe", ".bin", ".appimage", ".node", ".jar",
     ".py", ".pyc", ".pyo", ".qml", ".js", ".mjs", ".cjs", ".lua",
-    ".rb", ".pl", ".pm", ".class",
+    ".rb", ".pl", ".pm", ".class", ".wasm",
 )
+
+# App payloads often contain code/resources that are neither ELF executables
+# nor shared objects. These are useful startup/runtime reads, unlike bulk user
+# media. Size caps below prevent opaque giant assets from being promoted.
+APP_CODE_RESOURCE_SUFFIXES = (
+    ".asar", ".pak", ".dat", ".gresource", ".typelib", ".qmltypes", ".mo",
+    ".wasm",
+)
+
+APP_RUNTIME_SUBSTRINGS = (
+    "/.local/share/flatpak/app/",
+    "/.local/share/flatpak/runtime/",
+)
+
+GENERIC_SANDBOX_APP_STATE_SUBSTRINGS = (
+    "/.var/app/",
+)
+
+APP_SHARE_CODE_SUFFIXES = (
+    ".py", ".pyc", ".pyo", ".qml", ".qmltypes", ".js", ".mjs", ".cjs",
+    ".wasm", ".gresource", ".typelib", ".mo",
+)
+
+APP_CODE_RESOURCE_MAX = 256 * MIB
+APP_SHARE_CODE_MAX = 128 * MIB
 
 FONT_SUFFIXES = (
     ".ttf", ".otf", ".ttc", ".woff", ".woff2", ".pcf", ".pfb",
@@ -1310,6 +1352,7 @@ STEAM_UI_CACHE_SUBSTRINGS = (
 FIREFOX_WEB_CACHE_SUBSTRINGS = (
     "/.cache/mozilla/firefox/",
     "/.mozilla/firefox/",
+    "/.var/app/org.mozilla.firefox/cache/mozilla/firefox/",
 )
 
 FIREFOX_WEB_CACHE_TARGET_SUBSTRINGS = (
@@ -1470,6 +1513,9 @@ VIP_FULL_APP_PATH_NEEDLES = (
     "/lc_messages/filezilla.mo",
     "/org.kde.kdenlive",
     "/com.obsproject.studio",
+    "/obs-plugins/",
+    "/obs-scripting/",
+    "/libobs",
     "/rustdesk.",
     "/rustdesk/",
     "/org.shotcut.shotcut",
@@ -1764,7 +1810,43 @@ def is_app_runtime_path(path: str) -> bool:
     return (
         path_has_prefix(path, APP_RUNTIME_PREFIXES)
         or path_has_prefix(path, BROWSER_RUNTIME_PREFIXES)
+        or path_contains_any(path, APP_RUNTIME_SUBSTRINGS)
         or path_contains_any(path, ELECTRON_APP_SUBSTRINGS)
+    )
+
+
+def is_generic_sandbox_app_state_path(path: str) -> bool:
+    return path_contains_any(path, GENERIC_SANDBOX_APP_STATE_SUBSTRINGS)
+
+
+def is_app_code_resource(
+    path: str,
+    name: str,
+    size: int,
+    *,
+    executable: bool,
+    shared_lib: bool,
+) -> bool:
+    if executable or shared_lib:
+        return True
+
+    if name in ELECTRON_RUNTIME_NAMES:
+        return True
+
+    if name.endswith(RUNTIME_SUFFIXES):
+        return True
+
+    if size <= APP_CODE_RESOURCE_MAX and name.endswith(APP_CODE_RESOURCE_SUFFIXES):
+        return True
+
+    return False
+
+
+def is_shared_app_code_path(path: str, name: str, size: int) -> bool:
+    return (
+        (path.startswith("/usr/share/") or path.startswith("/usr/local/share/"))
+        and size <= APP_SHARE_CODE_MAX
+        and name.endswith(APP_SHARE_CODE_SUFFIXES)
     )
 
 
@@ -1856,6 +1938,7 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     shader = is_shader_cache_path(path)
     browser_profile = is_browser_profile_path(path)
     user_app = path_contains_any(path, USER_APP_SUBSTRINGS)
+    sandbox_app_state = is_generic_sandbox_app_state_path(path)
     cosmic = path_contains_any(path, COSMIC_SUBSTRINGS)
 
     # Targeted bounded caches and game/runtime paths.
@@ -2039,38 +2122,48 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
                 return (2, 520, 0)
 
         if broad_steam_game_area:
-            # This is the big RAM saver: random Steam games, prefixes, and shader caches
-            # fall back instead of eating tier-1 RAM.
+            # Random game payloads are fallback only. Large opaque packs are
+            # especially poor cache value compared with executable/library
+            # random reads, so do not lock them at all.
+            if name.endswith(GAME_ASSET_SUFFIXES) and size > 256 * MIB:
+                return (99, 0, 0)
             return (5, 40, 0)
 
         return (5, 120, 0)
 
-    # Tier 2: installed app runtimes: browsers, Flatpak/Snap apps, /opt apps,
-    # Electron apps, AppImages, Discord/Vesktop-like apps.
-    if (
-        is_app_runtime_path(path)
-        and (
-            shared_lib
-            or executable
-            or name.endswith(RUNTIME_SUFFIXES)
-            or name in ELECTRON_RUNTIME_NAMES
-            or name.endswith(CONFIG_SUFFIXES)
-        )
+    # Tier 1: installed application code. Generic native/Flatpak/Snap/Electron
+    # code belongs near Steam/VR runtimes because these random reads directly
+    # affect launch latency.
+    if is_app_runtime_path(path) and is_app_code_resource(
+        path,
+        name,
+        size,
+        executable=executable,
+        shared_lib=shared_lib,
     ):
-        confidence = 820
+        confidence = 940
         if path_has_prefix(path, BROWSER_RUNTIME_PREFIXES):
             confidence += 220
         if path_contains_any(path, ELECTRON_APP_SUBSTRINGS):
-            confidence += 220
+            confidence += 180
         if name in ELECTRON_RUNTIME_NAMES:
             confidence += 200
         if shared_lib or executable:
-            confidence += 160
-        return (2, confidence, 0)
+            confidence += 200
+        if name.endswith((".so", ".wasm", ".pyc", ".qml", ".js", ".mjs", ".cjs")):
+            confidence += 100
+        return (1, confidence, 0)
 
-    # Tier 3: browser, Vesktop/Discord, OBS, COSMIC, VS Code, Slack user startup state.
+    # Tier 2: code-bearing resources installed under /usr/share. Many modern
+    # desktop apps ship JS/QML/Python/typelib/gresource data here.
+    if is_shared_app_code_path(path, name, size):
+        return (2, 860, 0)
+
+    # Tier 3: browser, Vesktop/Discord, OBS, COSMIC, VS Code, Slack and generic
+    # sandboxed-app startup state. Cache databases/config/code, not arbitrary
+    # large per-app data.
     # Cache configs and startup DBs, not random HTTP cache blobs.
-    if browser_profile or user_app or cosmic:
+    if browser_profile or user_app or cosmic or sandbox_app_state:
         if name in BROWSER_STARTUP_NAMES:
             return (3, 900, 0)
 
@@ -2083,7 +2176,12 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
         if name.endswith(CONFIG_SUFFIXES) or name.endswith(RUNTIME_SUFFIXES):
             return (3, 720, 0)
 
-        if size <= 4 * MIB:
+        if (
+            size <= 1 * MIB
+            and not name.endswith(MEDIA_SUFFIXES)
+            and not name.endswith(GAME_ASSET_SUFFIXES)
+            and not name.endswith(ARCHIVE_SUFFIXES)
+        ):
             return (3, 500, 0)
 
         return (5, 100, 0)
@@ -2140,12 +2238,37 @@ def fallback_size_rank(size: int) -> int:
         return 9
     return 10
 
+
+def fallback_content_rank(path: str, name: str) -> int:
+    """Keep bulk media/assets behind ordinary small files in fallback cache."""
+    if name.endswith(GAME_ASSET_SUFFIXES):
+        return 4
+    if name.endswith(MEDIA_SUFFIXES):
+        return 5
+    if name.endswith(DOCUMENT_SUFFIXES):
+        return 3
+    if name.endswith(ARCHIVE_SUFFIXES):
+        return 6
+    if name.endswith(PACKAGE_IMAGE_SUFFIXES):
+        return 7
+    return 0
+
 def cache_budget_caps(cfg: dict) -> dict[str, int]:
     return {
         "steam_htmlcache": parse_size(cfg.get("steam_htmlcache_budget_bytes", "1G")) or GIB,
         "firefox_webcache": parse_size(cfg.get("firefox_webcache_budget_bytes", "2G")) or (2 * GIB),
         "hytale_world": parse_size(cfg.get("hytale_world_budget_bytes", "2G")) or (2 * GIB),
         "vrchat_content_cache": parse_size(cfg.get("vrchat_content_cache_budget_bytes", "2G")) or (2 * GIB),
+    }
+
+
+def cache_budget_file_caps(cfg: dict) -> dict[str, int]:
+    # Firefox cache2 entries are individual URL resources, not one file per web
+    # page. A recent-resource cap approximates the recent browsing working set
+    # without pretending that 50 cache files == 50 pages.
+    return {
+        "steam_htmlcache": int(cfg.get("steam_htmlcache_max_files", 4000) or 4000),
+        "firefox_webcache": int(cfg.get("firefox_webcache_max_files", 2000) or 2000),
     }
 
 
@@ -2243,15 +2366,18 @@ def _rotational_for_path(path: str) -> Optional[bool]:
 def resolve_scan_storage_profile(cfg: dict) -> str:
     """Return nonrotational, rotational, mixed, or unknown.
 
-    Use configured roots only here. This function is also called by status
-    reporting, so it must never rediscover Steam/app paths every controller tick.
+    Backing media does not normally change while the service is running. Cache
+    this result so idle status updates never reprobe sysfs/storage.
     """
-    flags: set[bool] = set()
-    roots = [
+    roots = tuple(
         os.path.normpath(path)
         for path in cfg.get("include_paths", ["/"])
-    ]
+    )
+    cached = _SCAN_STORAGE_PROFILE_CACHE.get(roots)
+    if cached is not None:
+        return cached
 
+    flags: set[bool] = set()
     seen_devs: set[int] = set()
 
     for root in roots:
@@ -2268,12 +2394,16 @@ def resolve_scan_storage_profile(cfg: dict) -> str:
             flags.add(rotational)
 
     if flags == {False}:
-        return "nonrotational"
-    if flags == {True}:
-        return "rotational"
-    if len(flags) > 1:
-        return "mixed"
-    return "unknown"
+        profile = "nonrotational"
+    elif flags == {True}:
+        profile = "rotational"
+    elif len(flags) > 1:
+        profile = "mixed"
+    else:
+        profile = "unknown"
+
+    _SCAN_STORAGE_PROFILE_CACHE[roots] = profile
+    return profile
 
 
 def resolve_scan_worker_count(cfg: dict) -> int:
@@ -2362,12 +2492,18 @@ def file_record_for_path(
     if max_file_size is not None and size > max_file_size:
         return None
 
-    return FileRec(
+    rec = FileRec(
         path=full,
         size=size,
         mtime=recency_timestamp_for_path(full, st),
         mode=st.st_mode,
     )
+
+    # Do not spend inventory RAM on files the policy can never select.
+    if classify_file(rec)[0] >= 99:
+        return None
+
+    return rec
 
 
 def scan_files(
@@ -2560,14 +2696,14 @@ def scan_files(
                         if max_file_size is not None and size > max_file_size:
                             continue
 
-                        local_files.append(
-                            FileRec(
-                                path=full,
-                                size=size,
-                                mtime=recency_timestamp_for_path(full, st),
-                                mode=st.st_mode,
-                            )
+                        rec = FileRec(
+                            path=full,
+                            size=size,
+                            mtime=recency_timestamp_for_path(full, st),
+                            mode=st.st_mode,
                         )
+                        if classify_file(rec)[0] < 99:
+                            local_files.append(rec)
             except Exception:
                 logging.exception("scan worker error in %s", dirpath)
             finally:
@@ -2728,22 +2864,20 @@ def selection_sort_key(rec: FileRec) -> Optional[tuple]:
     if tier >= 99:
         return None
 
-    # Priority tiers first. Inside each tier:
-    # - higher confidence wins
-    # - smaller files win
-    # - newer files win
-    #
-    # Tier 5 is the fallback and therefore behaves like the old algorithm:
-    # smallest files first, then newer files.
+    path = os.path.normpath(rec.path).lower()
+    name = os.path.basename(path)
     budget_key = cache_budget_key(rec)
     recency_first = budget_key in RECENCY_FIRST_BUDGET_KEYS
 
     if tier == 5:
+        # Fallback fills leftover RAM only after code/runtime/startup data.
+        # Ordinary small files beat photos/audio/video/game packs even when
+        # those media files happen to be tiny.
         return (
             tier,
+            fallback_content_rank(path, name),
             fallback_size_rank(rec.size),
             rec.size,
-            0,
             -rec.mtime,
             rec.path,
         )
@@ -2758,43 +2892,64 @@ def selection_sort_key(rec: FileRec) -> Optional[tuple]:
             rec.path,
         )
 
+    # For real application/runtime tiers, semantic confidence matters more
+    # than merely being a tiny file. This makes code/libs/resources outrank
+    # low-value small files while still preferring compact files at equal value.
     return (
         tier,
-        fallback_size_rank(rec.size),
         -confidence,
+        fallback_size_rank(rec.size),
         rec.size,
         -rec.mtime,
         rec.path,
     )
 
 
-def build_selection_index(
-    files,
-) -> tuple[list[FileRec], list[tuple]]:
-    ranked: list[tuple[tuple, FileRec]] = []
-
-    for rec in files:
-        key = selection_sort_key(rec)
-        if key is not None:
-            ranked.append((key, rec))
-
-    ranked.sort(key=lambda item: item[0])
-    return [rec for _, rec in ranked], [key for key, _ in ranked]
+def build_selection_index(files) -> list[FileRec]:
+    """Build only the ordered record list; do not retain millions of sort tuples."""
+    # scan_files()/file_record_for_path() already discard tier-99 records.
+    ordered = list(files)
+    ordered.sort(key=selection_sort_key)
+    return ordered
 
 
 def build_selection_order(files: list[FileRec]) -> list[FileRec]:
-    ordered, _ = build_selection_index(files)
-    return ordered
+    return build_selection_index(files)
+
+
+def _ordered_bisect_left(ordered: list[FileRec], key: tuple) -> int:
+    lo = 0
+    hi = len(ordered)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        mid_key = selection_sort_key(ordered[mid])
+        if mid_key is not None and mid_key < key:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _ordered_bisect_right(ordered: list[FileRec], key: tuple) -> int:
+    lo = 0
+    hi = len(ordered)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        mid_key = selection_sort_key(ordered[mid])
+        if mid_key is not None and key < mid_key:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
 
 
 def update_selection_index(
     ordered: list[FileRec],
-    ordered_keys: list[tuple],
     inventory: dict[str, FileRec],
     removed: list[FileRec],
     added: list[FileRec],
     cfg: dict,
-) -> tuple[list[FileRec], list[tuple]]:
+) -> list[FileRec]:
     changed_count = len(removed) + len(added)
     rebuild_threshold = int(cfg.get("selection_incremental_rebuild_threshold", 256) or 256)
 
@@ -2807,9 +2962,8 @@ def update_selection_index(
         if key is None:
             continue
 
-        idx = bisect.bisect_left(ordered_keys, key)
-        if idx < len(ordered_keys) and ordered_keys[idx] == key:
-            ordered_keys.pop(idx)
+        idx = _ordered_bisect_left(ordered, key)
+        if idx < len(ordered) and selection_sort_key(ordered[idx]) == key:
             ordered.pop(idx)
 
     for rec in added:
@@ -2817,11 +2971,10 @@ def update_selection_index(
         if key is None:
             continue
 
-        idx = bisect.bisect_right(ordered_keys, key)
-        ordered_keys.insert(idx, key)
+        idx = _ordered_bisect_right(ordered, key)
         ordered.insert(idx, rec)
 
-    return ordered, ordered_keys
+    return ordered
 
 
 
@@ -2839,7 +2992,9 @@ def select_files(
     steps = 0
 
     group_caps = cache_budget_caps(cfg)
+    group_file_caps = cache_budget_file_caps(cfg)
     group_used: dict[str, int] = {}
+    group_file_count: dict[str, int] = {}
     chosen_dynamic_roots: dict[str, str] = {}
 
     # Precompute VRChat cache unit sizes so the 2G cap is applied to whole
@@ -2902,8 +3057,12 @@ def select_files(
         elif budget_key is not None:
             cap = group_caps.get(budget_key)
             used = group_used.get(budget_key, 0)
+            file_cap = group_file_caps.get(budget_key)
+            used_files = group_file_count.get(budget_key, 0)
 
             if cap is not None and used + rec.size > cap:
+                continue
+            if file_cap is not None and used_files >= file_cap:
                 continue
 
             root_key = dynamic_cache_root_key(rec)
@@ -2924,6 +3083,7 @@ def select_files(
 
         if budget_key is not None and budget_key != "vrchat_content_cache":
             group_used[budget_key] = group_used.get(budget_key, 0) + rec.size
+            group_file_count[budget_key] = group_file_count.get(budget_key, 0) + 1
 
         if total >= budget_bytes:
             break
@@ -3018,7 +3178,7 @@ def choose_target_bytes(
 
     elif available < floor_available:
         # Memory pressure: shrink immediately and overshoot back to the safer
-        # reserve. This avoids bouncing around the 8G line.
+        # reserve. This avoids bouncing around the hard floor.
         target_bytes = target_for_available_reserve(shrink_to_available)
 
     elif available > grow_above_available:
@@ -3067,7 +3227,7 @@ def target_change_is_meaningful(
     # Grow only after choose_target_bytes() says MemAvailable is above the
     # upper watermark. Do not scale the grow deadband with total cache size:
     # on 64G+ systems that strands multiple GiB unused. The absolute deadband
-    # is enough to prevent churn while still converging toward the 5G reserve.
+    # is enough to prevent churn while still converging toward the configured reserve.
     abs_deadband = parse_size(cfg.get("target_relock_min_delta", "512M")) or 0
     return desired_target_bytes - current_target_bytes >= abs_deadband
 
@@ -3258,6 +3418,7 @@ class Watcher:
 
                     if "|" not in line:
                         self.resync_event.set()
+                        CONTROLLER_WAKE_EVENT.set()
                         continue
 
                     events, path = line.split("|", 1)
@@ -3269,6 +3430,7 @@ class Watcher:
 
                     if "Q_OVERFLOW" in event_set or "UNMOUNT" in event_set:
                         self.resync_event.set()
+                        CONTROLLER_WAKE_EVENT.set()
                         continue
 
                     path = os.path.normpath(path)
@@ -3280,7 +3442,9 @@ class Watcher:
                         or 100000
                     )
 
+                    wake_for_change = False
                     with self.lock:
+                        was_empty = not self.pending
                         existing = self.pending.setdefault(path, set())
                         existing.update(event_set)
 
@@ -3290,8 +3454,24 @@ class Watcher:
                             # the incremental inventory is still authoritative.
                             self.pending.clear()
                             self.resync_event.set()
+                            wake_for_change = True
+                        elif was_empty:
+                            # One wake starts the coalescing/batch timer. Further
+                            # events do not spin the controller while pending.
+                            wake_for_change = True
+
+                    if wake_for_change:
+                        CONTROLLER_WAKE_EVENT.set()
             except Exception:
                 self.resync_event.set()
+                CONTROLLER_WAKE_EVENT.set()
+            finally:
+                # EOF from a dead watcher is a correctness gap just like an
+                # explicit exception. Wake immediately rather than waiting for
+                # the idle health heartbeat.
+                if not self.stop_event.is_set():
+                    self.resync_event.set()
+                    CONTROLLER_WAKE_EVENT.set()
 
         self.thread = threading.Thread(
             target=reader,
@@ -3356,7 +3536,6 @@ def compute_vmtouch_pause_plan(path_count: int, cfg: dict) -> tuple[float, int]:
 
 
 def start_vmtouch(cfg: dict, max_file_size_bytes: Optional[int], records: list[FileRec]) -> VmtouchRun:
-    paths = [r.path for r in records]
     bytes_locked = sum(r.size for r in records)
 
     if max_file_size_bytes is not None:
@@ -3383,18 +3562,19 @@ def start_vmtouch(cfg: dict, max_file_size_bytes: Optional[int], records: list[F
         text=False,
     )
 
-    pause_seconds, pause_count = compute_vmtouch_pause_plan(len(paths), cfg)
+    pause_seconds, pause_count = compute_vmtouch_pause_plan(len(records), cfg)
     stop_event = threading.Event()
 
     def feed_paths() -> None:
         first_path = True
         pauses_done = 0
-        total_paths = len(paths)
+        total_paths = len(records)
 
         try:
             assert proc.stdin is not None
 
-            for idx, path in enumerate(paths, start=1):
+            for idx, rec in enumerate(records, start=1):
+                path = rec.path
                 if stop_event.is_set() or proc.poll() is not None:
                     break
 
@@ -3456,15 +3636,11 @@ def flatten_run_records(runs: list[VmtouchRun]) -> list[FileRec]:
     return records
 
 
-def record_identity(rec: FileRec) -> tuple[str, int, float]:
-    return (rec.path, rec.size, rec.mtime)
-
-
 def common_prefix_len(a: list[FileRec], b: list[FileRec]) -> int:
     limit = min(len(a), len(b))
     idx = 0
 
-    while idx < limit and record_identity(a[idx]) == record_identity(b[idx]):
+    while idx < limit and a[idx] == b[idx]:
         idx += 1
 
     return idx
@@ -3580,10 +3756,7 @@ def sync_vmtouch_cache(
 ) -> tuple[list[VmtouchRun], list[FileRec]]:
     current = flatten_run_records(runs)
 
-    desired_identities = [record_identity(r) for r in desired]
-    current_identities = [record_identity(r) for r in current]
-
-    if current_identities == desired_identities:
+    if current == desired:
         return runs, current
 
     desired_bytes = selected_bytes(desired)
@@ -3609,7 +3782,7 @@ def sync_vmtouch_cache(
         if idx + 1 < len(to_stop):
             maybe_stagger_vmtouch_transition(cfg, "vmtouch_stop_stagger_seconds")
 
-    desired_set = set(desired_identities)
+    desired_set = set(desired)
 
     # If a file changed in-place, only recycle chunks that contain a stale
     # record. Unchanged chunks remain locked and are never needlessly rebuilt.
@@ -3617,7 +3790,7 @@ def sync_vmtouch_cache(
     kept_runs: list[VmtouchRun] = []
 
     for run in runs:
-        if all(record_identity(rec) in desired_set for rec in run.records):
+        if all(rec in desired_set for rec in run.records):
             kept_runs.append(run)
         else:
             stale_runs.append(run)
@@ -3637,36 +3810,31 @@ def sync_vmtouch_cache(
             maybe_stagger_vmtouch_transition(cfg, "vmtouch_stop_stagger_seconds")
 
     runs = kept_runs
-    locked_set = {
-        record_identity(rec)
-        for rec in flatten_run_records(runs)
-    }
+    del desired_set
 
+    locked_set = set(flatten_run_records(runs))
     missing = [
         rec
         for rec in desired
-        if record_identity(rec) not in locked_set
+        if rec not in locked_set
     ]
+    del locked_set
 
     if missing:
         runs.extend(start_vmtouch_chunks(cfg, max_file_size_bytes, missing))
 
-    # Process order is only metadata used by our shrink strategy. Reordering
-    # the handles costs nothing and keeps future pressure releases priority-
-    # correct even after incremental file updates.
-    desired_position = {
-        identity: idx
-        for idx, identity in enumerate(desired_identities)
-    }
-    runs.sort(
-        key=lambda run: min(
-            (
-                desired_position.get(record_identity(rec), len(desired_position))
-                for rec in run.records
-            ),
-            default=len(desired_position),
-        )
-    )
+    # Run order is only metadata for future pressure release. The selection
+    # sort key already encodes global priority, so sorting chunks by their best
+    # member avoids building a huge record->position dictionary.
+    def run_priority(run: VmtouchRun) -> tuple:
+        best = None
+        for rec in run.records:
+            key = selection_sort_key(rec)
+            if key is not None and (best is None or key < best):
+                best = key
+        return best if best is not None else (999,)
+
+    runs.sort(key=run_priority)
 
     return runs, flatten_run_records(runs)
 
@@ -3686,10 +3854,13 @@ def write_status(
     fast_growth_bytes: int = 0,
     psi_some_delta_us: int = 0,
     psi_full_delta_us: int = 0,
+    selected_total_bytes: Optional[int] = None,
 ) -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    selected_total_bytes = sum(r.size for r in selected)
+    if selected_total_bytes is None:
+        selected_total_bytes = sum(r.size for r in selected)
     payload = {
+        "controller_version": CONTROLLER_VERSION,
         "timestamp": int(time.time()),
         "memory_profile": cfg.get("memory_profile", "normal"),
         "target_locked_gib": target_gib,
@@ -3732,11 +3903,11 @@ def main() -> int:
 
     inventory: dict[str, FileRec] = {}
     ordered: list[FileRec] = []
-    ordered_keys: list[tuple] = []
 
     current_target_bytes: Optional[int] = None
     current_vmtouch_runs: list[VmtouchRun] = []
     current_selected: list[FileRec] = []
+    current_locked_bytes = 0
 
     last_full_scan = 0.0
     last_incremental_scan = 0.0
@@ -3787,6 +3958,7 @@ def main() -> int:
                     fast_growth_bytes=memory_monitor.recent_fast_growth_bytes(cfg),
                     psi_some_delta_us=memory_monitor.psi_stall_deltas()[0],
                     psi_full_delta_us=memory_monitor.psi_stall_deltas()[1],
+                    selected_total_bytes=0,
                 )
 
             now = time.time()
@@ -3829,9 +4001,7 @@ def main() -> int:
                     if memory_monitor.should_abort_scan(cfg):
                         raise MemoryPressureAbort
 
-                    new_ordered, new_ordered_keys = build_selection_index(
-                        new_inventory
-                    )
+                    new_ordered = build_selection_index(new_inventory)
                 except MemoryPressureAbort:
                     logging.info(
                         "memory growth/pressure detected during scan; "
@@ -3840,7 +4010,9 @@ def main() -> int:
                 else:
                     inventory = {rec.path: rec for rec in new_inventory}
                     ordered = new_ordered
-                    ordered_keys = new_ordered_keys
+                    # Drop the temporary scan list reference immediately; the
+                    # records now live in inventory/ordered only.
+                    del new_inventory
                     last_full_scan = time.time()
                     inventory_changed = True
 
@@ -3892,9 +4064,8 @@ def main() -> int:
                     )
                 else:
                     if removed or added:
-                        ordered, ordered_keys = update_selection_index(
+                        ordered = update_selection_index(
                             ordered,
-                            ordered_keys,
                             inventory,
                             removed,
                             added,
@@ -3943,7 +4114,7 @@ def main() -> int:
                 desired_target_bytes = current_target_bytes
 
             if proactive_release_bytes > 0 and current_vmtouch_runs:
-                locked_estimate = selected_bytes(current_selected)
+                locked_estimate = current_locked_bytes
                 proactive_target = max(
                     0,
                     locked_estimate - proactive_release_bytes,
@@ -3975,12 +4146,12 @@ def main() -> int:
             if urgent_pressure:
                 memory_monitor.arm_regrow_guard(cfg)
 
-            # Critical latency path: unlock before doing expensive reselection.
-            # Several vmtouch processes are terminated concurrently.
+            # Any decision that lowers the cache target uses the same latency-
+            # critical concurrent unlock path. Growth is deliberate; shrinkage
+            # is always immediate regardless of why the target fell.
             if (
-                urgent_pressure
-                and current_vmtouch_runs
-                and desired_target_bytes < selected_bytes(current_selected)
+                current_vmtouch_runs
+                and desired_target_bytes < current_locked_bytes
             ):
                 (
                     current_vmtouch_runs,
@@ -3991,15 +4162,15 @@ def main() -> int:
                     desired_target_bytes,
                 )
 
-                actual_locked = selected_bytes(current_selected)
-                current_target_bytes = actual_locked
-                desired_target_bytes = actual_locked
+                current_locked_bytes = run_bytes(current_vmtouch_runs)
+                current_target_bytes = current_locked_bytes
+                desired_target_bytes = current_locked_bytes
 
                 logging.info(
-                    "urgent cache release completed: %.2f GiB unlocked; "
+                    "fast cache shrink completed: %.2f GiB unlocked; "
                     "%.2f GiB remains locked",
                     bytes_to_gib(actually_released),
-                    bytes_to_gib(actual_locked),
+                    bytes_to_gib(current_locked_bytes),
                 )
 
             effective_target_bytes = current_target_bytes
@@ -4048,7 +4219,7 @@ def main() -> int:
                 )
 
             current_target_bytes = effective_target_bytes
-            current_locked_bytes = selected_bytes(current_selected)
+            current_locked_bytes = run_bytes(current_vmtouch_runs)
 
             write_status(
                 bytes_to_gib(current_locked_bytes),
@@ -4064,23 +4235,38 @@ def main() -> int:
                 fast_growth_bytes=memory_monitor.recent_fast_growth_bytes(cfg),
                 psi_some_delta_us=memory_monitor.psi_stall_deltas()[0],
                 psi_full_delta_us=memory_monitor.psi_stall_deltas()[1],
+                selected_total_bytes=current_locked_bytes,
             )
 
         except Exception:
             logging.exception("controller loop error")
 
-        sleep_for = 1.0
+        sleep_for = 60.0
         try:
             _, cfg = load_config()
-            sleep_for = float(cfg.get("check_interval_seconds", 1) or 1)
+            sleep_for = float(cfg.get("check_interval_seconds", 60) or 60)
+
+            # Filesystem activity wakes us once. If it arrived inside the
+            # coalescing window, sleep only until that batch becomes due—not
+            # for the whole idle interval and not in a busy polling loop.
+            if watcher.pending_count() > 0 and full_scan_required_reason is None:
+                batch_interval = float(
+                    cfg.get("incremental_rescan_interval_seconds", 5) or 5
+                )
+                due_in = max(
+                    0.05,
+                    batch_interval - (time.time() - last_incremental_scan),
+                )
+                sleep_for = min(sleep_for, due_in)
         except Exception:
             pass
 
         if RUNNING:
-            # The normal loop is cheap, but memory pressure can wake it
-            # immediately rather than waiting for the next controller tick.
-            PRESSURE_WAKE_EVENT.wait(timeout=max(0.05, sleep_for))
-            PRESSURE_WAKE_EVENT.clear()
+            # Steady state is event-driven: filesystem events and memory
+            # pressure wake this immediately. The long timeout is only a cheap
+            # health/config/status heartbeat.
+            CONTROLLER_WAKE_EVENT.wait(timeout=max(0.05, sleep_for))
+            CONTROLLER_WAKE_EVENT.clear()
 
     memory_monitor.stop()
     watcher.stop()
@@ -4116,7 +4302,7 @@ write_config() {
   "auto_include_common_app_paths": true,
   "cross_filesystem_include_roots": ["/snap"],
 
-  "check_interval_seconds": 1,
+  "check_interval_seconds": 60,
   "incremental_rescan_interval_seconds": 5,
   "full_rescan_interval_seconds": 0,
   "prefer_fanotify_filesystem_watch": true,
@@ -4163,7 +4349,9 @@ write_config() {
   "max_selection_budget_total_ratio": 4.0,
 
   "steam_htmlcache_budget_bytes": "1G",
+  "steam_htmlcache_max_files": 4000,
   "firefox_webcache_budget_bytes": "2G",
+  "firefox_webcache_max_files": 2000,
   "hytale_world_budget_bytes": "2G",
   "vrchat_content_cache_budget_bytes": "2G",
 
@@ -4316,23 +4504,59 @@ fs.inotify.max_user_instances=1024
 fs.inotify.max_queued_events=262144
 EOF
 
-  if [[ ! -f /etc/sysctl.d/99-cache-aggressive.conf ]]; then
-    cat > /etc/sysctl.d/99-cache-aggressive.conf <<'EOF'
-vm.vfs_cache_pressure=10
-vm.vfs_cache_pressure_denom=100
-EOF
+  # Own a dedicated VM sysctl file. Linux 6.16+ exposes
+  # vfs_cache_pressure_denom; older Mint/Ubuntu/Pop kernels do not. Never write
+  # an unsupported key, so installation and boot stay clean on either kernel.
+  {
+    echo 'vm.vfs_cache_pressure=10'
+    if [[ -e /proc/sys/vm/vfs_cache_pressure_denom ]]; then
+      echo 'vm.vfs_cache_pressure_denom=100'
+    fi
+  } > /etc/sysctl.d/99-ramcache-vm.conf
+
+  # v1.2 could have created this exact legacy file. Remove it only when it is
+  # clearly ours; never overwrite/delete a user's unrelated tuning file.
+  legacy=/etc/sysctl.d/99-cache-aggressive.conf
+  if [[ -f "$legacy" ]]; then
+    legacy_compact="$(grep -Ev '^[[:space:]]*(#|$)' "$legacy" | tr -d '[:space:]' || true)"
+    if [[ "$legacy_compact" == 'vm.vfs_cache_pressure=10vm.vfs_cache_pressure_denom=100' ]]; then
+      rm -f "$legacy"
+    fi
   fi
 
-  sysctl --system >/dev/null
+  # Apply only files owned by this installer. This avoids failing installation
+  # because some unrelated sysctl file elsewhere on the machine is invalid.
+  sysctl -p /etc/sysctl.d/99-ramcache-inotify.conf >/dev/null
+  sysctl -p /etc/sysctl.d/99-ramcache-vm.conf >/dev/null
+}
+
+ensure_dependencies() {
+  local packages=()
+
+  command -v python3 >/dev/null 2>&1 || packages+=(python3)
+  command -v vmtouch >/dev/null 2>&1 || packages+=(vmtouch)
+  command -v inotifywait >/dev/null 2>&1 || packages+=(inotify-tools)
+
+  if ((${#packages[@]})); then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "ERROR: This installer expects an Ubuntu/Debian-family system with apt (Ubuntu, Pop!_OS, Linux Mint)." >&2
+      return 1
+    fi
+
+    echo "Installing required packages: ${packages[*]}"
+    apt-get update
+    apt-get install -y "${packages[@]}"
+  fi
 }
 
 ensure_fs_watch_tools() {
-  # inotify-tools provides both the universal inotify fallback and, on modern
-  # Ubuntu/Pop!/Mint releases, fsnotifywait for fanotify filesystem watching.
-  # Only touch apt when one of the required commands is actually absent.
-  if ! command -v inotifywait >/dev/null 2>&1 || ! command -v fsnotifywait >/dev/null 2>&1; then
+  # inotifywait is the reliable baseline. fsnotifywait/fanotify is optional
+  # and preferred automatically when the installed inotify-tools build and
+  # running kernel support it.
+  if ! command -v inotifywait >/dev/null 2>&1; then
     echo "Installing Linux filesystem notification tools (inotify-tools)..."
-    apt install -y inotify-tools
+    apt-get update
+    apt-get install -y inotify-tools
   fi
 
   if ! command -v inotifywait >/dev/null 2>&1; then
@@ -4351,8 +4575,7 @@ ensure_fs_watch_tools() {
 install_all() {
   need_root
   export DEBIAN_FRONTEND=noninteractive
-  apt update
-  apt install -y python3 vmtouch
+  ensure_dependencies
   ensure_fs_watch_tools
   write_controller
   write_config
@@ -4362,7 +4585,7 @@ install_all() {
   systemctl enable --now ramcache-controller.service
 
   echo
-  echo "Installed."
+  echo "Installed RAM cache controller v1.3."
   echo "Status:"
   echo "  systemctl status ramcache-controller.service --no-pager"
   echo "  python3 -m json.tool /run/ramcache-controller/status.json"
@@ -4380,10 +4603,18 @@ uninstall_all() {
   rm -rf /etc/ramcache-controller
   rm -rf /run/ramcache-controller
   rm -f /etc/sysctl.d/99-ramcache-inotify.conf
+  rm -f /etc/sysctl.d/99-ramcache-vm.conf
+
+  legacy=/etc/sysctl.d/99-cache-aggressive.conf
+  if [[ -f "$legacy" ]]; then
+    legacy_compact="$(grep -Ev '^[[:space:]]*(#|$)' "$legacy" | tr -d '[:space:]' || true)"
+    if [[ "$legacy_compact" == 'vm.vfs_cache_pressure=10vm.vfs_cache_pressure_denom=100' ]]; then
+      rm -f "$legacy"
+    fi
+  fi
 
   systemctl daemon-reload
   systemctl reset-failed ramcache-controller.service || true
-  sysctl --system >/dev/null || true
 
   echo
   echo "Removed ramcache-controller."
@@ -4392,9 +4623,17 @@ uninstall_all() {
   echo "  /opt/ramcache-controller"
   echo "  /run/ramcache-controller"
   echo "  /etc/systemd/system/ramcache-controller.service"
+  echo "  /etc/sysctl.d/99-ramcache-inotify.conf"
+  echo "  /etc/sysctl.d/99-ramcache-vm.conf"
 }
 
 status_all() {
+  echo "RAM cache controller installer: v1.3"
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
+  fi
+  echo "Kernel: $(uname -r)"
   systemctl status ramcache-controller.service --no-pager || true
   echo
   if [[ -f /run/ramcache-controller/status.json ]]; then
@@ -4404,6 +4643,15 @@ status_all() {
   fi
   echo
   grep -E 'MemAvailable|Cached|Active\(file\)|Inactive\(file\)|Mlocked|Unevictable' /proc/meminfo || true
+
+  echo
+  echo "VM cache tuning:"
+  echo "  vm.vfs_cache_pressure: $(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo unavailable)"
+  if [[ -e /proc/sys/vm/vfs_cache_pressure_denom ]]; then
+    echo "  vm.vfs_cache_pressure_denom: supported"
+  else
+    echo "  vm.vfs_cache_pressure_denom: not exposed by this kernel (safely skipped)"
+  fi
 
   echo
   echo "Filesystem watcher capabilities:"
