@@ -41,7 +41,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.3"
+CONTROLLER_VERSION = "1.3.1"
 _SCAN_STORAGE_PROFILE_CACHE: dict[tuple[str, ...], str] = {}
 
 @dataclass(frozen=True, slots=True)
@@ -2950,32 +2950,129 @@ def update_selection_index(
     added: list[FileRec],
     cfg: dict,
 ) -> list[FileRec]:
+    """Update the global priority order without ever re-sorting the inventory.
+
+    Tiny batches use in-place binary insert/remove. Larger batches remove
+    changed paths in one linear pass, binary-search insertion points for only
+    the new records, then rebuild the list of references once. This keeps work
+    proportional to the change set plus one cheap pointer pass instead of
+    repeatedly reclassifying/sorting millions of unchanged files.
+    """
     changed_count = len(removed) + len(added)
-    rebuild_threshold = int(cfg.get("selection_incremental_rebuild_threshold", 256) or 256)
+    if changed_count <= 0:
+        return ordered
 
-    if changed_count >= rebuild_threshold:
-        # Still entirely in RAM: no filesystem rescan, just a fresh ordering.
-        return build_selection_index(inventory.values())
+    small_threshold = int(
+        cfg.get("selection_small_update_threshold", 32)
+        or 32
+    )
 
-    for rec in removed:
+    if changed_count <= small_threshold:
+        for rec in removed:
+            key = selection_sort_key(rec)
+            if key is None:
+                continue
+
+            idx = _ordered_bisect_left(ordered, key)
+            if idx < len(ordered) and selection_sort_key(ordered[idx]) == key:
+                ordered.pop(idx)
+
+        for rec in added:
+            key = selection_sort_key(rec)
+            if key is None:
+                continue
+
+            idx = _ordered_bisect_right(ordered, key)
+            ordered.insert(idx, rec)
+
+        return ordered
+
+    # Modifications are represented as old-record removal + new-record add.
+    # Include added paths in the removal set defensively so a stale duplicate
+    # can never survive an unusual watcher sequence.
+    changed_paths = {rec.path for rec in removed}
+    changed_paths.update(rec.path for rec in added)
+
+    if changed_paths:
+        kept = [rec for rec in ordered if rec.path not in changed_paths]
+    else:
+        kept = list(ordered)
+
+    # Coalesce repeated events for the same path to the newest FileRec.
+    added_by_path: dict[str, FileRec] = {}
+    for rec in added:
+        added_by_path[rec.path] = rec
+
+    placements: list[tuple[int, tuple, FileRec]] = []
+    for rec in added_by_path.values():
         key = selection_sort_key(rec)
         if key is None:
             continue
+        idx = _ordered_bisect_right(kept, key)
+        placements.append((idx, key, rec))
 
-        idx = _ordered_bisect_left(ordered, key)
-        if idx < len(ordered) and selection_sort_key(ordered[idx]) == key:
-            ordered.pop(idx)
+    if not placements:
+        return kept
+
+    # Multiple additions may map to the same insertion point; preserve their
+    # exact global ordering without sorting the unchanged inventory.
+    placements.sort(key=lambda item: (item[0], item[1]))
+
+    merged: list[FileRec] = []
+    cursor = 0
+    place_idx = 0
+
+    while place_idx < len(placements):
+        insert_at = placements[place_idx][0]
+        merged.extend(kept[cursor:insert_at])
+
+        while (
+            place_idx < len(placements)
+            and placements[place_idx][0] == insert_at
+        ):
+            merged.append(placements[place_idx][2])
+            place_idx += 1
+
+        cursor = insert_at
+
+    merged.extend(kept[cursor:])
+    return merged
+
+
+def changes_affect_current_selection(
+    current_selected: list[FileRec],
+    removed: list[FileRec],
+    added: list[FileRec],
+) -> bool:
+    """Return True only when changed files can alter the currently locked set.
+
+    Most desktop filesystem churn is cache/history/log data that falls below
+    the current selection boundary. Keep the inventory accurate, but do not
+    rerun the expensive multi-million-file selection pass unless a selected
+    file changed/disappeared or a newly changed file outranks the current tail.
+    """
+    if not removed and not added:
+        return False
+
+    if not current_selected:
+        return bool(added)
+
+    removed_paths = {rec.path for rec in removed}
+    if removed_paths:
+        for rec in current_selected:
+            if rec.path in removed_paths:
+                return True
+
+    boundary_key = selection_sort_key(current_selected[-1])
+    if boundary_key is None:
+        return True
 
     for rec in added:
         key = selection_sort_key(rec)
-        if key is None:
-            continue
+        if key is not None and key <= boundary_key:
+            return True
 
-        idx = _ordered_bisect_right(ordered, key)
-        ordered.insert(idx, rec)
-
-    return ordered
-
+    return False
 
 
 def select_files(
@@ -3270,6 +3367,7 @@ class Watcher:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.pending: dict[str, set[str]] = {}
+        self.pending_since_monotonic: Optional[float] = None
         self.resync_event = threading.Event()
         self.cfg: dict = {}
         self.include_paths: list[str] = []
@@ -3351,7 +3449,15 @@ class Watcher:
         self._write_watch_list(cfg)
         self.stop_event.clear()
 
-        event_spec = "close_write,create,delete,move,attrib"
+        # Attribute-only events are extremely noisy on active Linux desktops
+        # (timestamps/metadata can change without useful cache content changes).
+        # Content/path changes remain fully event-driven. Users can explicitly
+        # opt back into ATTRIB watching if a workload really needs chmod/chown
+        # changes reflected immediately.
+        watched_events = ["close_write", "create", "delete", "move"]
+        if bool(cfg.get("watch_attribute_events", False)):
+            watched_events.append("attrib")
+        event_spec = ",".join(watched_events)
         started = False
 
         fsnotifywait = shutil.which("fsnotifywait")
@@ -3402,6 +3508,7 @@ class Watcher:
 
         with self.lock:
             self.pending.clear()
+            self.pending_since_monotonic = None
 
         def reader() -> None:
             assert self.proc is not None
@@ -3453,11 +3560,14 @@ class Watcher:
                             # Force one recovery scan rather than pretending
                             # the incremental inventory is still authoritative.
                             self.pending.clear()
+                            self.pending_since_monotonic = None
                             self.resync_event.set()
                             wake_for_change = True
                         elif was_empty:
-                            # One wake starts the coalescing/batch timer. Further
-                            # events do not spin the controller while pending.
+                            # Wake once so the controller can arm a long batch
+                            # deadline. Further events stay coalesced and do not
+                            # repeatedly wake/spin the Python controller.
+                            self.pending_since_monotonic = time.monotonic()
                             wake_for_change = True
 
                     if wake_for_change:
@@ -3497,10 +3607,12 @@ class Watcher:
                 for path, events in self.pending.items()
             ]
             self.pending.clear()
+            self.pending_since_monotonic = None
         return changes
 
     def requeue_changes(self, changes: list[tuple[str, str]]) -> None:
         with self.lock:
+            was_empty = not self.pending
             for events, path in changes:
                 bucket = self.pending.setdefault(path, set())
                 bucket.update(
@@ -3508,10 +3620,18 @@ class Watcher:
                     for event in events.split(",")
                     if event.strip()
                 )
+            if was_empty and self.pending:
+                self.pending_since_monotonic = time.monotonic()
 
     def pending_count(self) -> int:
         with self.lock:
             return len(self.pending)
+
+    def pending_age_seconds(self) -> float:
+        with self.lock:
+            if not self.pending or self.pending_since_monotonic is None:
+                return 0.0
+            return max(0.0, time.monotonic() - self.pending_since_monotonic)
 
     def needs_resync(self) -> bool:
         return self.resync_event.is_set()
@@ -3976,6 +4096,7 @@ def main() -> int:
             emergency_pressure = memory_monitor.should_abort_scan(cfg)
 
             inventory_changed = False
+            selection_policy_changed = False
 
             if full_scan_required_reason is not None and not emergency_pressure:
                 reason = full_scan_required_reason
@@ -4015,6 +4136,7 @@ def main() -> int:
                     del new_inventory
                     last_full_scan = time.time()
                     inventory_changed = True
+                    selection_policy_changed = True
 
                     if watcher.needs_resync():
                         full_scan_required_reason = "filesystem event overflow during scan"
@@ -4030,19 +4152,18 @@ def main() -> int:
                 meminfo = memory_monitor.meminfo()
                 max_file_size_bytes = resolve_vmtouch_max_file_size_bytes(meminfo, cfg)
 
-            # Normal updates are event-driven. No whole-filesystem walk occurs:
-            # only files/directories reported by the kernel are re-statted.
+            # Normal filesystem changes are deliberately lazy-batched. The
+            # first kernel event wakes us once to arm the deadline; ordinary
+            # desktop churn then accumulates for a few minutes. Memory pressure
+            # remains independent and immediate.
             incremental_interval = float(
-                cfg.get("incremental_rescan_interval_seconds", 5)
-                or 5
+                cfg.get("incremental_rescan_interval_seconds", 180)
+                or 180
             )
             incremental_due = (
                 full_scan_required_reason is None
                 and watcher.pending_count() > 0
-                and (
-                    inventory_changed
-                    or time.time() - last_incremental_scan >= incremental_interval
-                )
+                and watcher.pending_age_seconds() >= incremental_interval
             )
 
             if incremental_due and not emergency_pressure:
@@ -4064,6 +4185,18 @@ def main() -> int:
                     )
                 else:
                     if removed or added:
+                        # Decide whether the actual locked cache can change
+                        # before spending CPU on a full selection pass.
+                        affects_locked_selection = (
+                            current_target_bytes is None
+                            or current_locked_bytes < int(current_target_bytes)
+                            or changes_affect_current_selection(
+                                current_selected,
+                                removed,
+                                added,
+                            )
+                        )
+
                         ordered = update_selection_index(
                             ordered,
                             inventory,
@@ -4072,9 +4205,12 @@ def main() -> int:
                             cfg,
                         )
                         inventory_changed = True
+                        selection_policy_changed = (
+                            selection_policy_changed
+                            or affects_locked_selection
+                        )
 
                     last_incremental_scan = time.time()
-
             # Re-sample after any scan work. The memory monitor continues
             # sampling while scans run, so a long scan cannot hide a RAM spike.
             meminfo = memory_monitor.meminfo()
@@ -4188,7 +4324,7 @@ def main() -> int:
                 target_changed = True
 
             selection_needs_refresh = (
-                inventory_changed
+                selection_policy_changed
                 or target_changed
                 or any_vmtouch_dead
                 or not current_selected
@@ -4241,30 +4377,31 @@ def main() -> int:
         except Exception:
             logging.exception("controller loop error")
 
-        sleep_for = 60.0
+        sleep_for = 300.0
         try:
             _, cfg = load_config()
-            sleep_for = float(cfg.get("check_interval_seconds", 60) or 60)
+            sleep_for = float(cfg.get("check_interval_seconds", 300) or 300)
 
-            # Filesystem activity wakes us once. If it arrived inside the
-            # coalescing window, sleep only until that batch becomes due—not
-            # for the whole idle interval and not in a busy polling loop.
+            # A normal filesystem event only wakes us once to establish its
+            # batch start time. Do not process it immediately after a long
+            # idle period; wait until the batch itself has aged enough.
             if watcher.pending_count() > 0 and full_scan_required_reason is None:
                 batch_interval = float(
-                    cfg.get("incremental_rescan_interval_seconds", 5) or 5
+                    cfg.get("incremental_rescan_interval_seconds", 180)
+                    or 180
                 )
                 due_in = max(
-                    0.05,
-                    batch_interval - (time.time() - last_incremental_scan),
+                    0.10,
+                    batch_interval - watcher.pending_age_seconds(),
                 )
                 sleep_for = min(sleep_for, due_in)
         except Exception:
             pass
-
         if RUNNING:
-            # Steady state is event-driven: filesystem events and memory
-            # pressure wake this immediately. The long timeout is only a cheap
-            # health/config/status heartbeat.
+            # Memory pressure and watcher failures wake immediately. Normal
+            # filesystem activity wakes once only to arm its batch deadline;
+            # expensive cache/index work stays infrequent and bursty. The long
+            # timeout is only a cheap health/config/status heartbeat.
             CONTROLLER_WAKE_EVENT.wait(timeout=max(0.05, sleep_for))
             CONTROLLER_WAKE_EVENT.clear()
 
@@ -4302,10 +4439,11 @@ write_config() {
   "auto_include_common_app_paths": true,
   "cross_filesystem_include_roots": ["/snap"],
 
-  "check_interval_seconds": 60,
-  "incremental_rescan_interval_seconds": 5,
+  "check_interval_seconds": 600,
+  "incremental_rescan_interval_seconds": 600,
   "full_rescan_interval_seconds": 0,
   "prefer_fanotify_filesystem_watch": true,
+  "watch_attribute_events": false,
   "max_pending_fs_events": 100000,
 
   "scan_worker_max": 64,
@@ -4317,7 +4455,7 @@ write_config() {
   "scan_cooldown_seconds": 0.0,
   "select_cooldown_every": 0,
   "select_cooldown_seconds": 0.0,
-  "selection_incremental_rebuild_threshold": 256,
+  "selection_small_update_threshold": 32,
 
   "memory_monitor_interval_seconds": 0.25,
   "fast_memory_growth_window_seconds": 10,
@@ -4582,10 +4720,13 @@ install_all() {
   write_service
   write_sysctls
   systemctl daemon-reload
-  systemctl enable --now ramcache-controller.service
+  systemctl enable ramcache-controller.service
+  # Always restart on install/upgrade so the running Python process actually
+  # loads the newly written controller instead of continuing old in-memory code.
+  systemctl restart ramcache-controller.service
 
   echo
-  echo "Installed RAM cache controller v1.3."
+  echo "Installed RAM cache controller v1.3.1."
   echo "Status:"
   echo "  systemctl status ramcache-controller.service --no-pager"
   echo "  python3 -m json.tool /run/ramcache-controller/status.json"
@@ -4628,7 +4769,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.3"
+  echo "RAM cache controller installer: v1.3.1"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
