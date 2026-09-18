@@ -1,1047 +1,636 @@
-## Install
+<div align="center">
+
+# ◈ RAMCACHE
+
+### An adaptive, preemptive RAM cache controller for Linux.
+
+**Faster launches · Smarter page caching · Automatic memory-pressure response**
+
+<br>
+
+<img src="https://img.shields.io/badge/LINUX-PAGE_CACHE-5D8CFF?style=for-the-badge&labelColor=090D18" alt="Linux Page Cache">
+<img src="https://img.shields.io/badge/ADAPTIVE-MEMORY_AWARE-34D8A3?style=for-the-badge&labelColor=090D18" alt="Adaptive">
+<img src="https://img.shields.io/badge/VMTouch-MLOCK-806DF7?style=for-the-badge&labelColor=090D18" alt="vmtouch">
+<img src="https://img.shields.io/badge/SYSTEMD-MANAGED-70B5FF?style=for-the-badge&labelColor=090D18" alt="systemd">
+<img src="https://img.shields.io/badge/VERSION-1.3.2-9B73FF?style=for-the-badge&labelColor=090D18" alt="Version 1.3.2">
+
+<br><br>
+
+**RAMCache turns otherwise idle memory into a prioritized, self-adjusting cache for the files that make Linux applications feel fast.**
+
+It preloads useful files into the normal Linux page cache, locks selected pages with `vmtouch`, and automatically gives RAM back when applications need it.
+
+**No tmpfs. No file copies. No filesystem replacement.**
+
+<br>
+
+[Install](#-install) ·
+[Status](#-status) ·
+[Uninstall](#-uninstall) ·
+[How it works](#how-it-works) ·
+[Memory control](#memory-control) ·
+[Configuration](#configuration)
+
+</div>
+
+---
+
+# Quick start
+
+## ⚡ Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/RamCache/main/ramcache.sh | sudo bash -s install
-````
+```
 
-## Uninstall
+This downloads the current `ramcache.sh` from GitHub and runs its `install` action as root.
+
+The installer:
+
+1. Checks for `python3`, `vmtouch`, and `inotify-tools`.
+2. Installs missing dependencies with `apt`.
+3. Checks whether fanotify filesystem watching is available.
+4. Installs the controller under `/opt/ramcache-controller`.
+5. Writes the default configuration under `/etc/ramcache-controller`.
+6. Creates the systemd service.
+7. Installs RAM-cache and filesystem-watcher sysctl settings.
+8. Reloads systemd.
+9. Enables RAMCache at boot.
+10. Starts — or restarts — the controller immediately.
+
+> [!IMPORTANT]
+> Running the install command again acts as a reinstall/update and writes the current default `config.json` again. Back up custom configuration before reinstalling.
+
+---
+
+## ◇ Status
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/RamCache/main/ramcache.sh | bash -s status
+```
+
+This does **not install or modify RAMCache**.
+
+It prints:
+
+* RAMCache version
+* Linux distribution and kernel
+* systemd service state
+* Controller status JSON
+* Available, cached, mlocked, and unevictable memory
+* VM cache tuning
+* Filesystem-watcher support
+* Active watcher mode
+* fanotify capability information
+
+For the privileged fanotify runtime test, run the same command through `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/RamCache/main/ramcache.sh | sudo bash -s status
+```
+
+Useful local checks after installation:
+
+```bash
+systemctl status ramcache-controller.service --no-pager
+```
+
+```bash
+python3 -m json.tool /run/ramcache-controller/status.json
+```
+
+```bash
+journalctl -u ramcache-controller.service -f
+```
+
+---
+
+## ✕ Uninstall
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/RamCache/main/ramcache.sh | sudo bash -s uninstall
 ```
 
-# An Adaptive and Preemptive RAM Cache Controller for Linux
+This downloads the current script and runs its `uninstall` action as root.
 
-This project installs a small systemd managed Python controller that continuously selects useful files, feeds them to `vmtouch`, and keeps those files resident in RAM while preserving a configurable amount of available memory for normal system use.
+It:
 
-It is designed for desktop Linux systems where application launch latency, game startup latency, Steam/Proton responsiveness, browser startup, desktop shell responsiveness, shader-cache reuse, and general loading speeds matter.
+* Stops RAMCache.
+* Kills remaining processes belonging to the service.
+* Disables the service.
+* Removes the systemd unit.
+* Removes the controller.
+* Removes RAMCache configuration.
+* Removes runtime state.
+* Removes RAMCache-owned sysctl configuration files.
+* Removes the old legacy cache sysctl file **only if its contents match the file created by an older RAMCache release**.
+* Reloads systemd.
 
-> This is not a tmpfs copy system. It does not move files, duplicate files, replace your filesystem, or rewrite application data. It uses the Linux page cache and `mlock()` behavior through `vmtouch` to keep selected file backed pages resident in RAM.
+It does **not** uninstall `python3`, `vmtouch`, or `inotify-tools`.
+
+> [!NOTE]
+> Removing a sysctl configuration file does not necessarily restore an already-applied kernel value immediately. Those live values may remain until changed manually or the system is rebooted.
 
 ---
 
-## Table of contents
+# What is RAMCache?
 
-* [What it does](#what-it-does)
-* [Why it exists](#why-it-exists)
-* [How it differs from normal Linux caching](#how-it-differs-from-normal-linux-caching)
-* [Why it is faster](#why-it-is-faster)
-* [How it works](#how-it-works)
-* [Architecture](#architecture)
+RAMCache is a systemd-managed Linux controller that proactively keeps useful file-backed data resident in RAM.
+
+Linux already uses unused memory as a filesystem cache. That behavior is excellent, but mostly reactive:
+
+```text
+Application requests file
+        ↓
+Storage is accessed
+        ↓
+Linux keeps the data in page cache
+        ↓
+Later reads may be faster
+```
+
+RAMCache adds a proactive layer:
+
+```text
+System starts
+      ↓
+Useful files are discovered
+      ↓
+Files are ranked by value
+      ↓
+Selected pages are loaded + locked in RAM
+      ↓
+Applications can hit memory immediately
+```
+
+The goal is to reduce storage waits during workloads made up of many small reads:
+
+* Application launches
+* Shared-library loading
+* Desktop startup
+* Browser startup
+* Steam startup
+* Proton/Wine initialization
+* Shader-cache access
+* Fonts, icons, MIME data, and desktop metadata
+* Electron and Flatpak application startup
+
+Even very fast NVMe drives are slower than RAM when software needs thousands of scattered files and metadata records.
 
 ---
 
-## What it does
+# This is not a RAM disk
 
-This RAM Cache Controller keeps selected files hot in memory by:
+RAMCache does **not** copy your applications into `tmpfs`.
 
-1. Scanning configured filesystem roots.
-2. Excluding unsafe, temporary, huge, or low value paths.
-3. Automatically discovering common app/runtime locations.
-4. Classifying files into priority tiers.
-5. Building a sorted cache candidate list.
-6. Choosing how much RAM can be used without crossing configured memory reserve limits.
-7. Feeding selected paths to `vmtouch`.
-8. Locking those file backed pages into RAM.
-9. Shrinking quickly when memory pressure appears.
-10. Growing again when the system has enough available memory.
-11. Watching the filesystem for changes and rescanning when needed.
+It does not move files or change where applications read their data.
 
-The controller is intentionally biased toward files that usually affect perceived desktop speed:
+```mermaid
+flowchart LR
+    A["Files on SSD / NVMe"]
+    B["Linux page cache"]
+    C["vmtouch + mlock"]
+    D["Applications"]
+    E["RAMCache controller"]
 
-* Core binaries
-* Shared libraries
-* Dynamic linker data
-* Runtime files
-* Graphics/audio stack libraries
-* Vulkan/Mesa/OpenGL/PipeWire/ALSA/GStreamer support files
-* Desktop shell support files
-* Fonts
-* Icons
-* MIME databases
-* `.desktop` entries
-* Browser startup state
-* Electron app runtime files
-* Discord/Vesktop/OBS/COSMIC-related files
-* Steam startup files
-* Steam manifests
-* Proton/Wine/Steam runtime files
+    A --> B
+    E -->|"select + preload"| B
+    E -->|"lock / release"| C
+    C --> B
+    B --> D
+```
+
+The original files remain on their normal filesystem.
+
+RAMCache uses Linux's existing **file-backed page cache** and `vmtouch -l` to keep selected pages resident until the controller decides that memory should be released.
+
+---
+
+# How it works
+
+RAMCache continuously coordinates four jobs:
+
+```mermaid
+flowchart TD
+    A["Discover files"] --> B["Classify + prioritize"]
+    B --> C["Build RAM budget"]
+    C --> D["Lock selected pages with vmtouch"]
+    D --> E["Monitor memory pressure"]
+    E -->|"RAM available"| F["Grow cache"]
+    E -->|"Pressure detected"| G["Release low-priority chunks"]
+    F --> H["Watch filesystem changes"]
+    G --> H
+    H --> B
+```
+
+### 1. Discover
+
+The controller scans configured filesystems and automatically discovers common Linux application locations.
+
+It understands paths associated with:
+
+* Core Linux binaries and libraries
+* Desktop environments
+* Flatpak
+* Snap
+* Steam libraries
+* Proton and Wine
+* Browsers
+* Electron applications
 * Shader caches
-* VR/runtime paths
-* Lots of small files that are slow to read from an SSD
+* VR runtimes
+* User application state
 
----
+Steam libraries can also be discovered from `libraryfolders.vdf`.
 
-## Why it exists
+### 2. Rank
 
-Normal Linux caching is excellent, but it is reactive. The kernel usually caches file data after it has been read. That means the first launch after boot, after cache eviction, or after heavy I/O can still pay the cost of storage latency.
+Files are not treated equally.
 
-This project changes the strategy from:
+High-value executable and runtime data is placed ahead of generic fallback files.
 
-> “Wait until applications read files, then keep recently used pages if memory allows.”
+A simplified priority model looks like this:
 
-Into:
+| Priority     | Typical data                                                               |
+| ------------ | -------------------------------------------------------------------------- |
+| **Highest**  | Core libraries, executables, linker data, selected high-value applications |
+| **High**     | Steam client, Proton/Wine, VR runtimes, installed application code         |
+| **Medium**   | Browser/application startup state and bounded high-value caches            |
+| **Support**  | Fonts, icons, MIME data, desktop metadata, schemas                         |
+| **Fallback** | Other safe files, generally favoring smaller files                         |
 
-> “Proactively identify files likely to matter for responsiveness, load them into the page cache, lock them there, and adapt the locked set as memory availability changes.”
+Huge media, archives, package images, logs, container storage, source trees, browser bulk caches, and other low-value data are excluded or heavily deprioritized.
 
-The goal is not to replace the Linux page cache. The goal is to steer it toward the files that matter most for interactive desktop performance.
+RAMCache also contains targeted policies for selected application and game workloads rather than blindly locking every file under Steam or a user's home directory.
 
----
+### 3. Select
 
-## How it differs from normal Linux caching
+The controller calculates how much memory can safely be used and walks the priority-ordered inventory until that budget is filled.
 
-### Normal Linux page cache
+### 4. Lock
 
-When an application reads a file, the kernel can keep that data in RAM so future reads are faster. This is why “free RAM” on Linux is often low over time while “available RAM” remains healthy.
-
-Normal page cache behavior is mostly:
-
-* Demand driven: files are cached after they are accessed.
-* Recency/frequency influenced: recently or repeatedly used pages are more likely to stay hot.
-* Reclaimable: cached file pages can be evicted when memory is needed elsewhere.
-* Workload dependent: a large read, update, game install, browser cache burst, backup job, or package operation can disturb the useful working set.
-* Not application aware: the kernel does not know that one small shared library or shader cache may matter more to perceived responsiveness than a large file read once.
-
-### Our RAM Cache Controller
-
-RAM Cache Controller is different because it is:
-
-* Proactive: it scans and preloads files before applications ask for them.
-* Priority based: it ranks files by likely launch/runtime value.
-* Desktop aware: it has explicit knowledge of Linux desktop, browser, Steam, Proton, Flatpak, Snap, shader, runtime, and application paths.
-* Memory reserve aware: it grows and shrinks based on `MemAvailable` watermarks.
-* Locking based: it uses `vmtouch -l`, which keeps selected file backed pages resident until released.
-* Chunked: it splits the locked set into smaller groups so shrink operations can release RAM quickly and surgically.
-* Adaptive: it watches filesystem changes and periodically rescans.
-
-### Practical difference
-
-Normal Linux caching says:
+Selected files are passed to:
 
 ```text
-Application launches -> files are read -> cache becomes warm -> later launches are faster
+vmtouch -q -l -0 -b - -m <maximum-file-size>
 ```
 
-RAM Cache Controller says:
+`vmtouch` loads those file-backed pages and keeps them resident using `mlock()`.
+
+The cache is divided into smaller worker chunks so lower-priority memory can be released without tearing down the entire cache.
+
+---
+
+# Memory control
+
+The most important part of RAMCache is not filling RAM.
+
+It is **giving RAM back quickly when something else needs it**.
+
+RAMCache watches three independent pressure signals.
+
+### MemAvailable
+
+The normal profile uses these default watermarks:
 
 ```text
-System boots -> useful files are selected and locked -> application launches hit RAM immediately
+MemAvailable < 4 GiB
+        │
+        └── SHRINK immediately toward 6 GiB available
+
+4 GiB ─────────────── 7 GiB
+        HOLD
+
+MemAvailable > 7 GiB
+        │
+        └── GROW while targeting ~6 GiB available
 ```
 
-That is the key difference.
+That gap creates hysteresis so the controller does not constantly grow and shrink around one threshold.
+
+### Rapid application memory growth
+
+RAMCache separately monitors memory consumption every **0.5 seconds**.
+
+It can react before the hard available-memory floor is reached when another workload suddenly begins allocating large amounts of RAM.
+
+The controller tracks both short and longer memory-growth windows, predicts near-term demand, and can proactively release cache.
+
+### Linux PSI
+
+Linux **Pressure Stall Information** provides another signal.
+
+If the kernel reports meaningful memory stalls, RAMCache can release locked cache even when a simple free-memory threshold has not yet told the whole story.
+
+After a pressure event, a short regrowth guard prevents the controller from immediately fighting the application for the memory it just released.
 
 ---
 
-## Why it is faster
+## Fast shrink
 
-This software can improve speed because many desktop and game launch workloads are bottlenecked by many small file reads:
-
-* Shared libraries
-* Loader metadata
-* Config files
-* Runtime manifests
-* Fonts
-* Icons
-* MIME databases
-* Shader caches
-* Steam manifests
-* Proton/Wine support files
-* Electron runtime files
-* Browser profile startup databases
-
-Even on fast NVMe storage, thousands of metadata lookups and small reads can add latency. Serving those reads from RAM is faster than going to disk.
-
-The controller improves this by doing three things normal caching does not guarantee:
-
-1. **Prewarming**: important files are loaded before they are needed.
-2. **Retention**: important files are locked so unrelated file I/O does not evict them.
-3. **Selection**: RAM is spent on files likely to improve interactivity, not random recently read data.
-
-This is especially useful after login, after package updates, after game updates, after opening large files, or after workloads that would normally push useful cached pages out of RAM.
-
----
-
-## How it works
-
-At a high level, the controller loop does this:
+Normal RAMCache chunks are approximately:
 
 ```text
-load config
-start or refresh filesystem watcher
-read /proc/meminfo
-compute max allowed file size
-scan files
-rank files by usefulness
-compute desired locked cache size
-select files up to the target size
-raise file descriptor and memlock limits if needed
-start/stop vmtouch processes to match the desired cache
-write status JSON
-sleep briefly
-repeat
+1 GiB per vmtouch chunk
 ```
 
-The controller runs continuously under systemd.
+When pressure appears, tail chunks are stopped first.
+
+Because the selected list is priority ordered, this tends to preserve the highest-value cache entries while releasing lower-priority RAM.
+
+Multiple chunks can be signaled concurrently for fast release.
 
 ---
 
-## Architecture
+# Designed not to fight the desktop
 
-The project has three main parts:
+RAMCache intentionally runs as background infrastructure rather than foreground work.
 
-### 1. Bash installer
+The generated systemd service uses:
 
-The outer shell script handles:
+```text
+Nice=19
+IOSchedulingClass=idle
+```
 
-* Root check
-* Dependency installation through `apt`
-* Writing the Python controller
-* Writing the default JSON config
-* Writing the systemd unit
-* Writing sysctl tuning files
-* Reloading systemd
-* Enabling and starting the service
-* Status reporting
-* Uninstallation
+It also:
 
-Supported actions:
+* Restricts execution to roughly half of the machine's logical CPUs.
+* Prefers one SMT sibling from each physical core first.
+* Limits aggregate controller CPU time to approximately **25% of the whole machine**.
+* Uses storage-aware scan concurrency.
+* Keeps rotational-drive scanning substantially more conservative than SSD/NVMe scanning.
+
+Metadata scanning may use many threads on fast storage because those threads spend much of their time waiting on filesystem operations, while the systemd CPU quota still limits actual CPU consumption.
+
+---
+
+# Filesystem watching
+
+RAMCache does not repeatedly rescan the entire computer every few seconds.
+
+It prefers a filesystem-level **fanotify** watcher when the installed tools and kernel support it.
+
+If that cannot be used, it automatically falls back to recursive **inotify**.
+
+```mermaid
+flowchart LR
+    A["Filesystem changes"]
+    B{"fanotify available?"}
+    C["Filesystem-level watch"]
+    D["Recursive inotify"]
+    E["Coalesce changes"]
+    F["Incremental inventory update"]
+
+    A --> B
+    B -->|Yes| C
+    B -->|No| D
+    C --> E
+    D --> E
+    E --> F
+```
+
+Normal filesystem activity is coalesced and processed in batches rather than immediately triggering expensive work.
+
+If the watcher dies, overflows, or loses synchronization, RAMCache requests an authoritative recovery scan instead of silently trusting stale information.
+
+---
+
+# Low-RAM systems
+
+RAMCache automatically enables a separate low-memory profile when total system RAM is below:
+
+```text
+20 GiB
+```
+
+The low-RAM profile is more conservative about individual file sizes, cache budgets, scanner concurrency, and chunk size.
+
+For example, normal cache chunks are approximately `1 GiB`, while the low-RAM profile uses approximately `512 MiB` chunks so memory can be released more surgically.
+
+The active profile is visible in the status output:
+
+```json
+"memory_profile": "normal"
+```
+
+or:
+
+```json
+"memory_profile": "low_ram"
+```
+
+---
+
+# Status data
+
+Runtime status is written to:
+
+```text
+/run/ramcache-controller/status.json
+```
+
+Important fields include:
+
+| Field                     | Meaning                                      |
+| ------------------------- | -------------------------------------------- |
+| `controller_version`      | Running controller version                   |
+| `memory_profile`          | `normal` or `low_ram`                        |
+| `target_locked_gib`       | Current controller lock target               |
+| `selected_files`          | Number of selected cache files               |
+| `selected_gib`            | Approximate selected cache size              |
+| `inventory_files`         | Files currently known to the controller      |
+| `memavailable_gib`        | Linux `MemAvailable`                         |
+| `mlocked_gib`             | Memory currently reported as mlocked         |
+| `rapid_memory_growth_gib` | Recently detected memory growth              |
+| `psi_memory_*`            | Recent PSI memory-stall signals              |
+| `watcher_mode`            | Active filesystem watcher                    |
+| `scan_workers`            | Current scanner worker count                 |
+| `scan_storage_profile`    | Rotational, nonrotational, mixed, or unknown |
+
+Pretty-print it at any time:
 
 ```bash
-sudo ./ramcache-controller.sh install
-sudo ./ramcache-controller.sh uninstall
-./ramcache-controller.sh status
+python3 -m json.tool /run/ramcache-controller/status.json
 ```
-
-### 2. Python controller
-
-Installed to:
-
-```text
-/opt/ramcache-controller/ramcache_controller.py
-```
-
-The Python controller performs the actual adaptive cache management:
-
-* Reads `/etc/ramcache-controller/config.json`
-* Parses `/proc/meminfo`
-* Scans include paths
-* Applies exclusions and pruning rules
-* Discovers common app paths
-* Classifies files
-* Selects files for the current memory budget
-* Starts `vmtouch` workers
-* Chunks the selected set
-* Watches filesystem changes with `inotifywait`
-* Shrinks under memory pressure
-* Grows when memory is available
-* Writes status to `/run/ramcache-controller/status.json`
-
-### 3. systemd service
-
-Installed to:
-
-```text
-/etc/systemd/system/ramcache-controller.service
-```
-
-The service runs:
-
-```text
-/usr/bin/python3 /opt/ramcache-controller/ramcache_controller.py
-```
-
-It runs as root because it needs to:
-
-* Lock memory.
-* Raise resource limits.
-* Read system and user app paths.
-* Manage child `vmtouch` processes.
-* Write runtime status under `/run`.
-* Use system level inotify and sysctl configuration.
 
 ---
 
-## Installed files
+# Configuration
 
-Installation creates or modifies these paths:
+Configuration lives at:
+
+```text
+/etc/ramcache-controller/config.json
+```
+
+The most useful settings are:
+
+| Setting                               | Default | Purpose                                 |
+| ------------------------------------- | ------: | --------------------------------------- |
+| `target_available_bytes`              |    `4G` | Hard available-memory floor             |
+| `target_shrink_to_available_bytes`    |    `6G` | Desired reserve after shrinking         |
+| `target_grow_above_available_bytes`   |    `7G` | Available RAM required before growing   |
+| `target_grow_to_available_bytes`      |    `6G` | Reserve RAM while growing               |
+| `target_initial_max_bytes`            |    `8G` | Initial cache target cap                |
+| `target_max_grow_step_bytes`          |    `8G` | Maximum growth step                     |
+| `vmtouch_chunk_target_bytes`          | `1024M` | Normal cache chunk target               |
+| `vmtouch_max_file_size`               |  `128G` | Maximum candidate file size             |
+| `incremental_rescan_interval_seconds` |   `600` | Filesystem-change batching interval     |
+| `low_ram_total_threshold_bytes`       |   `20G` | Threshold for automatic low-RAM profile |
+
+Size fields accept values such as:
+
+```text
+512M
+4G
+20G
+1T
+```
+
+After changing configuration, restarting the service applies it immediately:
+
+```bash
+sudo systemctl restart ramcache-controller.service
+```
+
+---
+
+# Installed files
+
+RAMCache creates:
 
 ```text
 /opt/ramcache-controller/ramcache_controller.py
 /etc/ramcache-controller/config.json
 /etc/systemd/system/ramcache-controller.service
 /etc/sysctl.d/99-ramcache-inotify.conf
-/etc/sysctl.d/99-cache-aggressive.conf
+/etc/sysctl.d/99-ramcache-vm.conf
 ```
 
-The script only creates `/etc/sysctl.d/99-cache-aggressive.conf` if that file does not already exist.
-
----
-
-## Runtime files
-
-At runtime, the controller writes:
+Runtime state lives under:
 
 ```text
-/run/ramcache-controller/status.json
-/run/ramcache-controller/watch-list.txt
+/run/ramcache-controller/
 ```
 
-These are runtime files and are not persistent across reboot.
+The installer configures additional inotify capacity for large directory trees and sets:
+
+```text
+vm.vfs_cache_pressure=10
+```
+
+If the running kernel exposes `vm.vfs_cache_pressure_denom`, RAMCache configures the matching denominator as well. Unsupported kernel settings are skipped rather than written blindly.
 
 ---
 
-## Dependencies
+# Requirements
 
-The installer installs:
+The current installer targets Debian/Ubuntu-family distributions using `apt`, including systems such as:
+
+* Ubuntu
+* Pop!_OS
+* Linux Mint
+* Debian-family derivatives with systemd
+
+Required software:
 
 ```text
 python3
 vmtouch
 inotify-tools
+systemd
 ```
 
-The install script uses `apt`, so the current installer is intended for Debian, Ubuntu, Pop!_OS, and similar apt based systems.
+Missing package dependencies are installed automatically during installation.
 
 ---
 
-## Installation
+# What RAMCache can improve
 
-Save the script, make it executable, and run:
+RAMCache is aimed primarily at **storage-sensitive interactive workloads**.
 
-```bash
-chmod +x ramcache-controller.sh
-sudo ./ramcache-controller.sh install
-```
+Potential benefits include:
 
-The installer will:
+* Faster application cold starts
+* Faster repeated application launches
+* Faster access to shared libraries and runtime files
+* More responsive desktop metadata, fonts, and icons
+* Faster Steam client and selected Proton/Wine startup paths
+* Reduced cold-cache behavior after unrelated heavy I/O
+* Better use of otherwise idle RAM on high-memory systems
 
-1. Install dependencies.
-2. Write the controller to `/opt/ramcache-controller`.
-3. Write config to `/etc/ramcache-controller/config.json`.
-4. Write the systemd unit.
-5. Write sysctl tuning files.
-6. Apply sysctl settings.
-7. Reload systemd.
-8. Enable and start the service.
+Results depend on the workload and storage device.
 
-Check service status:
-
-```bash
-systemctl status ramcache-controller.service --no-pager
-```
-
-Check controller status:
-
-```bash
-python3 -m json.tool /run/ramcache-controller/status.json
-```
+RAMCache does not make CPU-bound calculations, GPU rendering, or network latency intrinsically faster.
 
 ---
 
-## Uninstallation
+# Safety model
 
-Run:
+RAMCache is deliberately designed around reclaimability and low interference.
 
-```bash
-sudo ./ramcache-controller.sh uninstall
-```
+It:
 
-Uninstall will:
+* Does not modify cached files.
+* Does not move application data.
+* Does not create a duplicate RAM filesystem.
+* Does not replace application directories with tmpfs.
+* Does not follow symlinks while scanning.
+* Avoids special filesystems and unsafe temporary paths.
+* Avoids crossing filesystem boundaries by default.
+* Skips non-regular and empty files.
+* Excludes known low-value or dangerous directory trees.
+* Caps and prioritizes selected application caches.
+* Continuously monitors system memory.
+* Aborts expensive scan work when memory pressure appears.
+* Releases lower-priority locked chunks first.
+* Stops all `vmtouch` workers when the service exits.
 
-* Stop the service.
-* Kill remaining service processes if needed.
-* Disable the service.
-* Remove the systemd unit.
-* Remove `/opt/ramcache-controller`.
-* Remove `/etc/ramcache-controller`.
-* Remove `/run/ramcache-controller`.
-* Remove `/etc/sysctl.d/99-ramcache-inotify.conf`.
-* Reload systemd.
-* Reset failed service state.
-* Re apply sysctl settings.
+The cache exists to use **spare RAM**.
 
----
-
-## Status and monitoring
-
-Run:
-
-```bash
-./ramcache-controller.sh status
-```
-
-Or manually inspect:
-
-```bash
-systemctl status ramcache-controller.service --no-pager
-python3 -m json.tool /run/ramcache-controller/status.json
-grep -E 'MemAvailable|Cached|Active\(file\)|Inactive\(file\)|Mlocked|Unevictable' /proc/meminfo
-```
+Applications remain the priority.
 
 ---
 
-## Configuration
+# Why use this instead of normal Linux caching?
 
-The config file is:
+Linux's page cache is already very good.
+
+RAMCache does not replace it.
+
+It changes **which data gets there first and which data is allowed to remain there**.
 
 ```text
-/etc/ramcache-controller/config.json
+Normal Linux
+────────────
+Read → Cache → Possibly reclaim
+
+RAMCache
+────────
+Predict → Preload → Prioritize → Lock
+                       ↓
+                Memory pressure?
+                  ↙         ↘
+               no             yes
+               ↓               ↓
+             grow            release
 ```
 
-Default config:
-
-```json
-{
-  "include_paths": ["/", "/home"],
-  "exclude_prefixes": [
-    "/proc",
-    "/sys",
-    "/dev",
-    "/run",
-    "/tmp",
-    "/var/tmp",
-    "/var/cache/apt/archives",
-    "/var/lib/systemd/coredump",
-    "/lost+found",
-    "/swapfile"
-  ],
-  "stay_on_filesystem": true,
-  "auto_include_common_app_paths": true,
-  "cross_filesystem_include_roots": ["/snap"],
-
-  "check_interval_seconds": 1,
-  "dirty_rescan_interval_seconds": 10800,
-  "full_rescan_interval_seconds": 86400,
-
-  "target_available_bytes": "7G",
-  "target_shrink_to_available_bytes": "8G",
-  "target_grow_above_available_bytes": "9G",
-  "target_grow_to_available_bytes": "8G",
-
-  "target_initial_max_bytes": "8G",
-  "target_max_grow_step_bytes": "4G",
-  "target_max_inflight_bytes": "8G",
-
-  "vmtouch_chunk_target_bytes": "512",
-  "vmtouch_chunk_max_paths": 8192,
-  "max_selection_budget_total_ratio": 4.0,
-
-  "target_relock_min_delta": "1G",
-  "target_relock_min_delta_ratio": 0.07,
-
-  "fd_limit_reserve": 65536,
-  "fd_limit_auto_max": 8388608,
-  "memlock_limit_reserve": "1G",
-  "memlock_limit_min": "1G",
-
-  "vmtouch_max_file_size": "128G",
-  "vmtouch_feed_pause_seconds": 0,
-  "vmtouch_feed_target_extra_seconds": 0
-}
-```
-
-### Size values
-
-Size values may be written as numbers or strings with suffixes:
-
-```text
-K, KB
-M, MB
-G, GB
-T, TB
-```
-
-Examples:
-
-```json
-"target_available_bytes": "5G"
-"vmtouch_chunk_target_bytes": "256M"
-"memlock_limit_reserve": "1G"
-```
+If the system has large amounts of otherwise unused memory, RAMCache gives that memory a specific job: keep high-value application and runtime data immediately accessible while retaining the ability to surrender that RAM when real workloads demand it.
 
 ---
 
-## File discovery
+<div align="center">
 
-The controller starts from `include_paths`.
+## ◈ Make idle RAM useful.
 
-Default:
+**Adaptive · Prioritized · Pressure-aware · Native Linux page cache**
 
-```json
-"include_paths": ["/", "/home"]
-```
+<br>
 
-It then optionally adds common app paths when enabled:
+RAMCache does not replace Linux caching.
 
-```json
-"auto_include_common_app_paths": true
-```
+### It gives it a head start.
 
-Auto discovered paths include existing directories under locations such as:
-
-* `/opt`
-* `/usr/local/bin`
-* `/usr/local/lib`
-* `/usr/local/libexec`
-* `/snap`
-* `/var/lib/flatpak/app`
-* `/var/lib/flatpak/runtime`
-* `/var/lib/flatpak/exports`
-* `/var/lib/snapd/desktop`
-* User `.local` app paths
-* User Flatpak paths
-* Browser profile directories
-* Discord/Vesktop/OBS/VS Code/VSCodium config paths
-* COSMIC desktop config paths
-* Fontconfig cache
-* Mesa shader cache
-* NVIDIA cache
-* Steam directories
-* Flatpak Steam directories
-* Steam library folders discovered from `libraryfolders.vdf`
-
-The controller deduplicates paths and avoids walking redundant child paths when a parent already covers the same filesystem.
-
----
-
-## File classification and priority tiers
-
-The controller does not blindly lock everything. Every file is classified into a priority tier.
-
-### Tier 0: core OS and runtime foundation
-
-Examples:
-
-* `/bin`
-* `/sbin`
-* `/lib`
-* `/lib64`
-* `/etc`
-* `/usr/bin`
-* `/usr/sbin`
-* `/usr/lib`
-* `/usr/lib64`
-* `/usr/libexec`
-* `/usr/local/bin`
-* `/usr/local/lib`
-* `/usr/local/libexec`
-
-Preferred file types:
-
-* Shared libraries
-* Executables
-* Config files
-* Runtime files
-* Dynamic linker data
-* Graphics/audio runtime files
-* OBS related runtime files
-* COSMIC related runtime files
-
-This tier receives the highest priority because these files affect many programs.
-
-### Tier 1: Steam, Proton, Wine, game, shader, and VR launch path
-
-Examples:
-
-* Steam startup files
-* Steam manifests
-* Proton files
-* Wine support files
-* Steam Linux Runtime files
-* Steam shader cache
-* Steam compatibility data
-* VR runtime paths
-* OpenVR/SteamVR/WiVRn/Monado/ALVR related paths
-
-Special high value names include:
-
-```text
-libraryfolders.vdf
-config.vdf
-loginusers.vdf
-shortcuts.vdf
-localconfig.vdf
-system.reg
-user.reg
-userdef.reg
-```
-
-This tier is optimized for faster Steam startup, faster game launch preparation, and faster Proton/Wine runtime access.
-
-### Tier 2: installed app runtimes
-
-Examples:
-
-* Browser runtimes
-* Flatpak app runtimes
-* Snap apps
-* `/opt` apps
-* Electron app runtimes
-* AppImage like runtime files
-
-Preferred files include:
-
-* Shared libraries
-* Executables
-* Runtime blobs
-* Electron files such as `app.asar`
-* Configuration files
-
-### Tier 3: user app startup state
-
-Examples:
-
-* Firefox profile startup files
-* Chromium/Chrome/Brave/Vivaldi/Opera config paths
-* Discord/Vesktop config
-* OBS config
-* VS Code/VSCodium config
-* Slack like app config
-* COSMIC user config
-
-Preferred browser startup names include:
-
-```text
-prefs.js
-sessionstore.jsonlz4
-extensions.json
-addons.json
-compatibility.ini
-profiles.ini
-places.sqlite
-favicons.sqlite
-permissions.sqlite
-cookies.sqlite
-storage.sqlite
-```
-
-The controller intentionally avoids broad browser HTTP cache directories unless they are shader related.
-
-### Tier 4: desktop support files
-
-Examples:
-
-* Application launchers
-* AppStream/metainfo data
-* Desktop directories
-* Icons
-* Pixmaps
-* MIME databases
-* GLib schemas
-* D-Bus data
-* systemd unit metadata
-* Polkit data
-* Fonts
-* Themes
-* Sounds
-* Thumbnailer definitions
-* Wayland/X11 session data
-* Vulkan data
-* PipeWire/PulseAudio/ALSA/GStreamer support files
-* KDE/GNOME/Cinnamon/MATE/XFCE support files
-* Fontconfig cache
-
-This tier helps with desktop shell startup, app menus, file pickers, icon loading, font discovery, and settings tools.
-
-### Tier 5: fallback
-
-After higher value files are selected, remaining RAM can be filled with other safe small files.
-
-Tier 5 is sorted to prefer smaller files first. This helps systems with limited cache budget get many useful cache hits instead of spending the budget on a few huge files.
-
-### Hard cold exclusions
-
-Some files and directories are skipped or deprioritized because they are unlikely to improve responsiveness or may waste too much RAM.
-
-Examples:
-
-* Documentation trees
-* Manual pages
-* Source trees
-* Logs
-* Crash dumps
-* Docker/container data
-* libvirt data
-* Flatpak repo storage
-* Snap package cache
-* Browser HTTP cache blobs
-* Trash
-* VCS metadata such as `.git`
-* Build directories such as `target/debug` and `target/release`
-* Huge media files
-* Huge documents
-* Huge package images
-* Huge archives
-* Huge game asset packs
-* Huge AppImage/bin blobs
-
----
-
-## Memory targeting
-
-The controller computes a target from current memory availability.
-
-It reads:
-
-```text
-/proc/meminfo
-```
-
-Important fields:
-
-* `MemTotal`
-* `MemAvailable`
-* `Cached`
-* `Active(file)`
-* `Inactive(file)`
-* `Mlocked`
-* `Unevictable`
-
-The default memory watermarks are:
-
-```json
-"target_available_bytes": "5G",
-"target_shrink_to_available_bytes": "7G",
-"target_grow_above_available_bytes": "8G",
-"target_grow_to_available_bytes": "7G"
-```
-
-Meaning:
-
-| Setting                             | Meaning                                                                               |
-| ----------------------------------- | ------------------------------------------------------------------------------------- |
-| `target_available_bytes`            | Hard lower available memory floor. If `MemAvailable` falls below this, shrink cache.  |
-| `target_shrink_to_available_bytes`  | When shrinking, release enough cache to recover to this safer available memory level. |
-| `target_grow_above_available_bytes` | Only grow when `MemAvailable` rises above this upper watermark.                       |
-| `target_grow_to_available_bytes`    | When growing, leave approximately this much memory available.                         |
-
-Default behavior:
-
-```text
-Below 5G available  -> shrink
-5G to 8G available  -> hold steady
-Above 8G available  -> grow, while trying to leave about 7G available
-```
-
-This prevents constant grow/shrink churn.
-
----
-
-## Growth, shrink, and hysteresis
-
-The controller uses hysteresis to avoid unstable behavior.
-
-### Initial target
-
-Default:
-
-```json
-"target_initial_max_bytes": "8G"
-```
-
-On first startup, the controller caps the first target so the system can ramp up safely.
-
-### Grow step
-
-Default:
-
-```json
-"target_max_grow_step_bytes": "4G"
-```
-
-When there is extra memory, the cache grows in bounded steps instead of trying to jump to the full possible target at once.
-
-### Grow deadband
-
-Default:
-
-```json
-"target_relock_min_delta": "1G"
-```
-
-Small target increases are ignored. This prevents relocking for tiny changes.
-
-### Shrink behavior
-
-Shrink is immediate when the available memory floor is crossed.
-
-If memory pressure appears, the controller drops tail chunks from the selected set. Since the selected list is priority ordered, tail chunks are lower priority than the earlier chunks.
-
-This means the controller tries to preserve the most valuable files while releasing RAM.
-
----
-
-## vmtouch locking model
-
-The controller starts `vmtouch` like this:
-
-```text
-vmtouch -q -l -0 -b - -m <max-file-size>
-```
-
-The important options are:
-
-| Option | Purpose                                    |
-| ------ | ------------------------------------------ |
-| `-q`   | Quiet output.                              |
-| `-l`   | Lock touched pages in memory.              |
-| `-0`   | Read null-delimited path input.            |
-| `-b -` | Read paths from standard input.            |
-| `-m`   | Set maximum file size accepted by vmtouch. |
-
-The Python controller feeds selected file paths to `vmtouch` through stdin.
-
-Each `vmtouch` process keeps its selected files resident while it remains running. When the controller needs to release RAM, it terminates selected `vmtouch` processes. The locked pages then become releasable by the kernel.
-
----
-
-## Chunking model
-
-The selected file list is split into chunks.
-
-Defaults:
-
-```json
-"vmtouch_chunk_target_bytes": "256M",
-"vmtouch_chunk_max_paths": 4096
-```
-
-Chunking matters because it makes shrink operations faster and more precise.
-
-Instead of one massive `vmtouch` process holding the entire cache, the controller runs multiple smaller `vmtouch` processes. Under memory pressure, it can stop only the tail chunks needed to recover memory.
-
-Benefits:
-
-* Faster RAM release.
-* Less over shrinking.
-* Better preservation of high priority files.
-
----
-
-## Filesystem behavior
-
-Default:
-
-```json
-"stay_on_filesystem": true
-```
-
-When enabled, the scanner does not cross filesystem boundaries while walking a root path. This prevents accidentally scanning mounted drives, network mounts, external disks, special mounts, or unrelated filesystems.
-
-Exception roots can be configured:
-
-```json
-"cross_filesystem_include_roots": ["/snap"]
-```
-
-This lets selected roots cross filesystem boundaries when needed.
-
-The scanner also avoids symlink traversal:
-
-```text
-followlinks=False
-```
-
-This reduces duplicate scanning and prevents symlink loops.
-
----
-
-## Inotify watcher behavior
-
-The controller uses `inotifywait` to monitor configured include paths and exclusions.
-
-It writes a watch list to:
-
-```text
-/run/ramcache-controller/watch-list.txt
-```
-
-The watcher listens for:
-
-```text
-close_write
-create
-delete
-move
-attrib
-```
-
-When a change occurs, the watcher marks the cache inventory dirty. The controller does not necessarily rescan instantly. It waits for the dirty rescan interval.
-
-Default:
-
-```json
-"dirty_rescan_interval_seconds": 1800
-```
-
-A full rescan also occurs periodically.
-
-Default:
-
-```json
-"full_rescan_interval_seconds": 86400
-```
-
-This design avoids constantly rescanning during active package installs, Steam updates, browser activity, or build workloads.
-
----
-
-## System limits
-
-Large cache selections may require many file descriptors and a large memlock limit.
-
-The controller tries to raise:
-
-* `RLIMIT_NOFILE`
-* `RLIMIT_MEMLOCK`
-* `/proc/sys/fs/nr_open`
-* `/proc/sys/fs/file-max`
-
-Relevant config:
-
-```json
-"fd_limit_reserve": 65536,
-"fd_limit_auto_max": 8388608,
-"memlock_limit_reserve": "1G",
-"memlock_limit_min": "1G"
-```
-
-The systemd unit also sets:
-
-```text
-LimitNOFILE=infinity
-LimitMEMLOCK=infinity
-```
-
----
-
-## Sysctl changes
-
-The installer writes:
-
-```text
-/etc/sysctl.d/99-ramcache-inotify.conf
-```
-
-With:
-
-```text
-fs.inotify.max_user_watches=1048576
-```
-
-This allows recursive watching of large directory trees.
-
-The installer may also write:
-
-```text
-/etc/sysctl.d/99-cache-aggressive.conf
-```
-
-With:
-
-```text
-vm.vfs_cache_pressure=10
-vm.vfs_cache_pressure_denom=100
-```
-
-This asks the kernel to be less aggressive about reclaiming filesystem metadata caches. The installer only creates this file if it does not already exist.
-
----
-
-## Performance expectations
-
-Expected improvements are usually in perceived responsiveness:
-
-* Faster application launches.
-* Faster Steam/Proton startup path access.
-* Faster desktop menu/icon/font/MIME interactions.
-* Less "cold cache" behavior on systems with enough spare RAM.
-
-This does not make CPU-bound or GPU-bound work faster.
-
----
-
-## Systems with lots of RAM
-
-This controller is especially useful on high RAM systems because normal Linux behavior may leave large amounts of RAM available or use it for recently accessed data that is not important for interactivity.
-
-With lots of RAM, the controller can:
-
-* Keep core OS/runtime files hot.
-* Keep desktop support files hot.
-* Keep browser startup data hot.
-* Keep Steam/Proton/Wine launch paths hot.
-* Keep shader caches hot.
-* Fill extra RAM with lots of small files that storage drive load slowly (random reads).
-* Preserve a configured available memory reserve.
-
-The default budget cap is controlled by:
-
-```json
-"max_selection_budget_total_ratio": 4.0
-```
-
-That is a high ceiling, not a forced allocation. Actual target size is still controlled by available-memory watermarks and grow logic.
-
-For very high-RAM systems, raising the watermarks and grow steps can allow a larger locked cache while still keeping the machine responsive.
-
----
-
-## Systems with less RAM
-
-The controller can still help on smaller systems because selection is prioritized.
-
-Instead of trying to cache everything, it prefers:
-
-* Core shared libraries
-* Executables
-* Loader/runtime files
-* Small configs
-* Desktop metadata
-* Browser startup files
-* Steam/Proton manifests and runtime files
-* Small shader/cache files
-
-The memory floor prevents the cache from consuming RAM needed by applications.
-
----
-
-## Safety model
-
-The controller is designed to be conservative in these ways:
-
-* It does not modify cached files.
-* It does not move application files.
-* It does not replace directories with tmpfs mounts.
-* It avoids `/proc`, `/sys`, `/dev`, `/run`, `/tmp`, and other unsafe paths by default.
-* It does not follow symlinks while scanning.
-* It avoids crossing filesystem boundaries by default.
-* It skips empty files.
-* It skips non regular files.
-* It deduplicates real paths.
-* It prunes known cold or dangerous directory trees.
-* It shrinks immediately under memory pressure.
-* It chunks vmtouch workers for faster release.
-* It stops all vmtouch workers on service shutdown.
-
-The most important safety feature is the available memory floor. If the system needs RAM, the controller should reduce its locked cache.
-
----
-
-## Limitations
-
-### Not all workloads benefit
-
-It does not directly accelerate:
-
-* CPU-bound rendering
-* GPU-bound games
-* Network latency
-
-### Selection is heuristic
-
-The classifier is intentionally opinionated. It knows about common Linux desktop, Steam, Proton, browser, Flatpak, Snap, shader, and runtime patterns. It cannot perfectly know every user’s workload.
-
-### Large files are usually avoided
-
-Huge media files, package images, archives, and monolithic game assets are usually poor locked-cache targets. The controller avoids or deprioritizes them.
+</div>
