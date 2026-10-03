@@ -4594,8 +4594,8 @@ write_service() {
   local cpu_quota
   local cpu_affinity
 
-  cpu_quota="$(cpu_quota_for_thread_ratio 0.25)"
-  cpu_affinity="$(cpu_affinity_for_thread_ratio 0.50)"
+  cpu_quota="$(cpu_quota_for_thread_ratio 0.50)"
+  cpu_affinity="$(cpu_affinity_for_thread_ratio 1.00)"
 
   cat > /etc/systemd/system/ramcache-controller.service <<UNIT
 [Unit]
