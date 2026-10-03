@@ -1408,10 +1408,10 @@ SELECTIVE_STEAM_RUNTIME_SUBSTRINGS = (
     "/compatibilitytools.d/",
 ) + VRCHAT_RUNTIME_SUBSTRINGS
 
-STEAM_UI_CACHE_FILE_MAX = 64 * MIB
-FIREFOX_WEB_CACHE_FILE_MAX = 128 * MIB
+STEAM_UI_CACHE_FILE_MAX = 512 * MIB
+FIREFOX_WEB_CACHE_FILE_MAX = 512 * MIB
 HYTALE_WORLD_FILE_MAX = 1 * GIB
-VRCHAT_CONTENT_CACHE_FILE_MAX = 1 * GIB
+VRCHAT_CONTENT_CACHE_FILE_MAX = 512 * MIB
 
 RECENCY_FIRST_BUDGET_KEYS = {
     "steam_htmlcache",
@@ -4439,8 +4439,8 @@ write_config() {
   "auto_include_common_app_paths": true,
   "cross_filesystem_include_roots": ["/snap"],
 
-  "check_interval_seconds": 600,
-  "incremental_rescan_interval_seconds": 600,
+  "check_interval_seconds": 300,
+  "incremental_rescan_interval_seconds": 300,
   "full_rescan_interval_seconds": 0,
   "prefer_fanotify_filesystem_watch": true,
   "watch_attribute_events": false,
@@ -4487,9 +4487,9 @@ write_config() {
   "max_selection_budget_total_ratio": 4.0,
 
   "steam_htmlcache_budget_bytes": "1G",
-  "steam_htmlcache_max_files": 4000,
-  "firefox_webcache_budget_bytes": "2G",
-  "firefox_webcache_max_files": 2000,
+  "steam_htmlcache_max_files": 7000,
+  "firefox_webcache_budget_bytes": "4G",
+  "firefox_webcache_max_files": 7000,
   "hytale_world_budget_bytes": "2G",
   "vrchat_content_cache_budget_bytes": "2G",
 
