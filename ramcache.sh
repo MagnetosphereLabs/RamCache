@@ -4439,9 +4439,9 @@ write_config() {
   "auto_include_common_app_paths": true,
   "cross_filesystem_include_roots": ["/snap"],
 
-  "check_interval_seconds": 300,
+  "check_interval_seconds": 10,
   "incremental_rescan_interval_seconds": 300,
-  "full_rescan_interval_seconds": 0,
+  "full_rescan_interval_seconds": 86400,
   "prefer_fanotify_filesystem_watch": true,
   "watch_attribute_events": false,
   "max_pending_fs_events": 350000,
