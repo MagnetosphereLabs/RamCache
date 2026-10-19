@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import queue
+import re
 import resource
 import shutil
 import signal
@@ -147,9 +148,19 @@ LOW_RAM_PROFILE_DEFAULTS = {
     "target_relock_min_delta": "256M",
 
     "steam_htmlcache_budget_bytes": "768M",
-    "steam_htmlcache_max_files": 2500,
+    "steam_htmlcache_max_files": 16384,
     "firefox_webcache_budget_bytes": "1G",
-    "firefox_webcache_max_files": 1200,
+    "firefox_webcache_max_files": 32768,
+    "chromium_webcache_budget_bytes": "1G",
+    "chromium_webcache_max_files": 32768,
+    "electron_webcache_budget_bytes": "512M",
+    "electron_webcache_max_files": 16384,
+    "desktop_shader_cache_budget_bytes": "256M",
+    "desktop_shader_cache_max_files": 8192,
+    "desktop_compiled_cache_budget_bytes": "64M",
+    "desktop_compiled_cache_max_files": 8192,
+    "app_catalog_budget_bytes": "64M",
+    "app_catalog_max_files": 4096,
     "hytale_world_budget_bytes": "1G",
     "vrchat_content_cache_budget_bytes": "1G",
 
@@ -741,6 +752,8 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
 
     # System app/runtime roots. These are where installed app runtimes, Flatpaks, Snaps, /opt apps, and local apps live.
     for p in (
+        Path("/usr"),
+        Path("/etc"),
         Path("/opt"),
         Path("/usr/local/bin"),
         Path("/usr/local/lib"),
@@ -752,6 +765,11 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
         Path("/var/lib/snapd/desktop"),
     ):
         add(p)
+
+    for p in APP_CATALOG_PREFIXES + (
+        "/var/lib/dpkg", "/var/lib/pacman/local", "/var/lib/rpm", "/var/cache/fontconfig",
+    ):
+        add(Path(p))
 
     for home in iter_home_dirs():
         # User app/runtime roots. Deliberately avoid broad "cache all of home".
@@ -791,7 +809,7 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
             home / ".config/com.system76.CosmicSettings",
             home / ".config/com.system76.CosmicFiles",
 
-            # High-value caches, not general browser HTTP cache.
+            # Shared desktop caches; browser caches are bounded separately.
             home / ".cache/fontconfig",
             home / ".cache/mesa_shader_cache",
             home / ".cache/nvidia",
@@ -807,6 +825,35 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
             home / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
         ):
             add(p)
+
+        for relative in (
+            ".config/mozilla/firefox", ".cache/mozilla/firefox", ".cache/firefox",
+            ".librewolf", ".zen", ".floorp", ".waterfox",
+            ".config/librewolf", ".config/zen", ".config/floorp", ".config/waterfox",
+            ".cache/librewolf", ".cache/zen", ".cache/floorp", ".cache/waterfox",
+            ".config/google-chrome-beta", ".config/google-chrome-unstable",
+            ".config/microsoft-edge", ".config/microsoft-edge-beta", ".config/microsoft-edge-dev",
+            ".cache/google-chrome", ".cache/google-chrome-beta", ".cache/google-chrome-unstable",
+            ".cache/chromium", ".cache/chromium-browser", ".cache/BraveSoftware",
+            ".cache/microsoft-edge", ".cache/microsoft-edge-beta", ".cache/microsoft-edge-dev",
+            ".cache/vivaldi", ".cache/opera",
+            ".cache/mesa_shader_cache_db", ".cache/mesa_shader_cache_sf", ".nv/GLCache",
+            ".cache/gstreamer-1.0", ".cache/plasmashell", ".cache/kwin",
+            ".local/share/gnome-shell/extensions", ".local/share/cinnamon",
+            ".local/share/plasma", ".local/share/kwin", ".local/share/pop-launcher",
+            ".local/share/nemo", ".local/share/nautilus/scripts", ".local/share/themes",
+            ".config/hypr", ".config/sway", ".config/niri", ".config/waybar",
+            ".config/pipewire", ".config/wireplumber",
+        ):
+            add(home / relative)
+
+        for app_id in (
+            "org.mozilla.firefox", "io.gitlab.librewolf-community", "app.zen_browser.zen",
+            "one.ablaze.floorp", "org.chromium.Chromium", "com.google.Chrome",
+            "com.brave.Browser", "com.microsoft.Edge", "com.vivaldi.Vivaldi",
+            "com.discordapp.Discord", "dev.vencord.Vesktop",
+        ):
+            add(home / ".var/app" / app_id)
 
         steam_roots = (
             home / ".steam/root",
@@ -1160,6 +1207,9 @@ VR_RUNTIME_SUBSTRINGS = (
     "/alvr",
     "/xrizer",
     "/openhmd",
+    "/opencomposite",
+    "/wlx-overlay-s",
+    "/wlxoverlay",
 )
 
 SHADER_CACHE_SUBSTRINGS = (
@@ -1170,6 +1220,8 @@ SHADER_CACHE_SUBSTRINGS = (
     "/.nv/glcache/",
     "/.cache/nvidia/",
     "/.cache/mesa_shader_cache/",
+    "/mesa_shader_cache_db/",
+    "/mesa_shader_cache_sf/",
     "/dxvk_state_cache",
     "/vkd3d",
 )
@@ -1257,7 +1309,7 @@ RUNTIME_SUFFIXES = (
 # media. Size caps below prevent opaque giant assets from being promoted.
 APP_CODE_RESOURCE_SUFFIXES = (
     ".asar", ".pak", ".dat", ".gresource", ".typelib", ".qmltypes", ".mo",
-    ".wasm",
+    ".wasm", ".xpi", ".ui", ".css", ".rcc", ".spv",
 )
 
 APP_RUNTIME_SUBSTRINGS = (
@@ -1416,6 +1468,11 @@ VRCHAT_CONTENT_CACHE_FILE_MAX = 512 * MIB
 RECENCY_FIRST_BUDGET_KEYS = {
     "steam_htmlcache",
     "firefox_webcache",
+    "chromium_webcache",
+    "electron_webcache",
+    "desktop_shader_cache",
+    "desktop_compiled_cache",
+    "app_catalog",
     "hytale_world",
     "vrchat_content_cache",
 }
@@ -1662,9 +1719,9 @@ def is_vip_path(path: str) -> bool:
 def vip_classification(path: str, name: str, size: int) -> Optional[tuple[int, int, int]]:
     if is_vrchat_content_cache_path(path):
         if size <= VRCHAT_CONTENT_CACHE_FILE_MAX:
-            # VIP, but after full app/runtime VIP. select_files() enforces the
-            # recent-unit, >=1M unit, and 2G total cap.
-            return (-90, 10000, 0)
+            # Keep the existing recent-unit budget, after daily desktop/web
+            # use. Downloaded worlds/avatars remain useful late cache filler.
+            return (6, 10000, 0)
         return (99, 0, 0)
 
     if (
@@ -1672,7 +1729,16 @@ def vip_classification(path: str, name: str, size: int) -> Optional[tuple[int, i
         or is_vip_steam_client_path(path)
         or is_vip_vrchat_runtime_path(path)
     ):
-        return (-100, 10000, 0)
+        if size > 16 * MIB and (
+            name.endswith(MEDIA_SUFFIXES)
+            or (name not in ELECTRON_RUNTIME_NAMES and name.endswith(
+                GAME_ASSET_SUFFIXES + (".assets", ".ress", ".resource", ".vrca", ".vrcw", ".unity3d")
+            ))
+        ):
+            return (6, 200, 0)
+        # Retain every VIP target, while letting core OS/toolkit files (tier 0)
+        # precede application payloads even on small-memory machines.
+        return (1, 10000, 0)
 
     return None
 
@@ -1683,7 +1749,8 @@ def is_steam_ui_cache_path(path: str) -> bool:
 
 def is_firefox_web_cache_path(path: str) -> bool:
     return (
-        path_contains_any(path, FIREFOX_WEB_CACHE_SUBSTRINGS)
+        (path_contains_any(path, FIREFOX_WEB_CACHE_SUBSTRINGS)
+         or FIREFOX_USER_PATH_RE.search(path) is not None)
         and path_contains_any(path, FIREFOX_WEB_CACHE_TARGET_SUBSTRINGS)
     )
 
@@ -1770,11 +1837,134 @@ def is_selective_steam_runtime_path(path: str) -> bool:
     return path_contains_any(path, SELECTIVE_STEAM_RUNTIME_SUBSTRINGS)
 
 
+# Match application namespaces, not arbitrary folders named Cache. Matching
+# both native and sandbox XDG layouts keeps the policy independent of distro,
+# architecture, browser release channel, and Flatpak/Snap packaging.
+FIREFOX_USER_PATH_RE = re.compile(
+    r"/(?:\.mozilla/firefox|"
+    r"(?:\.config|\.cache|config|cache)/(?:mozilla/firefox|firefox|librewolf|floorp|zen|waterfox)|"
+    r"\.(?:librewolf|floorp|zen|waterfox))(?=/|$)"
+)
+CHROMIUM_USER_PATH_RE = re.compile(
+    r"/(?:\.config|\.cache|config|cache)/(?:"
+    r"google-chrome(?:-[a-z]+)?|chromium(?:-browser)?|"
+    r"bravesoftware/brave-browser(?:-[a-z]+)?|microsoft-edge(?:-[a-z]+)?|"
+    r"vivaldi(?:-snapshot)?|opera(?:-(?:beta|developer))?|thorium|helium)(?=/|$)"
+)
+ELECTRON_USER_PATH_RE = re.compile(
+    r"/(?:\.config|\.cache|config|cache)/(?:"
+    r"discord(?:canary|ptb|development)?|vesktop|slack|signal|element|"
+    r"teams-for-linux|code(?:-insiders)?|vscodium)(?=/|$)|"
+    r"/(?:\.config|config)/obs-studio/plugin_config/obs-browser(?=/|$)"
+)
+WEB_CACHE_FILE_MAX = 512 * MIB
+
+
+def browser_cache_kind(path: str) -> Optional[tuple[str, str]]:
+    """Return a bounded cache family and resource kind, including cache roots."""
+    # Most inventory files are system/app code, not browser caches.
+    if not any(token in path for token in ("cache", "storage", "shared dictionary", "shared_dictionary")):
+        return None
+
+    p = path.rstrip(os.sep) + os.sep
+    if is_steam_ui_cache_path(p):
+        family, tail = "steam_htmlcache", p
+    else:
+        match = FIREFOX_USER_PATH_RE.search(p)
+        if match is not None:
+            family = "firefox_webcache"
+        else:
+            match = CHROMIUM_USER_PATH_RE.search(p)
+            if match is not None:
+                family = "chromium_webcache"
+            else:
+                match = ELECTRON_USER_PATH_RE.search(p)
+                if match is None:
+                    return None
+                family = "electron_webcache"
+        # Ignore the sandbox's XDG 'cache' directory itself: only match cache
+        # structures below the application namespace.
+        tail = p[match.end():]
+
+    if family == "firefox_webcache":
+        if "/startupcache/" in tail:
+            return family, "code"
+        if "/cache2/index" in tail:
+            return family, "index"
+        if "/cache2/entries/" in tail or "/offlinecache/" in tail:
+            return family, "http"
+        if "/storage/default/" in tail or "/storage/permanent/" in tail:
+            if "/cache/" in tail:
+                return family, "http"
+            # Prioritize site databases, not arbitrary large IndexedDB blobs.
+            name = os.path.basename(path)
+            if "/idb/" in tail and name.endswith((".sqlite", ".sqlite-wal", ".sqlite-shm")):
+                return family, "state"
+        return None
+
+    if "/code cache/" in tail or "/service worker/scriptcache/" in tail:
+        return family, "code"
+    if "/service worker/database/" in tail:
+        return family, "state"
+    if "/service worker/cachestorage/" in tail:
+        return family, "http"
+    if "/shared dictionary/" in tail or "/shared_dictionary/" in tail:
+        return family, "code"
+    if "/local storage/leveldb/" in tail or "/session storage/" in tail:
+        return family, "state"
+    if "/indexeddb/" in tail:
+        name = os.path.basename(path)
+        if name.endswith((".ldb", ".log", ".sqlite", ".sqlite-wal", ".sqlite-shm")) or name == "current" or name.startswith("manifest-"):
+            return family, "state"
+    if any(token in tail for token in ("/gpucache/", "/grshadercache/", "/dawncache/", "/dawngraphitecache/", "/dawnwebgpucache/")):
+        return family, "shader"
+    if "/cache/" in tail:
+        return family, "http"
+    return None
+
+
+def classify_web_cache(path: str, name: str, size: int) -> Optional[tuple[int, int, int]]:
+    kind = browser_cache_kind(path)
+    if kind is None:
+        return None
+    if size > WEB_CACHE_FILE_MAX:
+        # Remain eligible as late filler, within the family's byte budget.
+        return (5, 100, 0)
+    confidence = {"index": 1000, "code": 940, "state": 840, "http": 760, "shader": 740}[kind[1]]
+    if name in {"index", "the-real-index", "current"} or name.startswith("manifest-"):
+        confidence += 140
+    return (3, confidence, 0)
+
+
+GLOBAL_SHADER_CACHE_RE = re.compile(
+    r"/(?:\.cache|cache)/(?:mesa_shader_cache(?:_db|_sf)?|nvidia)(?=/|$)|"
+    r"/\.nv/glcache(?=/|$)"
+)
+USER_CACHE_PATH_RE = re.compile(r"/\.cache/|/\.var/app/[^/]+/cache/")
+
+
+def is_global_shader_cache_path(path: str) -> bool:
+    return GLOBAL_SHADER_CACHE_RE.search(path) is not None
+
+
+def is_desktop_compiled_cache_path(path: str) -> bool:
+    return (
+        "/qmlcache/" in path
+        and name_is_qml_cache(os.path.basename(path))
+        and USER_CACHE_PATH_RE.search(path) is not None
+    )
+
+
+def name_is_qml_cache(name: str) -> bool:
+    return name.endswith((".qmlc", ".jsc", ".mjsc"))
+
+
 def is_targeted_browser_like_cache_path(path: str) -> bool:
     return (
         is_steam_ui_cache_path(path)
         or is_firefox_web_cache_path(path)
         or is_vrchat_content_cache_path(path)
+        or browser_cache_kind(path) is not None
     )
 
 
@@ -1787,7 +1977,11 @@ def is_shared_library_name(name: str) -> bool:
 
 
 def is_browser_profile_path(path: str) -> bool:
-    return path_contains_any(path, BROWSER_PROFILE_SUBSTRINGS)
+    return (
+        path_contains_any(path, BROWSER_PROFILE_SUBSTRINGS)
+        or FIREFOX_USER_PATH_RE.search(path) is not None
+        or CHROMIUM_USER_PATH_RE.search(path) is not None
+    )
 
 
 def is_browser_http_cache_path(path: str) -> bool:
@@ -1848,6 +2042,137 @@ def is_shared_app_code_path(path: str, name: str, size: int) -> bool:
         and size <= APP_SHARE_CODE_MAX
         and name.endswith(APP_SHARE_CODE_SUFFIXES)
     )
+
+
+# Resource namespaces identify the installed desktop/toolkit itself. No distro
+# default is assumed: the same component paths work on Debian/Ubuntu/Pop/Mint,
+# Fedora's lib64 layout, and Arch/CachyOS, including user-installed resources.
+DESKTOP_COMPONENT_PREFIXES = (
+    "/usr/share/cosmic", "/usr/share/gnome-shell", "/usr/share/cinnamon",
+    "/usr/share/nemo", "/usr/share/mate", "/usr/share/caja",
+    "/usr/share/xfce4", "/usr/share/xfwm4", "/usr/share/thunar",
+    "/usr/share/plasma", "/usr/share/kwin", "/usr/share/kf6",
+    "/usr/share/kservices6", "/usr/share/kservicetypes6", "/usr/share/kxmlgui6",
+    "/usr/share/hypr", "/usr/share/niri", "/usr/share/waybar",
+    "/usr/share/pipewire", "/usr/share/wireplumber",
+)
+DESKTOP_USER_CONFIG_RE = re.compile(
+    r"/(?:\.config|config)/(?:cosmic|com\.system76\.cosmic[^/]*|"
+    r"gnome-shell|cinnamon|nemo|mate|caja|xfce4|thunar|"
+    r"gtk-3\.0|gtk-4\.0|dconf|fontconfig|autostart|menus|"
+    r"hypr|sway|niri|waybar|rofi|fuzzel|mako|dunst|wlogout|"
+    r"pipewire|wireplumber|pulse)(?=/|$)"
+)
+DESKTOP_USER_PLUGIN_RE = re.compile(
+    r"/(?:\.local/share|data)/(?:gnome-shell/extensions|"
+    r"cinnamon/(?:applets|desklets|extensions)|plasma/(?:plasmoids|desktoptheme|look-and-feel)|"
+    r"kwin/(?:scripts|effects|tabbox)|pop-launcher/(?:plugins|scripts)|"
+    r"nemo/(?:actions|scripts)|nautilus/scripts|themes)(?=/|$)"
+)
+DESKTOP_USER_SUPPORT_RE = re.compile(
+    r"/(?:\.local/share|data)/(?:applications|icons|fonts|mime|gvfs-metadata)(?=/|$)|"
+    r"/\.(?:themes|icons|fonts)(?=/|$)"
+)
+KDE_USER_CONFIG_NAMES = {
+    "kdeglobals", "kwinrc", "plasmashellrc", "kglobalshortcutsrc",
+    "kscreenlockerrc", "kiorc", "dolphinrc", "konsolerc", "katerc",
+    "plasma-org.kde.plasma.desktop-appletsrc", "breezerc", "kcminputrc",
+}
+DAILY_UI_SUFFIXES = (".ui", ".css", ".rcc", ".ron", ".spv")
+APP_CATALOG_PREFIXES = (
+    "/var/cache/swcatalog", "/var/lib/swcatalog", "/usr/share/swcatalog",
+    "/var/cache/app-info", "/var/lib/app-info", "/usr/share/app-info",
+)
+
+
+def is_app_catalog_path(path: str, name: str) -> bool:
+    return (
+        path_has_prefix(path, APP_CATALOG_PREFIXES)
+        and name.endswith((".xml", ".yml", ".yaml", ".xml.gz", ".yml.gz", ".yaml.gz", ".xb", ".cache", ".jxl"))
+    )
+
+
+def classify_daily_resource(rec: FileRec, path: str, name: str) -> Optional[tuple[int, int, int]]:
+    size = rec.size
+    system_runtime = path_has_prefix(path, HOT_SYSTEM_PREFIXES)
+
+    # Tiny runtime indexes are read alongside libraries, but their filenames
+    # do not look like executable code. Match runtime formats, not GIR sources.
+    if system_runtime and (
+        (name.endswith(".typelib") and size <= 32 * MIB)
+        or (name in {"giomodule.cache", "loaders.cache", "immodules.cache", "qmldir"} and size <= 4 * MIB)
+    ):
+        return (0, 1400, 0)
+    if size <= MIB and path.startswith("/usr/share/glvnd/egl_vendor.d/") and name.endswith(".json"):
+        return (0, 1400, 0)
+
+    cache_match = USER_CACHE_PATH_RE.search(path)
+    if size <= 32 * MIB and (
+        path.startswith("/var/cache/fontconfig/")
+        or (cache_match is not None and path[cache_match.end():].startswith("fontconfig/"))
+    ) and (".cache-" in name or name.endswith(".cache")):
+        return (0, 1380, 0)
+    if cache_match is not None:
+        tail = path[cache_match.end():]
+        if size <= 32 * MIB and tail.startswith("gstreamer-1.0/") and name.startswith("registry") and name.endswith(".bin"):
+            return (0, 1380, 0)
+        if size <= 64 * MIB and (name.startswith(("ksycoca5_", "ksycoca6_")) or name == "icon-cache.kcache"):
+            return (0, 1360, 0)
+        if is_desktop_compiled_cache_path(path) and size <= 64 * MIB:
+            return (2, 1120, 0)
+
+    if is_global_shader_cache_path(path) and size <= 256 * MIB:
+        # Preserve existing shader-file priority; also recognize hashed binary
+        # entries and Mesa's database/single-file layouts.
+        return (1 if name.endswith(SHADER_SUFFIXES) else 2, 760, 0)
+
+    if size <= 128 * MIB:
+        firefox = FIREFOX_USER_PATH_RE.search(path) is not None
+        chromium = CHROMIUM_USER_PATH_RE.search(path) is not None
+        if firefox and "/extensions/" in path and name.endswith(".xpi"):
+            return (1, 10600, 0)
+        if chromium and "/extensions/" in path and (
+            name.endswith(RUNTIME_SUFFIXES + (".json", ".html", ".css"))
+        ):
+            return (1, 10600, 0)
+        if (firefox or chromium) and name in BROWSER_STARTUP_NAMES:
+            return (2, 1080, 0)
+
+    if size <= 16 * MIB:
+        # Standard share/lib locations vary between distro families. Keep
+        # support data bounded so opaque, large payloads do not jump the queue.
+        share_path = path.replace("/usr/local/share/", "/usr/share/", 1) if path.startswith("/usr/local/share/") else path
+        component = path_has_prefix(share_path, DESKTOP_COMPONENT_PREFIXES)
+        user_plugin = DESKTOP_USER_PLUGIN_RE.search(path) is not None
+        launcher_plugin = "/pop-launcher/plugins/" in path and system_runtime
+        if component or user_plugin or launcher_plugin:
+            if file_is_executable(rec) or is_shared_library_name(name) or name.endswith(RUNTIME_SUFFIXES + DAILY_UI_SUFFIXES + (".gresource", ".typelib")) or name == "qmldir":
+                return (1, 10400, 0)
+            if size <= 4 * MIB and not name.endswith(MEDIA_SUFFIXES + ARCHIVE_SUFFIXES + DOCUMENT_SUFFIXES + GAME_ASSET_SUFFIXES):
+                return (2, 1020, 0)
+
+        config = DESKTOP_USER_CONFIG_RE.search(path) is not None
+        kde_config = name in KDE_USER_CONFIG_NAMES and ("/.config/" in path or "/config/" in path)
+        if (config or kde_config) and size <= 4 * MIB and not name.endswith(MEDIA_SUFFIXES + ARCHIVE_SUFFIXES + DOCUMENT_SUFFIXES + GAME_ASSET_SUFFIXES):
+            return (2, 1040, 0)
+
+        if path_has_prefix(share_path, DESKTOP_SUPPORT_PREFIXES) or DESKTOP_USER_SUPPORT_RE.search(path) is not None:
+            if not name.endswith(MEDIA_SUFFIXES + ARCHIVE_SUFFIXES + DOCUMENT_SUFFIXES + GAME_ASSET_SUFFIXES):
+                return (2, 1000, 0)
+
+        if (path.startswith(("/usr/share/", "/usr/local/share/")) or system_runtime) and name.endswith(DAILY_UI_SUFFIXES + (".gresource",)):
+            return (2, 920, 0)
+
+    # Software-center catalogs and installed-package records help occasional
+    # desktop actions, after interactive code/resources and browser data.
+    if size <= 64 * MIB:
+        if is_app_catalog_path(path, name):
+            return (4, 820, 0)
+        if path == "/var/lib/dpkg/status" or path.startswith("/var/lib/pacman/local/") and name in {"desc", "files"}:
+            return (4, 800, 0)
+        if path.startswith(("/usr/lib/sysimage/rpm/", "/var/lib/rpm/")) and name in {"rpmdb.sqlite", "rpmdb.sqlite-wal", "rpmdb.sqlite-shm", "packages.db", "packages"}:
+            return (4, 800, 0)
+    return None
 
 
 def should_prune_dir(path: str) -> bool:
@@ -1924,6 +2249,11 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     name = os.path.basename(path)
     size = rec.size
 
+    if not path_has_prefix(path, HARD_COLD_PREFIXES):
+        web_cache = classify_web_cache(path, name, size)
+        if web_cache is not None:
+            return web_cache
+
     vip = vip_classification(path, name, size)
     if vip is not None:
         return vip
@@ -1943,28 +2273,6 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
 
     # Targeted bounded caches and game/runtime paths.
     # These are intentionally handled before broad Steam/browser/game logic.
-
-    if is_steam_ui_cache_path(path):
-        if size <= STEAM_UI_CACHE_FILE_MAX:
-            confidence = 1040
-            if "/code cache/" in path:
-                confidence += 120
-            if "/cache/cache_data/" in path:
-                confidence += 100
-            if name in {"index", "the-real-index"}:
-                confidence += 160
-            return (1, confidence, 0)
-        return (99, 0, 0)
-
-    if is_firefox_web_cache_path(path):
-        if size <= FIREFOX_WEB_CACHE_FILE_MAX:
-            confidence = 760
-            if "/startupcache/" in path:
-                confidence += 160
-            if "/cache2/index" in path:
-                confidence += 140
-            return (3, confidence, 0)
-        return (99, 0, 0)
 
     if is_hytale_world_data_path(path):
         if size <= HYTALE_WORLD_FILE_MAX:
@@ -1988,7 +2296,7 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
             }:
                 confidence += 120
 
-            return (2, confidence, 0)
+            return (6, confidence, 0)
 
         return (99, 0, 0)
 
@@ -2002,7 +2310,7 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
 
     if is_vrchat_content_cache_path(path):
         if size <= VRCHAT_CONTENT_CACHE_FILE_MAX:
-            return (2, 840, 0)
+            return (6, 840, 0)
         return (99, 0, 0)
 
     if is_vrchat_runtime_path(path):
@@ -2054,6 +2362,10 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
         if cosmic:
             confidence += 180
         return (0, confidence, 0)
+
+    daily_resource = classify_daily_resource(rec, path, name)
+    if daily_resource is not None:
+        return daily_resource
 
     # Tier 1: Steam / Proton / Wine / selected game / VR launch path.
     # Keep Steam itself, Proton runtimes, VRChat, selected shader caches, and non-Steam VR hot.
@@ -2257,6 +2569,11 @@ def cache_budget_caps(cfg: dict) -> dict[str, int]:
     return {
         "steam_htmlcache": parse_size(cfg.get("steam_htmlcache_budget_bytes", "1G")) or GIB,
         "firefox_webcache": parse_size(cfg.get("firefox_webcache_budget_bytes", "2G")) or (2 * GIB),
+        "chromium_webcache": parse_size(cfg.get("chromium_webcache_budget_bytes", "4G")) or (4 * GIB),
+        "electron_webcache": parse_size(cfg.get("electron_webcache_budget_bytes", "2G")) or (2 * GIB),
+        "desktop_shader_cache": parse_size(cfg.get("desktop_shader_cache_budget_bytes", "1G")) or GIB,
+        "desktop_compiled_cache": parse_size(cfg.get("desktop_compiled_cache_budget_bytes", "256M")) or (256 * MIB),
+        "app_catalog": parse_size(cfg.get("app_catalog_budget_bytes", "256M")) or (256 * MIB),
         "hytale_world": parse_size(cfg.get("hytale_world_budget_bytes", "2G")) or (2 * GIB),
         "vrchat_content_cache": parse_size(cfg.get("vrchat_content_cache_budget_bytes", "2G")) or (2 * GIB),
     }
@@ -2267,13 +2584,29 @@ def cache_budget_file_caps(cfg: dict) -> dict[str, int]:
     # page. A recent-resource cap approximates the recent browsing working set
     # without pretending that 50 cache files == 50 pages.
     return {
-        "steam_htmlcache": int(cfg.get("steam_htmlcache_max_files", 4000) or 4000),
-        "firefox_webcache": int(cfg.get("firefox_webcache_max_files", 2000) or 2000),
+        "steam_htmlcache": int(cfg.get("steam_htmlcache_max_files", 65536) or 65536),
+        "firefox_webcache": int(cfg.get("firefox_webcache_max_files", 131072) or 131072),
+        "chromium_webcache": int(cfg.get("chromium_webcache_max_files", 131072) or 131072),
+        "electron_webcache": int(cfg.get("electron_webcache_max_files", 65536) or 65536),
+        "desktop_shader_cache": int(cfg.get("desktop_shader_cache_max_files", 32768) or 32768),
+        "desktop_compiled_cache": int(cfg.get("desktop_compiled_cache_max_files", 32768) or 32768),
+        "app_catalog": int(cfg.get("app_catalog_max_files", 16384) or 16384),
     }
 
 
 def cache_budget_key(rec: FileRec) -> Optional[str]:
     path = os.path.normpath(rec.path).lower()
+
+    web_cache = browser_cache_kind(path)
+    if web_cache is not None:
+        return web_cache[0]
+
+    if is_global_shader_cache_path(path):
+        return "desktop_shader_cache"
+    if is_desktop_compiled_cache_path(path):
+        return "desktop_compiled_cache"
+    if is_app_catalog_path(path, os.path.basename(path)):
+        return "app_catalog"
 
     if is_steam_ui_cache_path(path):
         return "steam_htmlcache"
@@ -2328,7 +2661,11 @@ def recency_timestamp_for_path(path: str, st: os.stat_result) -> float:
     lower = os.path.normpath(path).lower()
 
     if (
-        is_firefox_web_cache_path(lower)
+        browser_cache_kind(lower) is not None
+        or is_global_shader_cache_path(lower)
+        or is_desktop_compiled_cache_path(lower)
+        or is_app_catalog_path(lower, os.path.basename(lower))
+        or is_firefox_web_cache_path(lower)
         or is_vrchat_content_cache_path(lower)
         or is_hytale_world_data_path(lower)
         or is_steam_ui_cache_path(lower)
@@ -4487,9 +4824,19 @@ write_config() {
   "max_selection_budget_total_ratio": 4.0,
 
   "steam_htmlcache_budget_bytes": "1G",
-  "steam_htmlcache_max_files": 7000,
+  "steam_htmlcache_max_files": 65536,
   "firefox_webcache_budget_bytes": "4G",
-  "firefox_webcache_max_files": 7000,
+  "firefox_webcache_max_files": 131072,
+  "chromium_webcache_budget_bytes": "4G",
+  "chromium_webcache_max_files": 131072,
+  "electron_webcache_budget_bytes": "2G",
+  "electron_webcache_max_files": 65536,
+  "desktop_shader_cache_budget_bytes": "1G",
+  "desktop_shader_cache_max_files": 32768,
+  "desktop_compiled_cache_budget_bytes": "256M",
+  "desktop_compiled_cache_max_files": 32768,
+  "app_catalog_budget_bytes": "256M",
+  "app_catalog_max_files": 16384,
   "hytale_world_budget_bytes": "2G",
   "vrchat_content_cache_budget_bytes": "2G",
 
