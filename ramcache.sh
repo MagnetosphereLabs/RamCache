@@ -61,7 +61,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.23"
+CONTROLLER_VERSION = "1.4.24"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -151,7 +151,22 @@ def parse_size(value):
     return int(float(match.group(1)) * (1024 ** power))
 
 
+_MEMINFO_LOCK = threading.Lock()
+_MEMINFO_SAMPLE = (float("-inf"), {})
+
+
 def parse_meminfo() -> dict[str, int]:
+    # Configuration/plan threads share the supervisor's sample. Never turn a
+    # fast worker-completion loop into repeated /proc/cgroup memory polling.
+    global _MEMINFO_SAMPLE
+    with _MEMINFO_LOCK:
+        now = time.monotonic()
+        if now - _MEMINFO_SAMPLE[0] >= 1:
+            _MEMINFO_SAMPLE = (now, read_meminfo())
+        return dict(_MEMINFO_SAMPLE[1])
+
+
+def read_meminfo() -> dict[str, int]:
     data: dict[str, int] = {}
     with open("/proc/meminfo", "r", encoding="utf-8") as f:
         for line in f:
@@ -3241,7 +3256,8 @@ class CacheBudgetPolicy:
         elif available >= above:
             if self.high_since is None:
                 self.high_since = now
-            if now >= self.resume_not_before and now - self.high_since >= 30:
+            if (now >= self.resume_not_before and now - self.high_since >= 30
+                    and potential > self.target + 128 * MIB):
                 self.target = potential
                 self.refilling = True
                 self.high_since = None
@@ -3561,6 +3577,29 @@ def inventory_is_corrupt(error):
     return str(error) in ("database disk image is malformed", "file is not a database")
 
 
+class PlanDeferred(Exception):
+    """A full cache interrupted publication; retain the previous complete plan."""
+
+
+def discovery_control():
+    control = read_json(RUNTIME_PATH / "pressure.json", {}) or {}
+    return control if 0 <= time.time() - control.get("timestamp", 0) <= 10 else {}
+
+
+def discovery_is_parked():
+    control = discovery_control()
+    return bool(control.get("cache_holding") or control.get("refill_from_plan"))
+
+
+def release_unused_heap():
+    # Optional on glibc; other libc implementations still release Python/SQLite
+    # objects normally. Never require a distro-specific allocator extension.
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
+
+
 class InventoryDB:
     def __init__(self, path: Path, *, volatile=False, cfg=None):
         self.path = path
@@ -3699,10 +3738,7 @@ class InventoryDB:
         self.connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
         self.connection.execute("PRAGMA shrink_memory")
         # SQLite releases pages, but glibc may retain the heap until trimmed.
-        try:
-            ctypes.CDLL(None).malloc_trim(0)
-        except (AttributeError, OSError):
-            pass
+        release_unused_heap()
         self.last_checkpoint = time.time()
         self.last_checkpoint_rows = written
         self.last_checkpoint_seconds = time.monotonic() - started
@@ -3778,11 +3814,14 @@ class InventoryDB:
         for table in ("visited", "todo", "dirty", "scan_seen", "scan_marks"):
             self.connection.execute(f"DELETE FROM {table} WHERE path=? OR (path>=? AND path<?)", (raw, prefix, end))
 
-    def invalidate_directory(self, path):
+    def invalidate_directory(self, path, active=()):
         raw = os.fsencode(os.path.normpath(path))
         prefix = raw.rstrip(b"/") + b"/"
         self.connection.execute("DELETE FROM visited WHERE path=? OR (path>=? AND path<?)",
                                 (raw, prefix, prefix[:-1] + b"0"))
+        # A suspended descendant can finish with an old directory snapshot.
+        # Revisit it after that batch, even when the event names its parent.
+        return [directory for directory in active if path_is_under(directory, path)]
 
     def prepare(self, records, generation, *, force=False, dir_token=0):
         changed = []
@@ -3896,6 +3935,9 @@ class InventoryDB:
 
     def publish(self, cfg: dict, roots: list[str], *, reason: str):
         """Stream from the priority index. No all-inventory Python list/sort."""
+        interruptible = self.volatile and reason != "shutdown"
+        if interruptible and discovery_is_parked():
+            raise PlanDeferred()
         total_ram = parse_meminfo()["MemTotal"]
         limit = min(parse_size(cfg.get("plan_budget_bytes")) or int(total_ram * 0.95),
                     int(total_ram * 1.25))
@@ -3917,6 +3959,11 @@ class InventoryDB:
         plan_dir.mkdir(parents=True, exist_ok=True)
         path = plan_dir / "startup-plan.jsonl"
         fd, temp = tempfile.mkstemp(prefix="startup-plan.", dir=plan_dir)
+        # A newly full cache can interrupt a large publication. Roll back only
+        # this unfinished plan, not discovery or the last durable startup list.
+        if not self.connection.in_transaction:
+            self.connection.execute("BEGIN")
+        self.connection.execute("SAVEPOINT publish_plan")
         self.connection.execute("DELETE FROM plan_members")
         byte_count = count = 0
         digest = hashlib.sha256()
@@ -3937,7 +3984,12 @@ class InventoryDB:
                         fallback = query.replace("ORDER BY", "WHERE NOT EXISTS (SELECT 1 FROM plan_members p WHERE p.path=f.path) ORDER BY")
                         yield from ((True, row) for row in self.connection.execute(fallback))
 
+                last_control_check = time.monotonic()
                 for fallback, row in candidates():
+                    if interruptible and time.monotonic() - last_control_check >= 1:
+                        last_control_check = time.monotonic()
+                        if not RUNNING or discovery_is_parked():
+                            raise PlanDeferred()
                     raw, size, stamp, mode, dev, ino, mtime_ns, ctime_ns, *tail = row
                     path_text = os.fsdecode(raw)
                     if not cache_path_allowed(path_text, cfg, roots):
@@ -4018,7 +4070,12 @@ class InventoryDB:
                 invalid.unlink(missing_ok=True)
             self.connection.execute("DELETE FROM selection_dirty")
             self.force_publish = False
+        except BaseException:
+            self.connection.execute("ROLLBACK TO publish_plan")
+            raise
         finally:
+            self.connection.execute("RELEASE publish_plan")
+            self.connection.execute("DELETE FROM plan_members")
             if os.path.exists(temp):
                 os.unlink(temp)
         return {"plan_files": count, "plan_bytes": byte_count, "plan_generation": header["generation"],
@@ -4063,7 +4120,7 @@ class DirectoryScanner:
                 with os.scandir(directory) as entries:
                     for entry in entries:
                         while self.paused.is_set() and not self.stop.is_set():
-                            self.stop.wait(0.25)
+                            self.stop.wait(1)
                         if self.stop.is_set():
                             break
                         path = entry.path
@@ -4214,19 +4271,56 @@ def run_planner() -> int:
     last_memory_checkpoint_check = 0.0
     last_memory_checkpoint_attempt = -60.0
     started = time.monotonic()
+    was_holding = False
     try:
         while RUNNING:
             now = time.monotonic()
+            control = discovery_control()
+            holding = bool(control.get("cache_holding", False) or control.get("refill_from_plan", False))
+            paused = holding or bool(control.get("pause_discovery", False))
+            (scanner.paused.set if paused else scanner.paused.clear)()
+            (observer.paused.set if paused else observer.paused.clear)()
+            if holding:
+                # Keep queued directories/results and bounded notification
+                # buffers intact. No scan, classification, usage SQL, COUNT,
+                # or plan publication while the completed cache is holding.
+                # Periodic durability is still honored without rebuilding the
+                # saved selection, including an interrupted initial inventory.
+                if not was_holding or now >= checkpoint_due:
+                    try:
+                        # Save the bounded, coalesced learning delta with the
+                        # checkpoint; do not continuously run learning SQL or
+                        # republish a selection while the cache is asleep.
+                        observations = observer.take(observer.limit)
+                        if observations:
+                            changed += db.observe(observations, generation, directory_tokens)
+                        del observations
+                        db.checkpoint(reason="cache holding" if not was_holding else "periodic while holding")
+                        checkpoint_error = ""
+                        checkpoint_due = time.monotonic() + checkpoint_interval
+                    except (sqlite3.Error, OSError) as error:
+                        checkpoint_error = str(error)
+                        checkpoint_due = time.monotonic() + 60
+                        logging.exception("held metadata checkpoint failed; retaining live state")
+                was_holding = True
+                status = read_json(RUNTIME_PATH / "planner-status.json", {}) or {}
+                status.update(timestamp=time.time(), pid=os.getpid(),
+                              phase="holding" if control.get("cache_holding") else "waiting for cached-plan refill",
+                              scanned_files=scanned, inventory_files=inventory_count,
+                              checkpoint_error=checkpoint_error,
+                              last_checkpoint_epoch=db.last_checkpoint,
+                              last_checkpoint_reason=db.last_checkpoint_reason,
+                              last_checkpoint_rows=db.last_checkpoint_rows,
+                              last_checkpoint_seconds=round(db.last_checkpoint_seconds, 3),
+                              persistence_interval_seconds=checkpoint_interval)
+                atomic_json(RUNTIME_PATH / "planner-status.json", status)
+                time.sleep(1)
+                continue
+            was_holding = False
             if (RUNTIME_PATH / "plan-invalid.json").exists():
                 changed += 1
                 last_publish = 0
                 db.force_publish = True
-            control = read_json(RUNTIME_PATH / "pressure.json", {}) or {}
-            paused = bool(control.get("pause_discovery", False))
-            if time.time() - control.get("timestamp", 0) > 10:
-                paused = False
-            (scanner.paused.set if paused else scanner.paused.clear)()
-
             if not paused and now - last_root_refresh >= 300:
                 last_root_refresh = now
                 discovered = normalized_roots(cfg)
@@ -4371,9 +4465,7 @@ def run_planner() -> int:
                     changed += 1
                 for path in compact_prefixes(directories):
                     if cache_path_allowed(path, cfg, roots) and os.path.isdir(path):
-                        db.invalidate_directory(path)
-                        if path in scanner.active:
-                            refresh_again.add(path)
+                        refresh_again.update(db.invalidate_directory(path, scanner.active))
                         dev = safe_dev(path)
                         if dev is not None:
                             db.add_directory(path, dev, True)
@@ -4423,10 +4515,13 @@ def run_planner() -> int:
             publish_interval = 5 if first_install and now - started < 60 else 30
             if changed and not paused and now - last_publish >= publish_interval:
                 db.connection.commit()
-                if db.selection_changed():
-                    plan_info = db.publish(cfg, roots, reason=phase)
-                last_publish = now
-                changed = 0
+                try:
+                    if db.selection_changed():
+                        plan_info = db.publish(cfg, roots, reason=phase)
+                    last_publish = now
+                    changed = 0
+                except PlanDeferred:
+                    continue  # The next loop parks the scanner and planner.
             memory_checkpoint = False
             if now - last_memory_checkpoint_check >= 5 and now-last_memory_checkpoint_attempt >= 60:
                 memory_checkpoint = db.memory_checkpoint_needed()
@@ -4446,6 +4541,8 @@ def run_planner() -> int:
                     if not scan_active:
                         initial_checkpoint_pending = False
                     checkpoint_error = ""
+                except PlanDeferred:
+                    continue
                 except (sqlite3.Error, OSError) as error:
                     checkpoint_error = str(error)
                     logging.exception("metadata checkpoint failed; live RAM state retained for retry")
@@ -4477,7 +4574,7 @@ def run_planner() -> int:
                     "checkpoint_error": checkpoint_error,
                 })
                 last_status = now
-            time.sleep(0.02 if pending or futures else 0.2)
+            time.sleep(0.02 if (pending or futures) and not paused else 1)
     finally:
         scanner.close()
         observer.close()
@@ -4485,7 +4582,7 @@ def run_planner() -> int:
         # Never wait indefinitely for blocked filesystem I/O on shutdown.
         pool.shutdown(wait=False, cancel_futures=True)
         try:
-            if db.selection_changed():
+            if db.selection_changed() and not discovery_is_parked():
                 db.publish(cfg, roots, reason="shutdown")
             db.close()
         except (sqlite3.Error, OSError):
@@ -4502,6 +4599,7 @@ class UsageObserver:
     def __init__(self, cfg: dict, roots: list[str]):
         self.cfg, self.roots = cfg, roots
         self.stop = threading.Event()
+        self.paused = threading.Event()
         self.lock = threading.Lock()
         self.pending = {}
         self.processes = {}
@@ -4573,12 +4671,17 @@ class UsageObserver:
 
     def sample_processes(self):
         while not self.stop.is_set():
+            if self.paused.is_set():
+                self.stop.wait(1)
+                continue
             current = {}
             try:
                 entries = list(os.scandir("/proc"))
             except OSError:
                 entries = []
             for entry in entries:
+                if self.stop.is_set() or self.paused.is_set():
+                    break
                 if not entry.name.isdigit() or int(entry.name) == os.getpid():
                     continue
                 pid = int(entry.name)
@@ -4821,6 +4924,7 @@ class PlanReader:
         self.cfg, self.roots = cfg, roots
         self.messages = queue.Queue(maxsize=8)
         self.stop = threading.Event()
+        self.paused = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True, name="startup-plan-validation")
         self.thread.start()
 
@@ -4835,6 +4939,9 @@ class PlanReader:
     def run(self):
         last_identity = None
         while not self.stop.is_set():
+            if self.paused.is_set():
+                self.stop.wait(1)
+                continue
             try:
                 with startup_plan_source() as (identity, source):
                     header = json.loads(next(source))
@@ -4853,6 +4960,8 @@ class PlanReader:
                     metadata_limit = selection_metadata_budget(self.cfg, parse_meminfo()["MemTotal"])
                     metadata_used = 0
                     for line in source:
+                        while self.paused.is_set() and not self.stop.is_set():
+                            self.stop.wait(1)
                         if self.stop.is_set():
                             return
                         if maximum is not None and index >= maximum:
@@ -4889,6 +4998,10 @@ class PlanReader:
                     if batch:
                         self.put(("batch", batch))
                     self.put(("end", {"skipped": skipped, **header}))
+                    # Validation's duplicate-inode set is temporary; do not
+                    # retain millions of tuples throughout the idle interval.
+                    seen.clear()
+                    batch = []
                 last_identity = identity
             except FileNotFoundError:
                 pass
@@ -4899,14 +5012,27 @@ class PlanReader:
             self.stop.wait(0.5)
 
 
-def choose_candidates(records, budget, cfg):
+def choose_candidates(records, budget, cfg, *, existing=()):
     total = 0
     selected = []
     used = {}
     counts = {}
     caps, file_caps = cache_budget_caps(cfg), cache_budget_file_caps(cfg)
     maximum = parse_size(cfg.get("vmtouch_max_file_size", "128G"))
+    # A refill with an unchanged plan retains the current worker records.
+    # Identity integers are much smaller than rebuilding millions of path/
+    # timestamp tuples, and only newly selected records are returned.
+    present = set()
+    for rec in existing:
+        present.add(id(rec))
+        cost = page_bytes(rec.size)
+        total += cost
+        if rec.budget:
+            used[rec.budget] = used.get(rec.budget, 0) + cost
+            counts[rec.budget] = counts.get(rec.budget, 0) + 1
     for rec in records:
+        if present and id(rec) in present:
+            continue
         if maximum is not None and rec.size > maximum:
             continue
         cost = page_bytes(rec.size)
@@ -4957,7 +5083,6 @@ def run_supervisor() -> int:
     budget_policy = CacheBudgetPolicy()
     io_activity = IOActivity()
     io_busy = False
-    last_io_sample = 0.0
     workers = []
     retired = []
     records = []
@@ -4979,19 +5104,24 @@ def run_supervisor() -> int:
     started = time.monotonic()
     first_warm = None
     loading_peak = 0
+    last_memory_sample = float("-inf")
+    sampled_locked = {}
+    pause = False
+    was_holding = False
+    refill_from_plan = False
     try:
         while RUNNING:
             now = time.monotonic()
-            if now - last_io_sample >= 1:
+            monitor_interval = max(1.0, float(cfg.get("memory_monitor_interval_seconds", 1)))
+            memory_tick = now - last_memory_sample >= monitor_interval
+            if memory_tick:
                 io_busy = io_activity.busy(now)
-                last_io_sample = now
             reap_workers(retired)
-            meminfo = parse_meminfo()
             owned_locked = 0
             inflight = 0
             for worker in list(workers):
                 locked = worker.locked
-                if not worker.ready.is_set() or not worker.acknowledged_at or now - worker.last_sample >= 1:
+                if memory_tick:
                     locked, _ = process_memory(worker.proc.pid)
                     worker.last_sample = now
                 if locked > worker.locked:
@@ -5037,12 +5167,15 @@ def run_supervisor() -> int:
                     worker.failed.set()
                     worker.diagnostic = "a loaded mapping lost locked pages; revalidating this worker"
                 owned_locked += locked
-            supervisor_anon = process_memory(os.getpid())[1]
-            planner_anon = 0
-            if planner.poll() is None:
-                planner_anon = process_memory(planner.pid)[1]
-            own_anon = supervisor_anon + planner_anon
-            release, pause = policy.evaluate(meminfo, cfg, owned_locked, own_anon)
+            release = 0
+            if memory_tick:
+                supervisor_anon = process_memory(os.getpid())[1]
+                planner_anon = process_memory(planner.pid)[1] if planner.poll() is None else 0
+                own_anon = supervisor_anon + planner_anon
+                meminfo = parse_meminfo()
+                last_memory_sample = now
+                sampled_locked = {worker.proc.pid: worker.locked for worker in workers}
+                release, pause = policy.evaluate(meminfo, cfg, owned_locked, own_anon, now=now)
             if release:
                 target = max(0, owned_locked - release)
                 # Signal all chosen workers before waiting for any exit. The
@@ -5056,9 +5189,19 @@ def run_supervisor() -> int:
                 pending_chunks.clear()
                 plan_changed = True
 
+            floor, reserve, above = memory_watermarks(meminfo, cfg)
+            if memory_tick:
+                budget_policy.evaluate(meminfo, cfg, owned_locked, inflight, paused=pause, now=now)
+            budget = budget_policy.target
+            holding = not budget_policy.refilling
+            grow_existing = (not holding and budget > last_budget and validated
+                             and not plan_changed and not failed_until and not retired)
+            defer_plan = holding or refill_from_plan or grow_existing
+            (reader.paused.set if defer_plan else reader.paused.clear)()
+
             # Stream useful validated records immediately, without waiting for
             # the rest of the saved list or the background inventory.
-            for _ in range(16):
+            for _ in range(0 if defer_plan else 16):
                 try:
                     kind, payload = reader.messages.get_nowait()
                 except queue.Empty:
@@ -5086,38 +5229,63 @@ def run_supervisor() -> int:
                     last_error = "startup-plan validation: " + payload
                     logging.warning("%s", last_error)
 
-            floor, reserve, above = memory_watermarks(meminfo, cfg)
-            budget = budget_policy.evaluate(meminfo, cfg, owned_locked, inflight, paused=pause, now=now)
-            if not pause and records and now - last_reconcile >= 1 and (
+            if not holding and not pause and records and now - last_reconcile >= 1 and (
                     plan_changed or budget != last_budget
                     or any(deadline <= now for deadline in failed_until.values())):
                 failed_until = {key: deadline for key, deadline in failed_until.items() if deadline > now}
-                desired = choose_candidates(records, budget, cfg)
-                cache_goal = sum(page_bytes(rec.size) for rec in desired)
-                desired_priorities = {record_key(rec): rec.priority for rec in desired}
-                # Reuse this mapping's keys instead of duplicating millions
-                # of identity tuples in a second set during reconciliation.
-                desired_keys = desired_priorities.keys()
-                replacements, replacements_pending = replacement_batch(workers, desired_keys, cfg, retired)
-                for worker in list(workers):
-                    if all(record_key(rec) in desired_keys for rec in worker.records):
-                        worker.priority = min(desired_priorities[record_key(rec)] for rec in worker.records)
-                        continue
-                    # During the first streamed plan, keep existing workers
-                    # while later records are still arriving.
-                    if not validated and incoming is not None:
-                        continue
-                    if worker not in replacements:
-                        continue
-                    workers.remove(worker)
-                    signal_worker(worker)
-                    retired.append((now, worker))
-                present = {record_key(rec) for worker in workers for rec in worker.records}
-                missing = [rec for rec in desired if record_key(rec) not in present
-                           and record_key(rec) not in failed_until]
-                pending_chunks = deque(worker_chunks(missing, cfg))
-                last_reconcile, last_budget, plan_changed = now, budget, replacements_pending
-
+                if grow_existing:
+                    # No plan change: append only the newly affordable files.
+                    # Healthy workers and their bookkeeping stay in place.
+                    additions = choose_candidates(records, budget, cfg, existing=(
+                        rec for worker in workers for rec in worker.records))
+                    # A held plan may be hours old. Validate just the new
+                    # reads, not the millions of records already cached.
+                    verified = []
+                    for rec in additions:
+                        actual = stat_record(rec.path)
+                        if actual is not None and record_key(actual) == record_key(rec):
+                            verified.append(rec)
+                    if len(verified) != len(additions):
+                        atomic_json(RUNTIME_PATH / "plan-invalid.json", {
+                            "timestamp": time.time(), "reason": "refill candidates changed while holding"})
+                    additions = verified
+                    cache_goal = sum(worker.requested for worker in workers) + sum(
+                        page_bytes(rec.size) for rec in additions)
+                    pending_chunks = deque(worker_chunks(additions, cfg))
+                    del additions, verified
+                    refill_from_plan = cache_goal >= budget - 128 * MIB
+                    last_reconcile, last_budget, plan_changed = now, budget, False
+                else:
+                    refill_from_plan = False
+                    desired = choose_candidates(records, budget, cfg)
+                    cache_goal = sum(page_bytes(rec.size) for rec in desired)
+                    desired_records = {record_key(rec): rec for rec in desired}
+                    # Reuse this mapping's keys instead of duplicating millions
+                    # of identity tuples in a second set during reconciliation.
+                    desired_keys = desired_records.keys()
+                    replacements, replacements_pending = replacement_batch(workers, desired_keys, cfg, retired)
+                    for worker in list(workers):
+                        if all(record_key(rec) in desired_keys for rec in worker.records):
+                            worker.records = [desired_records[record_key(rec)] for rec in worker.records]
+                            worker.priority = min(rec.priority for rec in worker.records)
+                            continue
+                        # During the first streamed plan, keep existing workers
+                        # while later records are still arriving.
+                        if not validated and incoming is not None:
+                            continue
+                        if worker not in replacements:
+                            continue
+                        workers.remove(worker)
+                        signal_worker(worker)
+                        retired.append((now, worker))
+                    present = {record_key(rec) for worker in workers for rec in worker.records}
+                    missing = [rec for rec in desired if record_key(rec) not in present
+                               and record_key(rec) not in failed_until]
+                    pending_chunks = deque(worker_chunks(missing, cfg))
+                    last_reconcile, last_budget, plan_changed = now, budget, replacements_pending
+                    # These dictionaries/sets can dwarf the active worker index.
+                    # They are scratch space, not persistent cache ownership data.
+                    del desired, desired_records, desired_keys, present, missing, replacements
             active_loading = sum(not worker.ready.is_set() for worker in workers)
             loading_limit = max(1, min(16, int(cfg.get("warming_worker_max", 4))))
             if storage_profile == "rotational":
@@ -5131,8 +5299,13 @@ def run_supervisor() -> int:
             # workers acknowledge completion, independent of target deadbands.
             launches = 0
             launch_blocked = ""
-            while pending_chunks and not pause and active_loading < loading_limit and launches < 2:
-                free_room = max(0, meminfo["MemAvailable"] - reserve - inflight)
+            # A worker can finish between 1-s memory samples. Charge every byte
+            # not resident at the last sample EVEN AFTER its ready signal, so
+            # fast completion never lets us spend stale MemAvailable twice.
+            unsampled = sum(max(0, worker.requested - sampled_locked.get(worker.proc.pid, 0))
+                            for worker in workers)
+            while pending_chunks and not holding and not pause and active_loading < loading_limit and launches < 2:
+                free_room = max(0, meminfo["MemAvailable"] - reserve - unsampled)
                 chunk, cost = pop_fitting_chunk(pending_chunks, free_room, inflight, inflight_limit)
                 if chunk is None:
                     launch_blocked = "outstanding I/O budget" if inflight else "insufficient headroom for remaining whole-file chunks"
@@ -5149,6 +5322,7 @@ def run_supervisor() -> int:
                     if first_warm is None:
                         first_warm = now - started
                     inflight += cost
+                    unsampled += cost
                     active_loading += 1
                     launches += 1
                     loading_peak = max(loading_peak, active_loading)
@@ -5159,6 +5333,19 @@ def run_supervisor() -> int:
                         failed_until[record_key(rec)] = now + 30
                     logging.exception("unable to start cache worker")
                     break
+
+            # Full means stop expensive work in BOTH processes. The latch also
+            # covers a small whole-file tail that cannot fit the reserve.
+            if (budget_policy.refilling and validated and not active_loading
+                    and not pending_chunks and cache_goal >= budget - 128 * MIB):
+                budget_policy.hold(budget)
+            holding = not budget_policy.refilling
+            if holding:
+                refill_from_plan = False
+            (reader.paused.set if holding or refill_from_plan else reader.paused.clear)()
+            if holding and not was_holding:
+                release_unused_heap()
+            was_holding = holding
 
             if planner.poll() is not None:
                 if planner_retry == 0:
@@ -5193,12 +5380,15 @@ def run_supervisor() -> int:
                     plan_changed = True
                 storage_profile = planner_status.get("storage_profile", storage_profile)
                 atomic_json(RUNTIME_PATH / "pressure.json", {
-                    "timestamp": time.time(), "pause_discovery": pause or io_busy,
+                    "timestamp": time.time(), "pause_discovery": pause or io_busy or holding or refill_from_plan,
+                    "cache_holding": holding, "refill_from_plan": refill_from_plan,
                 })
                 actual = sum(worker.locked for worker in workers)
                 requested = sum(worker.requested for worker in workers)
                 if pause:
                     fill_state = "memory pressure or reserve"
+                elif holding and not active_loading:
+                    fill_state = "holding cache; discovery and selection asleep"
                 elif pending_chunks or active_loading:
                     fill_state = launch_blocked or "loading selected files"
                 elif failed_until:
@@ -5219,13 +5409,15 @@ def run_supervisor() -> int:
                 payload = {
                     "controller_version": CONTROLLER_VERSION, "timestamp": int(time.time()),
                     "uptime_seconds": round(now - started, 2), "memory_profile": cfg.get("memory_profile", "normal"),
-                    "phase": "pressure-paused" if pause and (policy.reason != "available" or now < policy.pause_until) else ("discovering" if not records else
-                             ("warming" if pending_chunks or active_loading else ("degraded" if failed_until else "ready"))),
+                    "phase": "pressure-paused" if pause and (policy.reason != "available" or now < policy.pause_until) else ("holding" if holding and not active_loading else ("discovering" if not records else
+                             ("warming" if pending_chunks or active_loading else ("degraded" if failed_until else "ready")))),
                     "target_locked_gib": bytes_to_gib(budget), "selected_files": sum(len(worker.records) for worker in workers),
                     "cache_goal_gib": bytes_to_gib(cache_goal),
                     "fill_state": fill_state, "candidate_gib": bytes_to_gib(candidate_bytes),
                     "capacity_gap_gib": bytes_to_gib(max(0, budget-actual)),
                     "refill_state": "filling" if budget_policy.refilling else "holding",
+                    "memory_monitor_interval_seconds": monitor_interval,
+                    "refill_from_existing_plan": refill_from_plan,
                     "refill_resume_available_gib": bytes_to_gib(above),
                     "refill_headroom_stable_seconds": round(now-budget_policy.high_since, 2) if budget_policy.high_since is not None else 0,
                     "refill_cooldown_remaining_seconds": round(max(0, budget_policy.resume_not_before-now), 2),
@@ -5282,10 +5474,10 @@ def run_supervisor() -> int:
                         planner_retry = time.monotonic() + 1
                 except (OSError, ValueError, TypeError) as error:
                     last_error = "invalid configuration; continuing last valid settings: " + str(error)
-            # Keep fast loading, but honor the intended 0.5-s memory monitor
-            # interval when idle/blocked instead of polling everything at 10 Hz.
-            busy = active_loading or not validated or incoming is not None or plan_changed
-            time.sleep(0.1 if busy else max(0.1, min(1.0, float(cfg.get("memory_monitor_interval_seconds", 0.5)))))
+            # Completion/feeding remains fast; memory telemetry is sampled on
+            # its independent >=1-s cadence. Holding ignores deferred plans.
+            busy = active_loading or (not holding and (not validated or incoming is not None or plan_changed))
+            time.sleep(0.1 if busy else monitor_interval)
     finally:
         reader.stop.set()
         for worker in workers:
@@ -5508,7 +5700,7 @@ write_config() {
 import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 path = Path('/etc/ramcache-controller/config.json')
-defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","firefox_webcache_budget_bytes":"4G","chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":3,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800}''')
+defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","firefox_webcache_budget_bytes":"4G","chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":3,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800}''')
 legacy = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":10,"incremental_rescan_interval_seconds":300,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":96,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":30,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"4G","target_shrink_to_available_bytes":"6G","target_grow_above_available_bytes":"7G","target_grow_to_available_bytes":"6G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"8G","vmtouch_chunk_target_bytes":"1024M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{}}''')
 current = {}
 if path.exists():
@@ -5545,7 +5737,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.23.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.4.24.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -6960,7 +7152,7 @@ install_all() {
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.23. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.4.24. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
@@ -7004,7 +7196,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.23"
+  echo "RAM cache controller installer: v1.4.24"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
