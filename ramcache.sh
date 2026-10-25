@@ -61,7 +61,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.22"
+CONTROLLER_VERSION = "1.4.23"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -3086,6 +3086,10 @@ def memory_watermarks(meminfo: dict, cfg: dict) -> tuple[int, int, int]:
             above = max(above, reserve + 512 * MIB)
         if meminfo.get("SwapTotal", 0) == 0:
             reserve = max(reserve, min(12 * GIB, int(total * 0.10)))
+        # A real refill hysteresis band, scaled for 16/32/64/128-GiB systems.
+        # On a 62.7-GiB, swapless system this resumes at ~10.2 GiB,
+        # while keeping the existing ~6.3-GiB fill reserve.
+        above = max(above, reserve + min(4 * GIB, max(512 * MIB, total // 16)))
     # A malformed old config cannot reserve more memory than the machine has.
     floor = min(floor, max(256 * MIB, int(total * 0.25)))
     reserve = min(max(floor, reserve), max(floor, int(total * 0.4)))
@@ -3202,6 +3206,53 @@ class PressurePolicy:
         if release:
             self.last_release = now
         return min(owned_locked, max(0, release)), pause or now < self.pause_until
+
+
+class CacheBudgetPolicy:
+    """Latch the cache target; noisy headroom must not resize a full cache."""
+    def __init__(self):
+        self.target = None
+        self.refilling = True
+        self.high_since = None
+        self.resume_not_before = 0.0
+
+    def evaluate(self, meminfo, cfg, owned_locked, inflight, *, paused=False, now=None):
+        now = time.monotonic() if now is None else now
+        _, reserve, above = memory_watermarks(meminfo, cfg)
+        available = max(0, meminfo["MemAvailable"] - inflight)
+        ceiling = int(meminfo["MemTotal"] * 0.9)
+        configured = parse_size(cfg.get("max_selection_budget_bytes"))
+        if configured is not None:
+            ceiling = min(ceiling, configured)
+        potential = min(ceiling, max(0, owned_locked + meminfo["MemAvailable"] - reserve))
+        if self.target is None:
+            self.target = potential
+        self.target = min(self.target, ceiling)
+        if paused:
+            self.refilling = False
+            self.high_since = None
+            # Keep healthy locks and outstanding reads, but do not immediately
+            # reacquire the memory just released for foreground work.
+            self.target = min(self.target, owned_locked + inflight)
+            self.resume_not_before = now + max(30, float(cfg.get("memory_pressure_regrow_cooldown_seconds", 10)))
+        elif self.refilling:
+            if available <= reserve + 128 * MIB:
+                self.hold(potential)
+        elif available >= above:
+            if self.high_since is None:
+                self.high_since = now
+            if now >= self.resume_not_before and now - self.high_since >= 30:
+                self.target = potential
+                self.refilling = True
+                self.high_since = None
+        else:
+            self.high_since = None
+        return self.target
+
+    def hold(self, potential):
+        self.target = min(self.target, potential)
+        self.refilling = False
+        self.high_since = None
 
 
 class IOActivity:
@@ -4903,6 +4954,7 @@ def run_supervisor() -> int:
     planner_retry = 0.0
     planner_failures = 0
     policy = PressurePolicy()
+    budget_policy = CacheBudgetPolicy()
     io_activity = IOActivity()
     io_busy = False
     last_io_sample = 0.0
@@ -4922,7 +4974,6 @@ def run_supervisor() -> int:
     cache_goal = 0
     candidate_bytes = 0
     incoming_bytes = 0
-    last_fill_progress = time.monotonic()
     plan_changed = False
     validated = False
     started = time.monotonic()
@@ -4945,7 +4996,6 @@ def run_supervisor() -> int:
                     worker.last_sample = now
                 if locked > worker.locked:
                     worker.last_progress = now
-                    last_fill_progress = now
                 worker.locked = locked
                 if worker.proc.poll() is not None or worker.failed.is_set():
                     workers.remove(worker)
@@ -5037,20 +5087,9 @@ def run_supervisor() -> int:
                     logging.warning("%s", last_error)
 
             floor, reserve, above = memory_watermarks(meminfo, cfg)
-            # Budget uses this service's measured locks. Global Mlocked can
-            # include unrelated audio/VM applications and must not drive growth.
-            budget = max(0, owned_locked + meminfo["MemAvailable"] - reserve)
-            budget = min(budget, int(meminfo["MemTotal"] * 0.9))
-            configured_max = parse_size(cfg.get("max_selection_budget_bytes"))
-            if configured_max is not None:
-                budget = min(budget, configured_max)
-            if pending_chunks and not any(not w.ready.is_set() for w in workers) and now-last_fill_progress >= 5:
-                # Re-evaluate a blocked tail even if the change is smaller
-                # than the normal budget deadband; no permanent waiting state.
-                plan_changed = True
-                last_fill_progress = now
+            budget = budget_policy.evaluate(meminfo, cfg, owned_locked, inflight, paused=pause, now=now)
             if not pause and records and now - last_reconcile >= 1 and (
-                    plan_changed or abs(budget - last_budget) >= 128 * MIB
+                    plan_changed or budget != last_budget
                     or any(deadline <= now for deadline in failed_until.values())):
                 failed_until = {key: deadline for key, deadline in failed_until.items() if deadline > now}
                 desired = choose_candidates(records, budget, cfg)
@@ -5097,6 +5136,12 @@ def run_supervisor() -> int:
                 chunk, cost = pop_fitting_chunk(pending_chunks, free_room, inflight, inflight_limit)
                 if chunk is None:
                     launch_blocked = "outstanding I/O budget" if inflight else "insufficient headroom for remaining whole-file chunks"
+                    if not active_loading:
+                        potential = max(0, owned_locked + meminfo["MemAvailable"] - reserve)
+                        if budget_policy.refilling or potential < budget_policy.target:
+                            # Rebudget a blocked tail once, then hold. Do not
+                            # rebuild the same million-file queue every 5 s.
+                            budget_policy.hold(potential)
                     break
                 try:
                     worker = start_cache_worker(chunk, cfg)
@@ -5158,6 +5203,8 @@ def run_supervisor() -> int:
                     fill_state = launch_blocked or "loading selected files"
                 elif failed_until:
                     fill_state = "retrying failed files"
+                elif not budget_policy.refilling:
+                    fill_state = "holding cache; waiting for sustained refill headroom"
                 elif cache_goal + 256*MIB < budget:
                     if planner_status.get("phase") in ("bootstrap", "reconciling", "paused"):
                         fill_state = "waiting for additional discovery"
@@ -5178,6 +5225,10 @@ def run_supervisor() -> int:
                     "cache_goal_gib": bytes_to_gib(cache_goal),
                     "fill_state": fill_state, "candidate_gib": bytes_to_gib(candidate_bytes),
                     "capacity_gap_gib": bytes_to_gib(max(0, budget-actual)),
+                    "refill_state": "filling" if budget_policy.refilling else "holding",
+                    "refill_resume_available_gib": bytes_to_gib(above),
+                    "refill_headroom_stable_seconds": round(now-budget_policy.high_since, 2) if budget_policy.high_since is not None else 0,
+                    "refill_cooldown_remaining_seconds": round(max(0, budget_policy.resume_not_before-now), 2),
                     "selected_gib": bytes_to_gib(requested), "owned_locked_gib": bytes_to_gib(actual),
                     "acknowledged_locked_gib": bytes_to_gib(sum(worker.locked for worker in workers if worker.ready.is_set())),
                     "inflight_gib": bytes_to_gib(inflight), "pending_chunks": len(pending_chunks),
@@ -5231,7 +5282,10 @@ def run_supervisor() -> int:
                         planner_retry = time.monotonic() + 1
                 except (OSError, ValueError, TypeError) as error:
                     last_error = "invalid configuration; continuing last valid settings: " + str(error)
-            time.sleep(0.1)
+            # Keep fast loading, but honor the intended 0.5-s memory monitor
+            # interval when idle/blocked instead of polling everything at 10 Hz.
+            busy = active_loading or not validated or incoming is not None or plan_changed
+            time.sleep(0.1 if busy else max(0.1, min(1.0, float(cfg.get("memory_monitor_interval_seconds", 0.5)))))
     finally:
         reader.stop.set()
         for worker in workers:
@@ -5491,7 +5545,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.22.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.4.23.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -6906,7 +6960,7 @@ install_all() {
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.22. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.4.23. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
@@ -6950,7 +7004,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.22"
+  echo "RAM cache controller installer: v1.4.23"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
