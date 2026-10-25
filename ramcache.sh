@@ -61,7 +61,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.1"
+CONTROLLER_VERSION = "1.4.22"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -107,7 +107,7 @@ def validate_config(cfg: dict) -> None:
         cfg[key] = value
     counts = {"scan_worker_max", "metadata_worker_cap", "classification_worker_max",
               "warming_worker_max", "scan_rotational_worker_max", "vmtouch_chunk_max_paths",
-              "plan_max_files", "learning_pending_max", "learning_max_files", "max_pending_fs_events"}
+              "learning_pending_max", "max_pending_fs_events"}
     flags = {"learning_enabled", "learn_file_opens", "adaptive_memory_reserve", "stay_on_filesystem",
              "auto_include_common_app_paths", "prefer_fanotify_filesystem_watch",
              "watch_attribute_events", "low_ram_profile_enabled"}
@@ -228,19 +228,12 @@ LOW_RAM_PROFILE_DEFAULTS = {
     "target_relock_min_delta": "256M",
 
     "steam_htmlcache_budget_bytes": "768M",
-    "steam_htmlcache_max_files": 16384,
     "firefox_webcache_budget_bytes": "1G",
-    "firefox_webcache_max_files": 32768,
     "chromium_webcache_budget_bytes": "1G",
-    "chromium_webcache_max_files": 32768,
     "electron_webcache_budget_bytes": "512M",
-    "electron_webcache_max_files": 16384,
     "desktop_shader_cache_budget_bytes": "256M",
-    "desktop_shader_cache_max_files": 8192,
     "desktop_compiled_cache_budget_bytes": "64M",
-    "desktop_compiled_cache_max_files": 8192,
     "app_catalog_budget_bytes": "64M",
-    "app_catalog_max_files": 4096,
     "hytale_world_budget_bytes": "1G",
     "vrchat_content_cache_budget_bytes": "1G",
 
@@ -2263,10 +2256,12 @@ def cache_budget_caps(cfg: dict) -> dict[str, int]:
 
 
 def cache_budget_file_caps(cfg: dict) -> dict[str, int]:
-    defaults = {"steam_htmlcache": 65536, "firefox_webcache": 131072,
-                "chromium_webcache": 131072, "electron_webcache": 65536,
-                "desktop_shader_cache": 32768, "desktop_compiled_cache": 32768, "app_catalog": 16384}
-    return {key: max(0, int(cfg.get(key + "_max_files", default))) for key, default in defaults.items()}
+    # Byte budgets are the defaults. Only an explicitly configured positive
+    # family count is a count limit; zero means unlimited.
+    families = ("steam_htmlcache", "firefox_webcache", "chromium_webcache", "electron_webcache",
+                "desktop_shader_cache", "desktop_compiled_cache", "app_catalog")
+    return {key: int(cfg[key + "_max_files"]) for key in families
+            if int(cfg.get(key + "_max_files", 0)) > 0}
 
 
 def cache_budget_key(rec: FileRec) -> Optional[str]:
@@ -3097,12 +3092,52 @@ def memory_watermarks(meminfo: dict, cfg: dict) -> tuple[int, int, int]:
     return floor, reserve, max(reserve + 128 * MIB, min(above, int(total * 0.5)))
 
 
-def plan_file_limit(cfg: dict, total_ram: int) -> int:
-    if "plan_max_files" in cfg:
-        return max(1, int(cfg["plan_max_files"]))
-    # Preserve a bound on metadata, but let 64/128 GiB machines select more
-    # files instead of silently stopping at the same 350k-file ceiling.
-    return max(120000, min(2000000, int(total_ram // MIB) * 8))
+def metadata_budget(cfg: dict, total_ram: int) -> int:
+    # 16/32/64/128 GiB -> 4/4/7/14 GiB. An allowance, not an allocation;
+    # large-memory machines can handle correspondingly larger working sets.
+    automatic = min(total_ram // 4, max(4 * GIB, total_ram * 7 // 64))
+    explicit = parse_size(cfg.get("metadata_budget_bytes"))
+    return max(MIB, min(explicit if explicit is not None else automatic, total_ram // 2))
+
+
+def selection_metadata_budget(cfg: dict, total_ram: int) -> int:
+    # Include old/new plan overlap and reconciliation structures in each
+    # record's charge, leaving 40% for discovery, SQLite and bounded IPC.
+    return metadata_budget(cfg, total_ram) * 3 // 5
+
+
+def record_metadata_bytes(path, budget="") -> int:
+    # Conservative allowance for FileRec, scalar objects, keys/sets, plan
+    # overlap, and the live JSONL representation. Charge long paths by bytes.
+    return 1536 + 6 * len(os.fsencode(path)) + 2 * len(budget)
+
+
+def explicit_plan_file_limit(cfg: dict) -> Optional[int]:
+    value = int(cfg.get("plan_max_files", 0))
+    return value if value > 0 else None
+
+
+def pop_fitting_chunk(pending, free_room, inflight, inflight_limit):
+    # Rotate deferred chunks instead of letting one large file block every
+    # smaller, higher-value read behind it. Bounded work per control tick.
+    oversized = None
+    for _ in range(min(len(pending), 128)):
+        chunk = pending.popleft()
+        cost = sum(page_bytes(rec.size) for rec in chunk)
+        if cost <= free_room and (inflight == 0 or inflight + cost <= inflight_limit):
+            if cost > inflight_limit and oversized is None:
+                oversized = (chunk, cost)
+                continue
+            if cost > inflight_limit:
+                pending.append(chunk)
+                continue
+            if oversized is not None:
+                pending.appendleft(oversized[0])
+            return chunk, cost
+        pending.append(chunk)
+    if oversized is not None:
+        return oversized
+    return None, 0
 
 
 def replacement_batch(workers, desired_keys, cfg, retired):
@@ -3139,8 +3174,12 @@ class PressurePolicy:
         psi = parse_memory_psi_totals()
         delta = tuple(max(0, a - b) for a, b in zip(psi, self.psi))
         self.psi = psi
-        stalled = (delta[0] >= int(cfg.get("psi_memory_some_stall_threshold_us", 100000))
+        psi_stalled = (delta[0] >= int(cfg.get("psi_memory_some_stall_threshold_us", 100000))
                    or delta[1] >= int(cfg.get("psi_memory_full_stall_threshold_us", 20000)))
+        # System-wide PSI can include unrelated reclaim/compaction. It must
+        # not drain this cache indefinitely while our effective headroom is
+        # ample (parse_meminfo already accounts for cgroup limits).
+        stalled = psi_stalled and available < reserve + max(512 * MIB, reserve // 4)
         release = 0
         self.reason = "available"
         if available < floor:
@@ -3321,6 +3360,9 @@ def start_cache_worker(records: list[FileRec], cfg: dict) -> CacheWorker:
                     if match:
                         worker.reported_pages = int(match.group(1))
                         worker.ready.set()
+                        # vmtouch sleeps after this final acknowledgement. Do
+                        # not keep one Python polling thread alive per locker.
+                        return
                     elif b"WARNING:" in line or b"FATAL:" in line or b"ERROR:" in line:
                         worker.warnings += 1
                         worker.diagnostic = line.decode("utf-8", "backslashreplace")[:1024]
@@ -3334,8 +3376,19 @@ def start_cache_worker(records: list[FileRec], cfg: dict) -> CacheWorker:
 
     worker.reader = threading.Thread(target=drain, daemon=True, name="cache-ack")
     worker.feeder = threading.Thread(target=feed, daemon=True, name="cache-feed")
-    worker.reader.start()
-    worker.feeder.start()
+    reader_started = False
+    try:
+        worker.reader.start()
+        reader_started = True
+        worker.feeder.start()
+    except BaseException:
+        worker.stop_event.set()
+        stop_proc(proc)
+        if reader_started:
+            worker.reader.join(timeout=1)
+        else:
+            os.close(master)
+        raise
     return worker
 
 
@@ -3429,21 +3482,59 @@ def classify_batch(items):
     return rows
 
 
+class BufferedInventoryConnection(sqlite3.Connection):
+    """Keep dirty pager pages in RAM; only InventoryDB.checkpoint commits them.
+
+    Clean inventory pages can be read/evicted on demand. cache_spill=OFF is
+    essential: cache_size alone otherwise permits writes before our checkpoint.
+    Ordinary planner commit calls only delimit logical batches in this mode.
+    """
+    deferred = False
+
+    def commit(self):
+        if not self.deferred:
+            super().commit()
+
+    def flush(self):
+        super().commit()
+
+
+def inventory_is_corrupt(error):
+    # A busy database, full disk or I/O error must never trigger renaming and
+    # rebuilding an otherwise valid inventory. Extended codes share a low byte.
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 255) in (11, 26)  # SQLITE_CORRUPT, SQLITE_NOTADB
+    # Python 3.10 does not expose sqlite_errorcode. SQLite's own diagnostic
+    # text is the compatibility fallback, not a broad OperationalError catch.
+    return str(error) in ("database disk image is malformed", "file is not a database")
+
+
 class InventoryDB:
-    def __init__(self, path: Path, *, volatile=False):
+    def __init__(self, path: Path, *, volatile=False, cfg=None):
         self.path = path
         self.volatile = volatile
+        self.cfg = cfg or {}
         self.force_publish = True
         self.last_checkpoint = 0.0
         self.last_checkpoint_rows = 0
         self.last_checkpoint_seconds = 0.0
+        self.last_checkpoint_reason = "none"
+        self.memory_baseline = process_memory(os.getpid())[1]
+        total_ram = parse_meminfo()["MemTotal"] if volatile else 16 * GIB
+        self.metadata_allowance = metadata_budget(self.cfg, total_ram)
+        self.page_cache_bytes = min(512 * MIB, max(32 * MIB, self.metadata_allowance // 16))
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.connection = sqlite3.connect(path, timeout=5)
+        self.connection = sqlite3.connect(path, timeout=5, factory=BufferedInventoryConnection)
         self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA synchronous=NORMAL")
-        self.connection.execute("PRAGMA cache_size=-16384")
-        self.connection.execute("PRAGMA temp_store=FILE")
-        self.connection.execute("PRAGMA wal_autocheckpoint=2048")
+        self.connection.execute("PRAGMA synchronous=FULL")
+        self.connection.execute(f"PRAGMA cache_size=-{self.page_cache_bytes // KIB}")
+        self.connection.execute("PRAGMA temp_store=MEMORY")
+        self.connection.execute("PRAGMA cache_spill=OFF")
+        self.connection.execute("PRAGMA secure_delete=OFF")
+        # Checkpoint explicitly after a batched commit, rather than in the
+        # middle of ordinary discovery/learning work.
+        self.connection.execute("PRAGMA wal_autocheckpoint=0")
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, DB_SCHEMA):
             raise ValueError(f"unsupported inventory schema {version}")
@@ -3478,24 +3569,13 @@ class InventoryDB:
                 k0 REAL, k1 REAL, k2 REAL, k3 REAL, k4 REAL
             );
             CREATE INDEX IF NOT EXISTS saved_plan_order ON saved_plan(k0,k1,k2,k3,k4,path);
+            CREATE TABLE IF NOT EXISTS scan_marks (
+                path BLOB PRIMARY KEY, generation INTEGER NOT NULL, dir_token INTEGER NOT NULL
+            );
         """)
         self.connection.execute(f"PRAGMA user_version={DB_SCHEMA}")
         self.connection.commit()
         os.chmod(path, 0o600)
-        if volatile:
-            # Keep the existing SQLite representation and indexes, but perform
-            # normal discovery/learning transactions exclusively in DRAM.
-            durable = self.connection
-            self.connection = sqlite3.connect(":memory:", timeout=5)
-            try:
-                durable.backup(self.connection)
-            finally:
-                durable.close()
-            self.connection.execute("PRAGMA journal_mode=MEMORY")
-            self.connection.execute("PRAGMA temp_store=MEMORY")
-            self.connection.execute("ATTACH DATABASE ? AS durable", (str(path),))
-            self.connection.execute("PRAGMA durable.synchronous=FULL")
-            self.connection.execute("PRAGMA durable.wal_autocheckpoint=2048")
         self.tables = {name: key for name, key in (
             ("files", "path"), ("usage", "path"), ("todo", "path"),
             ("visited", "path"), ("dirty", "path"), ("meta", "key"), ("saved_plan", "path"))}
@@ -3507,10 +3587,19 @@ class InventoryDB:
             ) WITHOUT ROWID;
             CREATE TEMP TABLE selection_dirty (path BLOB PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE plan_members (path BLOB PRIMARY KEY) WITHOUT ROWID;
+            CREATE TEMP TABLE scan_seen (
+                path BLOB PRIMARY KEY, generation INTEGER NOT NULL, dir_token INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TEMP TABLE usage_size (bytes INTEGER NOT NULL);
+            INSERT INTO usage_size SELECT coalesce(sum(2*length(path)+192),0) FROM usage;
+            CREATE TEMP TRIGGER usage_size_insert AFTER INSERT ON main.usage BEGIN
+                UPDATE usage_size SET bytes=bytes+2*length(NEW.path)+192; END;
+            CREATE TEMP TRIGGER usage_size_delete AFTER DELETE ON main.usage BEGIN
+                UPDATE usage_size SET bytes=bytes-2*length(OLD.path)-192; END;
         """)
         if volatile:
-            # One dirty key per row, regardless of how often it changes between
-            # checkpoints. No durable connection is modified by these triggers.
+            # One RAM dirty key per row, regardless of update frequency.
+            # No row changes are committed to storage until checkpoint().
             for table, key in self.tables.items():
                 different = " OR ".join(f"OLD.{col} IS NOT NEW.{col}" for col in self.columns[table])
                 for event, ref in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
@@ -3529,56 +3618,60 @@ class InventoryDB:
                 WHERE NOT EXISTS (SELECT 1 FROM selection_dirty WHERE path={ref}.path); END""")
         self.connection.execute("UPDATE todo SET active=0 WHERE active<>0")
         self.connection.commit()
+        self.connection.deferred = volatile
 
     def selection_changed(self):
         return self.force_publish or self.connection.execute("SELECT 1 FROM selection_dirty LIMIT 1").fetchone() is not None
 
-    def checkpoint(self):
-        """Atomically persist only the final changed rows, never a full backup."""
+    def checkpoint(self, reason="periodic"):
+        """Commit dirty SQLite pages in one batch, then release clean buffers."""
         self.connection.commit()
         if not self.volatile:
             return 0
-        count = self.connection.execute("SELECT count(*) FROM checkpoint_dirty").fetchone()[0]
-        if not count:
-            return 0
         started = time.monotonic()
-        written = 0
-        resumable_scan = self.meta("scan_pending", False)
+        before_marks = self.connection.total_changes
+        if self.meta("scan_pending", False):
+            generation = self.meta("generation", 0)
+            self.connection.execute("DELETE FROM scan_marks WHERE generation<>?", (generation,))
+            self.connection.execute("""INSERT INTO scan_marks SELECT * FROM scan_seen WHERE true
+                ON CONFLICT(path) DO UPDATE SET generation=excluded.generation,dir_token=excluded.dir_token
+                WHERE scan_marks.generation<>excluded.generation OR scan_marks.dir_token<>excluded.dir_token""")
+        else:
+            self.connection.execute("DELETE FROM scan_marks")
+        mark_changes = self.connection.total_changes - before_marks
+        written = self.connection.execute("SELECT count(*) FROM checkpoint_dirty").fetchone()[0] + mark_changes
+        # A failed commit leaves its transaction/dirty pages available for retry.
+        self.connection.flush()
+        self.connection.execute("DELETE FROM checkpoint_dirty")
+        self.connection.execute("DELETE FROM scan_seen")
+        self.connection.flush()  # TEMP-only transaction, no inventory-page writes.
+        self.connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        self.connection.execute("PRAGMA shrink_memory")
+        # SQLite releases pages, but glibc may retain the heap until trimmed.
         try:
-            self.connection.execute("BEGIN IMMEDIATE")
-            for table, key in self.tables.items():
-                cols = self.columns[table]
-                deleted = self.connection.execute(f"""DELETE FROM durable.{table}
-                    WHERE {key} IN (SELECT key FROM checkpoint_dirty WHERE kind=?)
-                    AND NOT EXISTS (SELECT 1 FROM main.{table} m WHERE m.{key}=durable.{table}.{key})""", (table,))
-                written += deleted.rowcount
-                updates = ",".join(f"{col}=excluded.{col}" for col in cols if col != key)
-                compared = [col for col in cols if col != key]
-                if table == "files" and not resumable_scan:
-                    # After a completed reconciliation, per-file scan marks
-                    # need not be durable: the next scan starts a new generation.
-                    # Preserve them for incomplete scans so resume remains safe.
-                    compared = [col for col in compared if col not in ("seen", "dir_token")]
-                different = " OR ".join(f"{table}.{col} IS NOT excluded.{col}" for col in compared)
-                conflict = f"DO UPDATE SET {updates} WHERE {different}" if updates else "DO NOTHING"
-                updated = self.connection.execute(f"""INSERT INTO durable.{table} ({','.join(cols)})
-                    SELECT {','.join('m.'+col for col in cols)} FROM main.{table} m
-                    JOIN checkpoint_dirty d ON d.key=m.{key} WHERE d.kind=?
-                    ON CONFLICT({key}) {conflict}""", (table,))
-                written += updated.rowcount
-            self.connection.execute("DELETE FROM checkpoint_dirty")
-            self.connection.commit()
-        except BaseException:
-            self.connection.rollback()
-            raise
+            ctypes.CDLL(None).malloc_trim(0)
+        except (AttributeError, OSError):
+            pass
         self.last_checkpoint = time.time()
         self.last_checkpoint_rows = written
         self.last_checkpoint_seconds = time.monotonic() - started
+        self.last_checkpoint_reason = reason
         return written
+
+    def memory_checkpoint_needed(self):
+        # Dirty-page accumulation is allowed during bootstrap, bounded by RAM
+        # rather than file count. Exceptional large scans may checkpoint early.
+        anon = process_memory(os.getpid())[1]
+        dirty = self.connection.execute("SELECT 1 FROM checkpoint_dirty LIMIT 1").fetchone()
+        meminfo = parse_meminfo()
+        _, reserve, _ = memory_watermarks(meminfo, self.cfg)
+        low_headroom = meminfo.get("MemAvailable", meminfo["MemTotal"]) < reserve
+        return bool(dirty and (anon > self.memory_baseline + self.metadata_allowance * 2 // 5
+                              or (low_headroom and anon > self.memory_baseline + 64 * MIB)))
 
     def close(self):
         try:
-            self.checkpoint()
+            self.checkpoint(reason="shutdown")
         finally:
             self.connection.close()
 
@@ -3594,11 +3687,16 @@ class InventoryDB:
             [roots, cfg.get("exclude_prefixes", []), cfg.get("stay_on_filesystem", True), POLICY_VERSION],
             sort_keys=True).encode()).hexdigest()
         if resume and self.meta("scan_pending", False) and self.meta("scan_fingerprint") == fingerprint:
+            # Import an interrupted scan written by 1.4.0-1.4.2.
+            if not self.connection.execute("SELECT 1 FROM scan_marks LIMIT 1").fetchone():
+                self.connection.execute("INSERT INTO scan_marks SELECT path,seen,dir_token FROM files WHERE seen=?",
+                                        (self.meta("generation", 1),))
             return self.meta("generation", 1)
         generation = int(self.meta("generation", 0)) + 1
         self.set_meta("generation", generation)
         self.set_meta("scan_pending", True)
         self.set_meta("scan_fingerprint", fingerprint)
+        self.connection.execute("DELETE FROM scan_seen")
         self.connection.execute("DELETE FROM todo")
         for root in roots:
             dev = safe_dev(root)
@@ -3626,6 +3724,14 @@ class InventoryDB:
         end = prefix[:-1] + b"0"
         self.connection.execute("DELETE FROM files WHERE path=? OR (path>=? AND path<?)", (raw, prefix, end))
         self.connection.execute("DELETE FROM usage WHERE path=? OR (path>=? AND path<?)", (raw, prefix, end))
+        for table in ("visited", "todo", "dirty", "scan_seen", "scan_marks"):
+            self.connection.execute(f"DELETE FROM {table} WHERE path=? OR (path>=? AND path<?)", (raw, prefix, end))
+
+    def invalidate_directory(self, path):
+        raw = os.fsencode(os.path.normpath(path))
+        prefix = raw.rstrip(b"/") + b"/"
+        self.connection.execute("DELETE FROM visited WHERE path=? OR (path>=? AND path<?)",
+                                (raw, prefix, prefix[:-1] + b"0"))
 
     def prepare(self, records, generation, *, force=False, dir_token=0):
         changed = []
@@ -3634,12 +3740,21 @@ class InventoryDB:
             row = self.connection.execute(
                 "SELECT size,dev,ino,mtime_ns,ctime_ns FROM files WHERE path=?", (raw,)).fetchone()
             if not force and row == (rec.size, rec.dev, rec.ino, rec.mtime_ns, rec.ctime_ns):
-                self.connection.execute("UPDATE files SET seen=?,dir_token=CASE WHEN ?<>0 THEN ? ELSE dir_token END WHERE path=?",
-                                        (generation, dir_token, dir_token, raw))
+                self.mark_seen(raw, generation, dir_token)
                 continue
             use = self.connection.execute("SELECT hits,last_use FROM usage WHERE path=?", (raw,)).fetchone()
             changed.append((rec, *(use or (0, 0))))
         return changed
+
+    def mark_seen(self, raw, generation, token):
+        if not token:
+            saved = self.connection.execute("SELECT dir_token FROM scan_marks WHERE path=? AND generation=?",
+                                            (raw, generation)).fetchone()
+            token = saved[0] if saved else 0
+        self.connection.execute("""INSERT INTO scan_seen VALUES (?,?,?) ON CONFLICT(path) DO UPDATE SET
+            generation=excluded.generation,
+            dir_token=CASE WHEN excluded.dir_token<>0 THEN excluded.dir_token ELSE scan_seen.dir_token END""",
+            (raw, generation, token))
 
     def store(self, rows, generation, dir_token=0):
         for rec, priority, budget, unit in rows:
@@ -3648,16 +3763,22 @@ class InventoryDB:
                 self.connection.execute("DELETE FROM files WHERE path=?", (raw,))
                 continue
             token = dir_token.get(os.path.dirname(rec.path), 0) if isinstance(dir_token, dict) else dir_token
+            self.mark_seen(raw, generation, token)
             self.connection.execute("""INSERT INTO files VALUES
                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
                 parent=excluded.parent,size=excluded.size,stamp=excluded.stamp,mode=excluded.mode,
                 dev=excluded.dev,ino=excluded.ino,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,
                 k0=excluded.k0,k1=excluded.k1,k2=excluded.k2,k3=excluded.k3,k4=excluded.k4,
-                budget=excluded.budget,unit=excluded.unit,seen=excluded.seen,
-                dir_token=CASE WHEN excluded.dir_token<>0 THEN excluded.dir_token ELSE files.dir_token END""", (
+                budget=excluded.budget,unit=excluded.unit
+                WHERE files.size IS NOT excluded.size OR files.stamp IS NOT excluded.stamp
+                OR files.mode IS NOT excluded.mode OR files.dev IS NOT excluded.dev OR files.ino IS NOT excluded.ino
+                OR files.mtime_ns IS NOT excluded.mtime_ns OR files.ctime_ns IS NOT excluded.ctime_ns
+                OR files.k0 IS NOT excluded.k0 OR files.k1 IS NOT excluded.k1 OR files.k2 IS NOT excluded.k2
+                OR files.k3 IS NOT excluded.k3 OR files.k4 IS NOT excluded.k4
+                OR files.budget IS NOT excluded.budget OR files.unit IS NOT excluded.unit""", (
                     raw, os.fsencode(os.path.dirname(rec.path)), rec.size, rec.mtime, rec.mode,
                     rec.dev, rec.ino, rec.mtime_ns, rec.ctime_ns, *priority,
-                    budget, os.fsencode(unit), generation, token))
+                    budget, os.fsencode(unit), 0, 0))
 
     def observe(self, records: list[tuple[FileRec, str]], generation, dir_tokens=None):
         now = time.time()
@@ -3672,7 +3793,8 @@ class InventoryDB:
             if previous:
                 hits += previous[0] * (0.5 ** (max(0, now - previous[1]) / (14 * 86400)))
             hits = min(64.0, hits)
-            self.connection.execute("INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?)",
+            self.connection.execute("""INSERT INTO usage VALUES (?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+                hits=excluded.hits,last_use=excluded.last_use,bucket=excluded.bucket,app=excluded.app""",
                                     (raw, hits, now, bucket, app))
             changed.append((rec, hits, now))
         self.store(classify_batch(changed), generation, dir_tokens or 0)
@@ -3703,9 +3825,12 @@ class InventoryDB:
             self.connection.execute("DELETE FROM usage WHERE last_use<?", (time.time() - 120 * 86400,))
         return len(rows)
 
-    def trim_usage(self, maximum=250000):
-        count = self.connection.execute("SELECT count(*) FROM usage").fetchone()[0]
-        excess = min(256, max(0, count - maximum))
+    def trim_usage(self, maximum=None, *, byte_budget=None):
+        size = self.connection.execute("SELECT bytes FROM usage_size").fetchone()[0]
+        excess = 256 if byte_budget is not None and size > byte_budget else 0
+        if maximum:
+            count = self.connection.execute("SELECT count(*) FROM usage").fetchone()[0]
+            excess = max(excess, min(256, max(0, count - maximum)))
         if not excess:
             return 0
         rows = self.connection.execute("""SELECT u.path,f.size,f.stamp,f.mode,f.dev,f.ino,f.mtime_ns,f.ctime_ns
@@ -3716,14 +3841,17 @@ class InventoryDB:
                 self.connection.execute("UPDATE files SET k0=?,k1=?,k2=?,k3=?,k4=? WHERE path=?",
                                         (*priority, os.fsencode(rec.path)))
         self.connection.executemany("DELETE FROM usage WHERE path=?", [(row[0],) for row in rows])
-        return excess
+        return len(rows)
 
     def publish(self, cfg: dict, roots: list[str], *, reason: str):
         """Stream from the priority index. No all-inventory Python list/sort."""
         total_ram = parse_meminfo()["MemTotal"]
         limit = min(parse_size(cfg.get("plan_budget_bytes")) or int(total_ram * 0.95),
                     int(total_ram * 1.25))
-        max_files = plan_file_limit(cfg, total_ram)
+        max_files = explicit_plan_file_limit(cfg)
+        metadata_limit = selection_metadata_budget(cfg, total_ram)
+        metadata_used = 0
+        resource_skipped = density_deferred = False
         caps, file_caps = cache_budget_caps(cfg), cache_budget_file_caps(cfg)
         used, counts, units, inodes = {}, {}, {}, set()
         chosen_units = set()
@@ -3750,7 +3878,15 @@ class InventoryDB:
                     f.k0,f.k1,f.k2,f.k3,f.k4,f.budget,f.unit,s.record,d.path FROM files f
                     LEFT JOIN saved_plan s ON s.path=f.path LEFT JOIN selection_dirty d ON d.path=f.path
                     ORDER BY f.k0,f.k1,f.k2,f.k3,f.k4,f.path"""
-                for row in self.connection.execute(query):
+                def candidates():
+                    yield from ((False, row) for row in self.connection.execute(query))
+                    if density_deferred:
+                        # If no denser candidates filled the byte budget, use
+                        # the remaining metadata allowance for deferred files.
+                        fallback = query.replace("ORDER BY", "WHERE NOT EXISTS (SELECT 1 FROM plan_members p WHERE p.path=f.path) ORDER BY")
+                        yield from ((True, row) for row in self.connection.execute(fallback))
+
+                for fallback, row in candidates():
                     raw, size, stamp, mode, dev, ino, mtime_ns, ctime_ns, *tail = row
                     path_text = os.fsdecode(raw)
                     if not cache_path_allowed(path_text, cfg, roots):
@@ -3762,6 +3898,16 @@ class InventoryDB:
                     if byte_count + cost > limit:
                         continue
                     priority, budget, unit = tuple(tail[:5]), tail[5], tail[6]
+                    metadata_cost = record_metadata_bytes(path_text, budget)
+                    if metadata_used + metadata_cost > metadata_limit:
+                        resource_skipped = True
+                        continue
+                    if (not fallback and metadata_used >= metadata_limit // 2
+                            and cost * (metadata_limit - metadata_used) < metadata_cost * (limit - byte_count)):
+                        # Reserve byte coverage when bookkeeping is expensive
+                        # relative to data. No count or fixed file-size cutoff.
+                        density_deferred = True
+                        continue
                     if budget:
                         budget_cost = cost
                         if budget == "vrchat_content_cache":
@@ -3771,7 +3917,7 @@ class InventoryDB:
                                 budget_cost = 0
                         if used.get(budget, 0) + budget_cost > caps.get(budget, limit):
                             continue
-                        if counts.get(budget, 0) >= file_caps.get(budget, max_files):
+                        if budget in file_caps and counts.get(budget, 0) >= file_caps[budget]:
                             continue
                         used[budget] = used.get(budget, 0) + budget_cost
                         counts[budget] = counts.get(budget, 0) + 1
@@ -3795,8 +3941,9 @@ class InventoryDB:
                             k2=excluded.k2,k3=excluded.k3,k4=excluded.k4 WHERE saved_plan.record<>excluded.record""",
                             (raw, line, *priority))
                     byte_count += cost
+                    metadata_used += metadata_cost
                     count += 1
-                    if count >= max_files or byte_count >= limit:
+                    if (max_files is not None and count >= max_files) or byte_count >= limit:
                         break
                 output.flush()
                 if not self.volatile:
@@ -3824,7 +3971,10 @@ class InventoryDB:
             if os.path.exists(temp):
                 os.unlink(temp)
         return {"plan_files": count, "plan_bytes": byte_count, "plan_generation": header["generation"],
-                "plan_file_limit": max_files, "plan_file_limit_reached": count >= max_files}
+                "plan_file_limit": max_files, "plan_file_limit_reached": max_files is not None and count >= max_files,
+                "plan_metadata_bytes": metadata_used, "plan_metadata_budget_bytes": metadata_limit,
+                "plan_metadata_limited": resource_skipped,
+                "plan_budget_bytes": limit}
 
 
 class DirectoryScanner:
@@ -3941,15 +4091,17 @@ def run_planner() -> int:
     STATE_PATH.mkdir(parents=True, exist_ok=True, mode=0o700)
     db_path = STATE_PATH / "inventory.sqlite3"
     try:
-        db = InventoryDB(db_path, volatile=True)
-    except (sqlite3.DatabaseError, ValueError):
+        db = InventoryDB(db_path, volatile=True, cfg=cfg)
+    except sqlite3.DatabaseError as error:
+        if not inventory_is_corrupt(error):
+            raise
         logging.exception("saved inventory could not be opened; rebuilding metadata")
         suffix = ".unreadable-" + str(int(time.time()))
         for extension in ("", "-wal", "-shm"):
             source = Path(str(db_path) + extension)
             if source.exists():
                 source.rename(str(source) + suffix)
-        db = InventoryDB(db_path, volatile=True)
+        db = InventoryDB(db_path, volatile=True, cfg=cfg)
     # State survives interruption at directory granularity. Restat selected
     # files in the supervisor before warming, then reconcile the rest here.
     first_install = not db.meta("saved_plan_header") and not (STATE_PATH / "startup-plan.jsonl").exists()
@@ -3991,6 +4143,9 @@ def run_planner() -> int:
     errors = 0
     last_full_scan = db.meta("last_full_scan", 0)
     inventory_count = db.count()
+    # Reuse the full persisted inventory immediately, including candidates
+    # beyond an older saved plan's ceiling, while reconciliation proceeds.
+    changed = int(inventory_count > 0)
     last_count = time.monotonic()
     plan_info = {"plan_files": 0, "plan_bytes": 0}
     phase = "reconciling" if not first_install else "bootstrap"
@@ -4003,7 +4158,10 @@ def run_planner() -> int:
     checkpoint_interval = max(60, float(cfg.get("persistence_interval_seconds", 1800)))
     checkpoint_due = time.monotonic() + checkpoint_interval
     checkpoint_error = ""
-    initial_checkpoint_pending = first_install
+    initial_checkpoint_pending = not bool(last_full_scan)
+    initial_checkpoint_retry = 0.0
+    last_memory_checkpoint_check = 0.0
+    last_memory_checkpoint_attempt = -60.0
     started = time.monotonic()
     try:
         while RUNNING:
@@ -4073,12 +4231,15 @@ def run_planner() -> int:
                     continue
                 raw = os.fsencode(directory)
                 if success:
-                    db.connection.execute("DELETE FROM files WHERE parent=? AND dir_token<>?",
-                                          (raw, directory_tokens.get(directory, 0)))
+                    db.connection.execute("""DELETE FROM files WHERE parent=? AND coalesce(
+                        (SELECT s.dir_token FROM scan_seen s WHERE s.path=files.path),
+                        (SELECT s.dir_token FROM scan_marks s WHERE s.path=files.path AND s.generation=?),-1)<>?""",
+                                          (raw, generation, directory_tokens.get(directory, 0)))
                 else:
                     # Preserve old entries below a temporarily unavailable path.
                     prefix = raw.rstrip(b"/") + b"/"
-                    db.connection.execute("UPDATE files SET seen=? WHERE path>=? AND path<?",
+                    db.connection.execute("""INSERT INTO scan_seen SELECT path,?,0 FROM files
+                        WHERE path>=? AND path<? ON CONFLICT(path) DO UPDATE SET generation=excluded.generation""",
                                           (generation, prefix, prefix[:-1] + b"0"))
                     errors += 1
                 db.connection.execute("INSERT OR REPLACE INTO visited VALUES (?,?)", (raw, generation))
@@ -4131,7 +4292,9 @@ def run_planner() -> int:
             if not paused:
                 changed += db.refresh_usage_priorities()
                 if now - last_usage_trim >= 60:
-                    trimmed = db.trim_usage(max(1000, int(cfg.get("learning_max_files", 250000))))
+                    total_ram = parse_meminfo()["MemTotal"]
+                    learning_bytes = parse_size(cfg.get("learning_budget_bytes")) or metadata_budget(cfg, total_ram) // 16
+                    trimmed = db.trim_usage(int(cfg.get("learning_max_files", 0)), byte_budget=learning_bytes)
                     changed += trimmed
                     if not trimmed:
                         last_usage_trim = now
@@ -4157,7 +4320,7 @@ def run_planner() -> int:
                     changed += 1
                 for path in compact_prefixes(directories):
                     if cache_path_allowed(path, cfg, roots) and os.path.isdir(path):
-                        db.connection.execute("DELETE FROM visited WHERE path=?", (os.fsencode(path),))
+                        db.invalidate_directory(path)
                         if path in scanner.active:
                             refresh_again.add(path)
                         dev = safe_dev(path)
@@ -4182,7 +4345,10 @@ def run_planner() -> int:
 
             pending = db.connection.execute("SELECT count(*) FROM todo").fetchone()[0]
             if scan_active and pending == 0 and not futures and not scanner.active:
-                db.connection.execute("DELETE FROM files WHERE seen<>?", (generation,))
+                db.connection.execute("""DELETE FROM files WHERE coalesce(
+                    (SELECT s.generation FROM scan_seen s WHERE s.path=files.path),
+                    (SELECT s.generation FROM scan_marks s WHERE s.path=files.path),-1)<>?""", (generation,))
+                db.connection.execute("DELETE FROM scan_seen")
                 last_full_scan = time.time()
                 db.set_meta("last_full_scan", last_full_scan)
                 db.set_meta("scan_pending", False)
@@ -4210,20 +4376,29 @@ def run_planner() -> int:
                     plan_info = db.publish(cfg, roots, reason=phase)
                 last_publish = now
                 changed = 0
-            if now >= checkpoint_due or (initial_checkpoint_pending and not scan_active):
+            memory_checkpoint = False
+            if now - last_memory_checkpoint_check >= 5 and now-last_memory_checkpoint_attempt >= 60:
+                memory_checkpoint = db.memory_checkpoint_needed()
+                last_memory_checkpoint_check = now
+            initial_checkpoint = initial_checkpoint_pending and not scan_active and now >= initial_checkpoint_retry
+            if now >= checkpoint_due or initial_checkpoint or memory_checkpoint:
+                if memory_checkpoint:
+                    last_memory_checkpoint_attempt = now
                 try:
                     if db.selection_changed():
                         plan_info = db.publish(cfg, roots, reason="checkpoint")
                         last_publish = now
                         changed = 0
-                    db.checkpoint()
+                    reason = "memory budget" if memory_checkpoint else ("initial scan" if initial_checkpoint_pending and not scan_active else "periodic")
+                    db.checkpoint(reason=reason)
                     checkpoint_due = time.monotonic() + checkpoint_interval
-                    initial_checkpoint_pending = False
+                    if not scan_active:
+                        initial_checkpoint_pending = False
                     checkpoint_error = ""
                 except (sqlite3.Error, OSError) as error:
                     checkpoint_error = str(error)
                     logging.exception("metadata checkpoint failed; live RAM state retained for retry")
-                    initial_checkpoint_pending = False
+                    initial_checkpoint_retry = now + 60
                     checkpoint_due = time.monotonic() + 60
             if now - last_commit > 2:
                 db.connection.commit()
@@ -4242,7 +4417,10 @@ def run_planner() -> int:
                     "learning_events": observer.events, "learning_dropped": observer.dropped,
                     "learning_error": observer.last_error, "scan_errors": errors, **plan_info,
                     "include_roots": roots, "storage_profile": resolve_scan_storage_profile(cfg),
-                    "inventory_storage": "memory", "persistence_interval_seconds": checkpoint_interval,
+                    "inventory_storage": "buffered; dirty pages in RAM", "persistence_interval_seconds": checkpoint_interval,
+                    "metadata_budget_gib": bytes_to_gib(db.metadata_allowance),
+                    "inventory_page_cache_mib": round(db.page_cache_bytes / MIB, 2),
+                    "last_checkpoint_reason": db.last_checkpoint_reason,
                     "last_checkpoint_epoch": db.last_checkpoint, "last_checkpoint_rows": db.last_checkpoint_rows,
                     "last_checkpoint_seconds": round(db.last_checkpoint_seconds, 3),
                     "checkpoint_error": checkpoint_error,
@@ -4620,16 +4798,22 @@ class PlanReader:
                     self.put(("begin", header))
                     batch, skipped, seen = [], 0, set()
                     index = 0
-                    maximum = plan_file_limit(self.cfg, parse_meminfo()["MemTotal"])
+                    maximum = explicit_plan_file_limit(self.cfg)
+                    metadata_limit = selection_metadata_budget(self.cfg, parse_meminfo()["MemTotal"])
+                    metadata_used = 0
                     for line in source:
                         if self.stop.is_set():
                             return
-                        if index >= maximum:
+                        if maximum is not None and index >= maximum:
                             break
                         index += 1
                         if len(line) > 65536:
                             raise ValueError("oversized startup plan record")
                         saved = record_from_list(json.loads(line))
+                        metadata_cost = record_metadata_bytes(saved.path, saved.budget)
+                        if metadata_used + metadata_cost > metadata_limit:
+                            skipped += 1
+                            continue
                         if not cache_path_allowed(saved.path, self.cfg, self.roots):
                             skipped += 1
                             continue
@@ -4646,6 +4830,7 @@ class PlanReader:
                                             actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
                                             tuple(priority[:5]), cache_budget_key(actual) or "")
                         seen.add((actual.dev, actual.ino))
+                        metadata_used += metadata_cost
                         batch.append(saved)
                         if len(batch) >= 512:
                             self.put(("batch", batch))
@@ -4679,7 +4864,7 @@ def choose_candidates(records, budget, cfg):
         if rec.budget:
             if used.get(rec.budget, 0) + cost > caps.get(rec.budget, budget):
                 continue
-            if counts.get(rec.budget, 0) >= file_caps.get(rec.budget, 350000):
+            if rec.budget in file_caps and counts.get(rec.budget, 0) >= file_caps[rec.budget]:
                 continue
             used[rec.budget] = used.get(rec.budget, 0) + cost
             counts[rec.budget] = counts.get(rec.budget, 0) + 1
@@ -4735,6 +4920,9 @@ def run_supervisor() -> int:
     last_reconcile = last_status = last_config = 0.0
     last_budget = 0
     cache_goal = 0
+    candidate_bytes = 0
+    incoming_bytes = 0
+    last_fill_progress = time.monotonic()
     plan_changed = False
     validated = False
     started = time.monotonic()
@@ -4757,6 +4945,7 @@ def run_supervisor() -> int:
                     worker.last_sample = now
                 if locked > worker.locked:
                     worker.last_progress = now
+                    last_fill_progress = now
                 worker.locked = locked
                 if worker.proc.poll() is not None or worker.failed.is_set():
                     workers.remove(worker)
@@ -4785,9 +4974,10 @@ def run_supervisor() -> int:
                     worker.failed.set()
                     worker.diagnostic = worker.diagnostic or "cache worker acknowledged fewer pages than requested; retrying this chunk"
                 if not ready:
-                    # Reserve the complete loading chunk until acknowledgement;
-                    # VmLck alone is not an I/O-completion signal.
-                    inflight += worker.requested
+                    # MemAvailable already reflects resident locked pages.
+                    # Reserve the remainder, avoiding double reservation of
+                    # partially loaded chunks near the usable-memory target.
+                    inflight += max(0, worker.requested - locked)
                     timeout = max(30, float(cfg.get("worker_progress_timeout_seconds", 120)))
                     if now - worker.last_progress > timeout:
                         worker.failed.set()
@@ -4797,9 +4987,11 @@ def run_supervisor() -> int:
                     worker.failed.set()
                     worker.diagnostic = "a loaded mapping lost locked pages; revalidating this worker"
                 owned_locked += locked
-            own_anon = process_memory(os.getpid())[1]
+            supervisor_anon = process_memory(os.getpid())[1]
+            planner_anon = 0
             if planner.poll() is None:
-                own_anon += process_memory(planner.pid)[1]
+                planner_anon = process_memory(planner.pid)[1]
+            own_anon = supervisor_anon + planner_anon
             release, pause = policy.evaluate(meminfo, cfg, owned_locked, own_anon)
             if release:
                 target = max(0, owned_locked - release)
@@ -4823,13 +5015,17 @@ def run_supervisor() -> int:
                     break
                 if kind == "begin":
                     incoming = []
+                    incoming_bytes = 0
                 elif kind == "batch" and incoming is not None:
                     incoming.extend(payload)
+                    incoming_bytes += sum(page_bytes(rec.size) for rec in payload)
                     if not validated:
                         records = incoming
+                        candidate_bytes = incoming_bytes
                         plan_changed = True
                 elif kind == "end" and incoming is not None:
                     records = incoming
+                    candidate_bytes = incoming_bytes
                     incoming = None
                     plan_generation = payload["generation"]
                     plan_skipped = payload["skipped"]
@@ -4848,14 +5044,21 @@ def run_supervisor() -> int:
             configured_max = parse_size(cfg.get("max_selection_budget_bytes"))
             if configured_max is not None:
                 budget = min(budget, configured_max)
+            if pending_chunks and not any(not w.ready.is_set() for w in workers) and now-last_fill_progress >= 5:
+                # Re-evaluate a blocked tail even if the change is smaller
+                # than the normal budget deadband; no permanent waiting state.
+                plan_changed = True
+                last_fill_progress = now
             if not pause and records and now - last_reconcile >= 1 and (
                     plan_changed or abs(budget - last_budget) >= 128 * MIB
                     or any(deadline <= now for deadline in failed_until.values())):
                 failed_until = {key: deadline for key, deadline in failed_until.items() if deadline > now}
                 desired = choose_candidates(records, budget, cfg)
                 cache_goal = sum(page_bytes(rec.size) for rec in desired)
-                desired_keys = {record_key(rec) for rec in desired}
                 desired_priorities = {record_key(rec): rec.priority for rec in desired}
+                # Reuse this mapping's keys instead of duplicating millions
+                # of identity tuples in a second set during reconciliation.
+                desired_keys = desired_priorities.keys()
                 replacements, replacements_pending = replacement_batch(workers, desired_keys, cfg, retired)
                 for worker in list(workers):
                     if all(record_key(rec) in desired_keys for rec in worker.records):
@@ -4888,13 +5091,13 @@ def run_supervisor() -> int:
             # desired cache grew by 8 GiB. Bounded outstanding I/O advances as
             # workers acknowledge completion, independent of target deadbands.
             launches = 0
+            launch_blocked = ""
             while pending_chunks and not pause and active_loading < loading_limit and launches < 2:
-                chunk = pending_chunks[0]
-                cost = sum(page_bytes(rec.size) for rec in chunk)
                 free_room = max(0, meminfo["MemAvailable"] - reserve - inflight)
-                if cost > free_room or (inflight > 0 and inflight + cost > inflight_limit):
+                chunk, cost = pop_fitting_chunk(pending_chunks, free_room, inflight, inflight_limit)
+                if chunk is None:
+                    launch_blocked = "outstanding I/O budget" if inflight else "insufficient headroom for remaining whole-file chunks"
                     break
-                pending_chunks.popleft()
                 try:
                     worker = start_cache_worker(chunk, cfg)
                     workers.append(worker)
@@ -4904,7 +5107,7 @@ def run_supervisor() -> int:
                     active_loading += 1
                     launches += 1
                     loading_peak = max(loading_peak, active_loading)
-                except OSError as error:
+                except (OSError, RuntimeError) as error:
                     failures += 1
                     last_error = str(error)
                     for rec in chunk:
@@ -4949,6 +5152,23 @@ def run_supervisor() -> int:
                 })
                 actual = sum(worker.locked for worker in workers)
                 requested = sum(worker.requested for worker in workers)
+                if pause:
+                    fill_state = "memory pressure or reserve"
+                elif pending_chunks or active_loading:
+                    fill_state = launch_blocked or "loading selected files"
+                elif failed_until:
+                    fill_state = "retrying failed files"
+                elif cache_goal + 256*MIB < budget:
+                    if planner_status.get("phase") in ("bootstrap", "reconciling", "paused"):
+                        fill_state = "waiting for additional discovery"
+                    elif planner_status.get("plan_file_limit_reached"):
+                        fill_state = "explicit user file limit reached"
+                    elif planner_status.get("plan_metadata_limited"):
+                        fill_state = "selection metadata budget reached"
+                    else:
+                        fill_state = "eligible plan exhausted"
+                else:
+                    fill_state = "usable-memory target reached"
                 payload = {
                     "controller_version": CONTROLLER_VERSION, "timestamp": int(time.time()),
                     "uptime_seconds": round(now - started, 2), "memory_profile": cfg.get("memory_profile", "normal"),
@@ -4956,6 +5176,8 @@ def run_supervisor() -> int:
                              ("warming" if pending_chunks or active_loading else ("degraded" if failed_until else "ready"))),
                     "target_locked_gib": bytes_to_gib(budget), "selected_files": sum(len(worker.records) for worker in workers),
                     "cache_goal_gib": bytes_to_gib(cache_goal),
+                    "fill_state": fill_state, "candidate_gib": bytes_to_gib(candidate_bytes),
+                    "capacity_gap_gib": bytes_to_gib(max(0, budget-actual)),
                     "selected_gib": bytes_to_gib(requested), "owned_locked_gib": bytes_to_gib(actual),
                     "acknowledged_locked_gib": bytes_to_gib(sum(worker.locked for worker in workers if worker.ready.is_set())),
                     "inflight_gib": bytes_to_gib(inflight), "pending_chunks": len(pending_chunks),
@@ -4971,6 +5193,8 @@ def run_supervisor() -> int:
                     "unevictable_gib": bytes_to_gib(meminfo.get("Unevictable", 0)),
                     "reserve_gib": bytes_to_gib(reserve), "pressure_reason": policy.reason,
                     "controller_anon_mib": round(own_anon / MIB, 2), "last_error": last_error,
+                    "supervisor_pid": os.getpid(), "supervisor_anon_mib": round(supervisor_anon/MIB,2),
+                    "planner_anon_mib": round(planner_anon/MIB,2),
                     "foreground_io_limited": io_busy,
                     "planner_pid": planner.pid, "planner_failures": planner_failures,
                     "planner_status_age_seconds": round(max(0, time.time() - planner_status.get("timestamp", time.time())), 2),
@@ -5230,7 +5454,7 @@ write_config() {
 import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 path = Path('/etc/ramcache-controller/config.json')
-defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":2,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"learning_max_files":250000,"persistence_interval_seconds":1800}''')
+defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","firefox_webcache_budget_bytes":"4G","chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":3,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800}''')
 legacy = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":10,"incremental_rescan_interval_seconds":300,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":96,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":30,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"4G","target_shrink_to_available_bytes":"6G","target_grow_above_available_bytes":"7G","target_grow_to_available_bytes":"6G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"8G","vmtouch_chunk_target_bytes":"1024M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{}}''')
 current = {}
 if path.exists():
@@ -5243,7 +5467,16 @@ if int(current.get('config_version', 1)) < 2:
     for key, value in defaults.items():
         if key in legacy and current.get(key) == legacy[key]:
             merged[key] = value
-merged['config_version'] = 2
+# Remove inherited automatic count limits. Non-default user overrides survive.
+if int(current.get('config_version', 1)) < 3:
+    old_counts = {'steam_htmlcache': 65536, 'firefox_webcache': 131072, 'chromium_webcache': 131072, 'electron_webcache': 65536, 'desktop_shader_cache': 32768, 'desktop_compiled_cache': 32768, 'app_catalog': 16384}
+    for family, old in old_counts.items():
+        key = family + '_max_files'
+        if current.get(key) == old:
+            merged.pop(key, None)
+    if current.get('learning_max_files') == 250000:
+        merged.pop('learning_max_files', None)
+merged['config_version'] = 3
 if current == merged:
     subprocess.run([sys.executable, sys.argv[1], '--config', str(path), '--check-config'], check=True, stdout=subprocess.DEVNULL)
     print('Existing configuration preserved.')
@@ -5258,7 +5491,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.1.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.4.22.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -5370,6 +5603,7 @@ ExecStart=$PYTHON_BIN /opt/ramcache-controller/ramcache_controller.py
 Restart=always
 RestartSec=5
 KillMode=control-group
+TasksMax=4096
 
 # All eligible CPUs are available; total background compute is capped at half
 # the machine. Bounded I/O and classification pools adapt to available CPUs.
@@ -6672,7 +6906,7 @@ install_all() {
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.1. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.4.22. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
@@ -6716,7 +6950,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.1"
+  echo "RAM cache controller installer: v1.4.22"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
