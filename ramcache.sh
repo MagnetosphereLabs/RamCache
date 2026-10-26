@@ -25,6 +25,7 @@ import errno
 import fcntl
 import hashlib
 import itertools
+import functools
 import multiprocessing
 import pwd
 import select
@@ -61,11 +62,11 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.24"
+CONTROLLER_VERSION = "1.4.25"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 _SCAN_STORAGE_PROFILE_CACHE: dict[tuple[str, ...], str] = {}
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +97,7 @@ def load_config() -> tuple[str, dict]:
     validate_config(cfg)
     effective = apply_memory_size_profile(cfg)
     validate_config(effective)
+    startup_steam_tools()
     return raw, effective
 
 
@@ -242,8 +244,6 @@ LOW_RAM_PROFILE_DEFAULTS = {
     # React quickly to smaller changes.
     "target_relock_min_delta": "256M",
 
-    "steam_htmlcache_budget_bytes": "768M",
-    "firefox_webcache_budget_bytes": "1G",
     "chromium_webcache_budget_bytes": "1G",
     "electron_webcache_budget_bytes": "512M",
     "desktop_shader_cache_budget_bytes": "256M",
@@ -1158,6 +1158,7 @@ RECENCY_FIRST_BUDGET_KEYS = {
     "app_catalog",
     "hytale_world",
     "vrchat_content_cache",
+    "discord_startup", "vrchat_startup", "warrobots_startup",
 }
 
 VIP_FULL_APP_PREFIXES = (
@@ -1549,8 +1550,338 @@ ELECTRON_USER_PATH_RE = re.compile(
 WEB_CACHE_FILE_MAX = 512 * MIB
 
 
+# Startup policy only. The scanner, saved-record schema, loader and holding
+# loop are unchanged. The small Steam manifest snapshot is memoized per process;
+# no recursive walk, per-file stat, timer, watcher or background task is added.
+STARTUP_BUDGETS = ("firefox_webcache", "steam_htmlcache", "discord_startup",
+                   "vrchat_startup", "warrobots_startup")
+STARTUP_RAM_BUDGETS = (
+    (20, ("2G", "2G", "1G", "1G", "1G")),
+    (28, ("4G", "3G", "2G", "1536M", "1536M")),
+    (48, ("6G", "5G", "2G", "2G", "2G")),
+    (float("inf"), ("8G", "6G", "2G", "3G", "3G")),
+)
+DISCORD_USER_RE = re.compile(
+    r"/(?:\.config|\.cache|config|cache)/(?:vesktop|discord(?:canary|ptb|development)?)(?=/|$)|"
+    r"/\.var/app/(?:dev\.vencord\.vesktop|com\.discordapp\.discord)(?=/|$)")
+DISCORD_CODE_RE = re.compile(
+    r"^/(?:opt|usr/lib|usr/lib64|usr/share)/(?:vesktop|discord(?:canary|ptb)?)(?=/|$)|"
+    r"/(?:flatpak/app|\.var/app)/(?:dev\.vencord\.vesktop|com\.discordapp\.discord)(?=/|$)")
+STEAM_TOOL_RE = re.compile(
+    r"/(?:compatibilitytools\.d/[^/]+|steamapps/common/(?:proton[^/]*|steamlinuxruntime[^/]*))(?=/|$)")
+SELECTED_GAME_NAMES = (("vrchat", "438100", "vrchat_startup"),
+                       ("war robots", "767560", "warrobots_startup"))
+STARTUP_DIAGNOSTIC_PARTS = ("/crash reports/", "/crashpad/", "/crashes/",
+    "/browsermetrics/", "/logs/", "/telemetry/", "/datareporting/", "/analytics/",
+    "/test/", "/tests/", "/__pycache__/test", "/share/doc/", "/share/man/",
+    "/share/help/", "/include/", "/.sentinel/")
+STARTUP_DB_NAMES = {"cookies", "history", "web data", "login data", "favicons",
+    "dips", "trust tokens", "transportsecurity", "network persistent state",
+    "local state", "preferences", "secure preferences", "visited links"}
+STARTUP_STATE_SUFFIXES = (".sqlite", ".sqlite3", ".db", "-wal", "-shm", "-journal",
+    ".reg", ".json", ".jsonlz4", ".json.lz4", ".conf", ".cfg", ".ini", ".vdf", ".acf")
+
+
+def _read_policy_vdf(path):
+    """Bounded parser for Steam's small text manifests; never reads app payloads."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as source:
+            text = source.read(2 * MIB + 1)
+        if len(text) > 2 * MIB:
+            return {}
+    except OSError:
+        return {}
+    tokens = []
+    for match in re.finditer(r'//[^\n]*|"((?:\\.|[^"\\])*)"|([{}])|([^\s{}"]+)', text):
+        if match.group(0).startswith("//"):
+            continue
+        value = match.group(1)
+        tokens.append((match.group(2) is not None,
+                       re.sub(r'\\(["\\])', r'\1', value) if value is not None else match.group(2) or match.group(3)))
+    root, stack, key = {}, [], None
+    current = root
+    for structural, token in tokens:
+        if structural and token == "{":
+            if key is None or len(stack) >= 32:
+                return {}
+            child = {}
+            current[key.lower()] = child
+            stack.append(current)
+            current, key = child, None
+        elif structural and token == "}":
+            if not stack or key is not None:
+                return {}
+            current, key = stack.pop(), None
+        elif key is None:
+            key = token
+        else:
+            current[key.lower()] = token
+            key = None
+    return root if not stack and key is None else {}
+
+
+def _vdf_find(tree, key):
+    if key in tree:
+        return tree[key]
+    for value in tree.values():
+        if isinstance(value, dict):
+            result = _vdf_find(value, key)
+            if result is not None:
+                return result
+    return None
+
+
+def _natural_tool_key(path):
+    return tuple((1, int(part)) if part.isdigit() else (0, part.lower())
+                 for part in re.split(r"(\d+)", os.path.basename(str(path))))
+
+
+@functools.lru_cache(maxsize=1)
+def startup_steam_tools():
+    """Resolve <=3 configured/current tools and their required runtime once.
+
+    Reads names at Steam's two installation-directory levels, NOT their trees.
+    All recursive discovery still belongs to the existing DirectoryScanner.
+    """
+    libraries, configs, tool_dirs, seen_roots = set(), [], set(), set()
+    installed_runtime_dirs = set()
+    for home in iter_home_dirs():
+        for relative in (".steam/root", ".steam/steam", ".steam/debian-installation",
+                         ".local/share/Steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam"):
+            root = Path(os.path.realpath(home / relative))
+            try:
+                present = root.is_dir()
+            except OSError:
+                present = False
+            if str(root) in seen_roots or not present:
+                continue
+            seen_roots.add(str(root))
+            configs.append(_read_policy_vdf(root / "config/config.vdf"))
+            libraries.add(root)
+            folders = _read_policy_vdf(root / "steamapps/libraryfolders.vdf")
+            folder_entries = _vdf_find(folders, "libraryfolders") or {}
+            for item in folder_entries.values() if isinstance(folder_entries, dict) else ():
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    libraries.add(Path(item["path"]))
+                elif isinstance(item, str) and item.startswith("/"):
+                    libraries.add(Path(item))
+            try:
+                tool_dirs.update(root.joinpath("compatibilitytools.d").iterdir())
+            except OSError:
+                pass
+    installed_ids = set()
+    for library in sorted(libraries):
+        try:
+            installed_ids.update(p.name[12:-4] for p in (library / "steamapps").iterdir()
+                                 if p.name.startswith("appmanifest_") and p.name.endswith(".acf"))
+        except OSError:
+            pass
+        try:
+            for p in (library / "steamapps/common").iterdir():
+                if p.name.lower().startswith(("proton", "steamlinuxruntime")):
+                    installed_runtime_dirs.add(p)
+                if p.name.lower().startswith("proton"):
+                    tool_dirs.add(p)
+        except OSError:
+            pass
+    tools = {}
+    for directory in sorted(tool_dirs):
+        manifest_path = directory if directory.name == "compatibilitytool.vdf" else directory / "compatibilitytool.vdf"
+        registrations = _vdf_find(_read_policy_vdf(manifest_path), "compat_tools") or {}
+        if not isinstance(registrations, dict):
+            continue
+        for identifier, entry in registrations.items():
+            if not isinstance(entry, dict):
+                continue
+            base = manifest_path.parent
+            install_path = entry.get("install_path", ".")
+            if not isinstance(install_path, str):
+                continue
+            tool = Path(os.path.realpath(base / install_path))
+            if str(tool) == "/":
+                continue
+            required = _vdf_find(_read_policy_vdf(tool / "toolmanifest.vdf"), "require_tool_appid")
+            tools[identifier.lower()] = (str(tool).lower(), str(required or ""), directory.name.lower())
+    preferred = []
+    for appid in ("438100", "767560", "0"):
+        for config in configs:
+            mapping = _vdf_find(config, "compattoolmapping") or {}
+            entry = mapping.get(appid, {}) if isinstance(mapping, dict) else {}
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                preferred.append(entry["name"].lower())
+    # Additional installed-game assignments use existing Steam metadata, not
+    # per-file frequency learning. Bound the selected set to three tools.
+    for config in configs:
+        mapping = _vdf_find(config, "compattoolmapping") or {}
+        if isinstance(mapping, dict):
+            for appid in sorted(installed_ids):
+                entry = mapping.get(appid, {})
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    preferred.append(entry["name"].lower())
+    # Fill empty slots with one latest stable, Experimental, and latest custom.
+    stable = [k for k,v in tools.items() if "experimental" not in v[2] and v[2].startswith("proton") and "compatibilitytools.d" not in v[0]]
+    experimental = [k for k,v in tools.items() if "experimental" in v[2]]
+    custom = [k for k,v in tools.items() if "compatibilitytools.d" in v[0]]
+    for group in (stable, experimental, custom):
+        if group:
+            preferred.append(max(group, key=lambda k:_natural_tool_key(tools[k][0])))
+    selected, required_ids = [], set()
+    for identifier in preferred:
+        if identifier in tools and tools[identifier][0] not in selected:
+            root, required, _ = tools[identifier]
+            selected.append(root)
+            if required:
+                required_ids.add(required)
+            if len(selected) == 3:
+                break
+    runtimes = []
+    for appid in sorted(required_ids):
+        for library in sorted(libraries):
+            app = _vdf_find(_read_policy_vdf(library / f"steamapps/appmanifest_{appid}.acf"), "appstate") or {}
+            name = app.get("installdir", "") if isinstance(app, dict) else ""
+            if isinstance(name, str) and name.lower().startswith("steamlinuxruntime") and os.path.basename(name) == name:
+                runtimes.append(str(library / "steamapps/common" / name).lower())
+    inventory_prefixes = []
+    for root in seen_roots:
+        inventory_prefixes.extend(str(Path(root) / name)
+            for name in STEAM_CLIENT_VIP_TOPLEVEL_DIRS | STEAM_CLIENT_VIP_TOPLEVEL_FILES)
+        inventory_prefixes.extend(str(Path(root) / name) for name in
+            ("steamclient.dll", "steamclient64.dll", "GameOverlayRenderer.dll",
+             "GameOverlayRenderer64.dll", "local.vdf", "update_hosts_cached.vdf",
+             "fossilize_engine_filters.json"))
+        inventory_prefixes.append(str(Path(root) / "compatibilitytools.d"))
+        inventory_prefixes.append(str(Path(root) / "userdata"))
+    for library in libraries:
+        inventory_prefixes.append(str(library / "steamapps/libraryfolders.vdf"))
+        inventory_prefixes.extend(str(library / f"steamapps/appmanifest_{appid}.acf") for appid in installed_ids)
+        for name in ("Proton", "SteamLinuxRuntime", "Steam Linux Runtime", "Steamworks Shared", "VRChat", "War Robots"):
+            # Individual installed tool prefixes are also retained below; the
+            # literal names cover standard game/runtime installs and aliases.
+            inventory_prefixes.append(str(library / "steamapps/common" / name))
+        for appid in ("438100", "767560"):
+            inventory_prefixes.append(str(library / "steamapps/compatdata" / appid))
+            inventory_prefixes.append(str(library / "steamapps/shadercache" / appid))
+    inventory_prefixes.extend(str(p) for p in installed_runtime_dirs)
+    inventory_prefixes.extend(str(p) for p in tool_dirs if p.name != "compatibilitytool.vdf")
+    startup_steam_tools.inventory_prefixes = tuple(inventory_prefixes)
+    return tuple(selected), tuple(runtimes)
+
+
+def startup_browser_role(path, name, firefox=False):
+    """Resource roles, including data journals before diagnostic-log filtering."""
+    if any(part in path for part in ("/local storage/", "/session storage/", "/service worker/database/", "/leveldb/")):
+        return "state"
+    if name == "current" or name.startswith("manifest-") or re.fullmatch(r"\d+\.(?:log|ldb|sst)", name):
+        return "state"
+    if "/indexeddb/" in path or (firefox and "/idb/" in path):
+        if ".files/" in path or "/blob_storage/" in path:
+            return "payload"
+        return "state"
+    if "/startupcache/" in path or "/code cache/" in path or "/service worker/scriptcache/" in path:
+        return "code"
+    if "/cache2/index" in path or name in ("index", "the-real-index"):
+        return "index"
+    if any(part in path for part in STARTUP_DIAGNOSTIC_PARTS) or name.endswith((".log", ".pma", ".dmp")):
+        return "diagnostic"
+    if any(part in path for part in ("/cache2/entries/", "/offlinecache/", "/cache/", "/service worker/cachestorage/")):
+        return "http"
+    if any(part in path for part in ("/gpucache/", "/shadercache/", "/dawnwebgpucache/", "/dawngraphitecache/", "/grshadercache/")):
+        return "shader"
+    if "/shared dictionary/" in path or "/shared_dictionary/" in path:
+        return "code"
+    if name in STARTUP_DB_NAMES or name.endswith(STARTUP_STATE_SUFFIXES):
+        return "state"
+    if name in ELECTRON_RUNTIME_NAMES or name.endswith(RUNTIME_SUFFIXES + (".xpi", ".css", ".html", ".bdic")):
+        return "code"
+    return "support"
+
+
+def startup_policy_role(path, name):
+    """Return (existing byte-budget family, resource role) using path metadata."""
+    if FIREFOX_USER_PATH_RE.search(path) is not None:
+        return "firefox_webcache", startup_browser_role(path, name, firefox=True)
+    if path_has_prefix(path, BROWSER_RUNTIME_PREFIXES[:3]) or "/flatpak/app/org.mozilla.firefox/" in path or "/snap/firefox/" in path:
+        return "firefox_webcache", "code"
+    if DISCORD_USER_RE.search(path) is not None:
+        return "discord_startup", startup_browser_role(path, name)
+    if DISCORD_CODE_RE.search(path) is not None:
+        return "discord_startup", "code"
+    if "/obs-studio/plugin_config/obs-browser/" in path:
+        return "electron_webcache", startup_browser_role(path, name)
+    for game, appid, family in SELECTED_GAME_NAMES:
+        if f"/steamapps/common/{game}/" in path or f"/steamapps/compatdata/{appid}/" in path:
+            if is_vrchat_content_cache_path(path) or any(p in path for p in ("/worlds/", "/avatars/", "/blob_storage/")):
+                return family, "payload"
+            return family, "game"
+        if f"/steamapps/shadercache/{appid}/" in path:
+            return family, "shader"
+    tool = STEAM_TOOL_RE.search(path)
+    if tool is not None:
+        root = path[:tool.end()]
+        selected, runtimes = startup_steam_tools()
+        return "steam_htmlcache", "runtime" if root in selected or root in runtimes else "unused-runtime"
+    tail = steam_root_tail(path)
+    if tail:
+        if tail.startswith("config/htmlcache/"):
+            return "steam_htmlcache", startup_browser_role(path, name)
+        if tail.startswith(("steamrt64/", "ubuntu12_32/steam-runtime/", "ubuntu12_64/steam-runtime/")):
+            browser_code = (name in ELECTRON_RUNTIME_NAMES
+                            or name in {"steamwebhelper", "steamwebhelper.sh", "libcef.so", "steamclient.so"}
+                            or ("/locales/" in path and name.endswith(".pak")))
+            return "steam_htmlcache", "code" if browser_code else "runtime"
+        if tail.split("/", 1)[0] in STEAM_CLIENT_VIP_TOPLEVEL_DIRS or tail in STEAM_CLIENT_VIP_TOPLEVEL_FILES:
+            return "steam_htmlcache", "client"
+        if "/" not in tail and (name.endswith((".so", ".dll", ".vdf", ".json")) or name.startswith("ssfn")):
+            return "steam_htmlcache", "client"
+        if tail.startswith("userdata/") and ("/config/" in tail or name.endswith((".vdf", ".acf"))):
+            return "steam_htmlcache", "state"
+        if name.startswith("appmanifest_") and name.endswith(".acf") or tail == "steamapps/libraryfolders.vdf":
+            return "steam_htmlcache", "state"
+    return None
+
+
+def classify_startup_resource(rec, path, name, policy):
+    family, role = policy
+    journal = role == "state"
+    if role in ("payload", "diagnostic"):
+        return (99, 0, 0)
+    if role == "unused-runtime":
+        return (99, 0, 0)
+    if not journal and role != "index" and (any(part in path for part in STARTUP_DIAGNOSTIC_PARTS)
+                        or name.endswith((".log", ".pma", ".dmp"))):
+        return (99, 0, 0)
+    # Bulk game/download payloads do not become code because of their directory.
+    if (role not in ("http", "index", "state", "shader") and name not in ELECTRON_RUNTIME_NAMES
+            and name.endswith(GAME_ASSET_SUFFIXES + (".assets", ".ress", ".resource", ".vrca", ".vrcw", ".unity3d"))
+            and not (role == "code" and name.endswith(".pak"))):
+        if rec.size > 16 * MIB or role == "runtime":
+            return (99, 0, 0)
+    ui_image = role == "client" and name.endswith((".jpg", ".jpeg", ".webp")) and rec.size <= 16 * MIB
+    if role not in ("http", "index", "state", "shader") and not ui_image and name.endswith(MEDIA_SUFFIXES + ARCHIVE_SUFFIXES + PACKAGE_IMAGE_SUFFIXES):
+        return (99, 0, 0)
+    if role == "runtime" and not (file_is_executable(rec) or is_shared_library_name(name)
+            or name.endswith(RUNTIME_SUFFIXES + CONFIG_SUFFIXES + (".dat", ".ttf", ".otf", ".nls", ".inf"))
+            or name in {"proton", "wine", "wine64", "wineserver", "version", "qmldir"}):
+        return (5, 40, 0)
+    if role == "game" and name.endswith(".bin") and rec.size > 16 * MIB:
+        return (99, 0, 0)
+    if role == "game" and not (file_is_executable(rec) or is_shared_library_name(name)
+            or name.endswith(RUNTIME_SUFFIXES + STARTUP_STATE_SUFFIXES)
+            or name == "global-metadata.dat"
+            or rec.size <= 16 * MIB):
+        return (5, 40, 0)
+    confidence = {"code": 11600, "index": 11400, "state": 11200, "client": 11000,
+                  "runtime": 10800, "game": 10600, "shader": 10400,
+                  "support": 10200, "http": 10900}[role]
+    return (1, confidence, 0)
+
+
+
 def browser_cache_kind(path: str) -> Optional[tuple[str, str]]:
     """Return a bounded cache family and resource kind, including cache roots."""
+    policy = startup_policy_role(path, os.path.basename(path))
+    if policy is not None and policy[1] in {"index", "code", "state", "http", "shader"}:
+        return policy
     # Most inventory files are system/app code, not browser caches.
     if not any(token in path for token in ("cache", "storage", "shared dictionary", "shared_dictionary")):
         return None
@@ -1944,6 +2275,10 @@ def classify_file(rec: FileRec) -> tuple[int, int, int]:
     name = os.path.basename(path)
     size = rec.size
 
+    policy = startup_policy_role(path, name)
+    if policy is not None:
+        return classify_startup_resource(rec, path, name, policy)
+
     if not path_has_prefix(path, HARD_COLD_PREFIXES):
         web_cache = classify_web_cache(path, name, size)
         if web_cache is not None:
@@ -2266,7 +2601,12 @@ def cache_budget_caps(cfg: dict) -> dict[str, int]:
         "electron_webcache": "2G", "desktop_shader_cache": "1G", "desktop_compiled_cache": "256M",
         "app_catalog": "256M", "hytale_world": "2G", "vrchat_content_cache": "2G",
     }
-    return {key: max(0, parse_size(cfg.get(key + "_budget_bytes", default)) or 0)
+    # Existing cached memory sample; no additional memory-monitor polling.
+    total_gib = parse_meminfo()["MemTotal"] / GIB
+    values = next(values for maximum, values in STARTUP_RAM_BUDGETS if total_gib < maximum)
+    defaults.update(zip(STARTUP_BUDGETS, values))
+    return {key: max(0, parse_size(default if cfg.get(key + "_budget_bytes") is None
+                                  else cfg[key + "_budget_bytes"]) or 0)
             for key, default in defaults.items()}
 
 
@@ -2274,12 +2614,17 @@ def cache_budget_file_caps(cfg: dict) -> dict[str, int]:
     # Byte budgets are the defaults. Only an explicitly configured positive
     # family count is a count limit; zero means unlimited.
     families = ("steam_htmlcache", "firefox_webcache", "chromium_webcache", "electron_webcache",
-                "desktop_shader_cache", "desktop_compiled_cache", "app_catalog")
+                "desktop_shader_cache", "desktop_compiled_cache", "app_catalog",
+                "discord_startup", "vrchat_startup", "warrobots_startup")
     return {key: int(cfg[key + "_max_files"]) for key in families
             if int(cfg.get(key + "_max_files", 0)) > 0}
 
 
 def cache_budget_key(rec: FileRec) -> Optional[str]:
+    path = os.path.normpath(rec.path).lower()
+    policy = startup_policy_role(path, os.path.basename(path))
+    if policy is not None:
+        return policy[0]
     if rec.budget:
         return rec.budget
     path = os.path.normpath(rec.path).lower()
@@ -3504,7 +3849,10 @@ DB_SCHEMA = 1
 
 
 def classify_batch(items):
-    """CPU-only batch. Spawn workers never receive the inventory or database."""
+    """Rank metadata; Steam's small manifest snapshot is cached once per process.
+
+    Spawn workers never receive the inventory/database or walk payload trees.
+    """
     rows = []
     for rec, hits, last_use in items:
         priority = selection_sort_key(rec)
@@ -3769,7 +4117,67 @@ class InventoryDB:
     def set_meta(self, key, value):
         self.connection.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(value)))
 
+    def refresh_startup_policy(self):
+        """One policy-upgrade rerank of affected cached metadata, no file walk.
+
+        Uses existing primary-key ranges and dirty-record triggers. This prevents
+        an old priority index from being published as a new-policy startup plan.
+        Later starts take only the version check.
+        """
+        if self.meta("policy_version", 0) == POLICY_VERSION:
+            return
+        if self.connection.execute("SELECT 1 FROM files LIMIT 1").fetchone():
+            prefixes = list(BROWSER_RUNTIME_PREFIXES[:3]) + [
+                "/opt/Vesktop", "/opt/vesktop", "/opt/Discord", "/opt/discord",
+                "/usr/lib/discord", "/usr/lib/vesktop", "/usr/lib64/discord",
+                "/usr/lib64/vesktop", "/usr/share/discord", "/usr/share/vesktop",
+                "/var/lib/flatpak/app/org.mozilla.firefox",
+                "/var/lib/flatpak/app/dev.vencord.Vesktop",
+                "/var/lib/flatpak/app/com.discordapp.Discord", "/snap/firefox"]
+            for home in iter_home_dirs():
+                prefixes.extend(str(home / part) for part in (
+                    ".mozilla/firefox", ".config/mozilla/firefox", ".config/firefox", ".cache/mozilla/firefox", ".cache/firefox",
+                    ".librewolf", ".zen", ".floorp", ".waterfox",
+                    ".config/librewolf", ".config/zen", ".config/floorp", ".config/waterfox",
+                    ".cache/librewolf", ".cache/zen", ".cache/floorp", ".cache/waterfox",
+                    ".config/vesktop", ".config/Vesktop", ".config/discord", ".config/Discord",
+                    ".config/discordcanary", ".config/discordptb", ".config/discorddevelopment",
+                    ".cache/vesktop", ".cache/discord", ".cache/discordcanary", ".cache/discordptb",
+                    ".var/app/org.mozilla.firefox", ".var/app/dev.vencord.Vesktop", ".var/app/com.discordapp.Discord",
+                    ".local/share/flatpak/app/org.mozilla.firefox", ".local/share/flatpak/app/dev.vencord.Vesktop",
+                    ".local/share/flatpak/app/com.discordapp.Discord", ".config/obs-studio/plugin_config/obs-browser"))
+            startup_steam_tools()
+            prefixes.extend(getattr(startup_steam_tools, "inventory_prefixes", ()))
+            prefixes = compact_prefixes([os.path.realpath(p) for p in prefixes])
+            for prefix in prefixes:
+                raw = os.fsencode(prefix)
+                low, high = raw.rstrip(b"/") + b"/", raw.rstrip(b"/") + b"0"
+                cursor = raw
+                while True:
+                    rows = self.connection.execute("""SELECT f.path,f.size,f.stamp,f.mode,f.dev,f.ino,
+                        f.mtime_ns,f.ctime_ns,coalesce(u.hits,0),coalesce(u.last_use,0)
+                        FROM files f LEFT JOIN usage u ON f.path=u.path
+                        WHERE (f.path=? OR (f.path>=? AND f.path<?)) AND f.path>=?
+                        ORDER BY f.path LIMIT 256""", (raw, low, high, cursor)).fetchall()
+                    if not rows:
+                        break
+                    work = []
+                    for row in rows:
+                        path = os.fsdecode(row[0])
+                        if startup_policy_role(path.lower(), os.path.basename(path).lower()) is not None:
+                            work.append((FileRec(path, *row[1:8]), row[8], row[9]))
+                    for rec, priority, budget, unit in classify_batch(work):
+                        if priority is None:
+                            self.connection.execute("DELETE FROM files WHERE path=?", (os.fsencode(rec.path),))
+                        else:
+                            self.connection.execute("UPDATE files SET k0=?,k1=?,k2=?,k3=?,k4=?,budget=?,unit=? WHERE path=?",
+                                (*priority, budget, os.fsencode(unit), os.fsencode(rec.path)))
+                    cursor = rows[-1][0] + b"\0"
+        self.set_meta("policy_version", POLICY_VERSION)
+
+
     def begin_scan(self, roots: list[str], cfg: dict, *, resume=True):
+        self.refresh_startup_policy()
         fingerprint = hashlib.sha256(json.dumps(
             [roots, cfg.get("exclude_prefixes", []), cfg.get("stay_on_filesystem", True), POLICY_VERSION],
             sort_keys=True).encode()).hexdigest()
@@ -5700,7 +6108,7 @@ write_config() {
 import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 path = Path('/etc/ramcache-controller/config.json')
-defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","firefox_webcache_budget_bytes":"4G","chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":3,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800}''')
+defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":4,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null}''')
 legacy = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":10,"incremental_rescan_interval_seconds":300,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":96,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":30,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"4G","target_shrink_to_available_bytes":"6G","target_grow_above_available_bytes":"7G","target_grow_to_available_bytes":"6G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"8G","vmtouch_chunk_target_bytes":"1024M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{}}''')
 current = {}
 if path.exists():
@@ -5722,7 +6130,14 @@ if int(current.get('config_version', 1)) < 3:
             merged.pop(key, None)
     if current.get('learning_max_files') == 250000:
         merged.pop('learning_max_files', None)
-merged['config_version'] = 3
+# Convert only previous shipped byte defaults to automatic startup allowances.
+# Explicit non-default overrides (including zero) remain intact.
+if int(current.get('config_version', 1)) < 4:
+    for key, old in {'firefox_webcache_budget_bytes': ('4G', '1G'),
+                     'steam_htmlcache_budget_bytes': ('1G', '768M')}.items():
+        if current.get(key) in old:
+            merged[key] = None
+merged['config_version'] = 4
 if current == merged:
     subprocess.run([sys.executable, sys.argv[1], '--config', str(path), '--check-config'], check=True, stdout=subprocess.DEVNULL)
     print('Existing configuration preserved.')
@@ -5737,7 +6152,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.24.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.4.25.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -7152,7 +7567,7 @@ install_all() {
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.24. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.4.25. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
@@ -7160,12 +7575,44 @@ install_all() {
 
 uninstall_all() {
   need_root
+  local unit="ramcache-controller.service"
+  local load_state output legacy legacy_compact
 
-  systemctl stop ramcache-controller.service || true
-  systemctl kill ramcache-controller.service --kill-who=all || true
-  systemctl disable ramcache-controller.service || true
+  # Distinguish an absent unit from a real systemd/bus failure. Do not delete
+  # bookkeeping while an unreachable or un-stoppable service can recreate it.
+  if ! systemctl show --property=Version --value >/dev/null; then
+    echo "ERROR: cannot contact systemd; RAMCache files were left in place." >&2
+    return 1
+  fi
+  load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
+  if [[ "${load_state:-not-found}" != "not-found" ]] || systemctl is-active --quiet "$unit"; then
+    if ! output="$(systemctl stop "$unit" 2>&1)"; then
+      echo "ERROR: could not stop RAMCache; bookkeeping was left in place." >&2
+      echo "$output" >&2
+      return 1
+    fi
+    # Stop is synchronous and the existing unit uses KillMode=control-group.
+    # A subsequent kill on this now-empty unit only produced false errors.
+    if [[ -f /etc/systemd/system/ramcache-controller.service ]]; then
+      if ! output="$(systemctl disable "$unit" 2>&1)"; then
+        echo "ERROR: could not disable RAMCache." >&2
+        echo "$output" >&2
+        return 1
+      fi
+    fi
+    # Clear restart-limit counters while the unit still exists, avoiding the
+    # old reset-failed-after-removal "unit not loaded" message.
+    if [[ -f /etc/systemd/system/ramcache-controller.service ]] || systemctl is-failed --quiet "$unit"; then
+      if ! output="$(systemctl reset-failed "$unit" 2>&1)"; then
+        echo "ERROR: could not clear RAMCache's systemd failure state." >&2
+        echo "$output" >&2
+        return 1
+      fi
+    fi
+  fi
 
   rm -f /etc/systemd/system/ramcache-controller.service
+  rm -f /etc/systemd/system/multi-user.target.wants/ramcache-controller.service
   rm -rf /opt/ramcache-controller
   rm -rf /etc/ramcache-controller
   rm -rf /run/ramcache-controller
@@ -7182,21 +7629,21 @@ uninstall_all() {
   fi
 
   systemctl daemon-reload
-  systemctl reset-failed ramcache-controller.service || true
 
   echo
   echo "Removed ramcache-controller."
-  echo "Removed:"
+  echo "Removed program, settings, inventory, saved plans, learned state and runtime bookkeeping:"
   echo "  /etc/ramcache-controller"
   echo "  /opt/ramcache-controller"
   echo "  /run/ramcache-controller"
+  echo "  /var/lib/ramcache-controller"
   echo "  /etc/systemd/system/ramcache-controller.service"
   echo "  /etc/sysctl.d/99-ramcache-inotify.conf"
   echo "  /etc/sysctl.d/99-ramcache-vm.conf"
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.24"
+  echo "RAM cache controller installer: v1.4.25"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
@@ -7299,4 +7746,5 @@ case "$ACTION" in
     exit 1
     ;;
 esac
+
 
