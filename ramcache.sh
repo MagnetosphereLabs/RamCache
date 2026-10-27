@@ -24,6 +24,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import heapq
 import itertools
 import functools
 import multiprocessing
@@ -62,11 +63,11 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.25"
+CONTROLLER_VERSION = "1.4.26"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-POLICY_VERSION = 3
+POLICY_VERSION = 4
 _SCAN_STORAGE_PROFILE_CACHE: dict[tuple[str, ...], str] = {}
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +99,8 @@ def load_config() -> tuple[str, dict]:
     effective = apply_memory_size_profile(cfg)
     validate_config(effective)
     startup_steam_tools()
+    startup_vrchat_cache_roots()
+    startup_policy_context()
     return raw, effective
 
 
@@ -250,7 +253,6 @@ LOW_RAM_PROFILE_DEFAULTS = {
     "desktop_compiled_cache_budget_bytes": "64M",
     "app_catalog_budget_bytes": "64M",
     "hytale_world_budget_bytes": "1G",
-    "vrchat_content_cache_budget_bytes": "1G",
 
     # Avoid giant single files on low-DRAM systems.
     "vmtouch_max_file_size": "2G",
@@ -410,6 +412,12 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
         found = existing_dir(path)
         if found is not None:
             paths.append(found)
+
+    # Explicit VRChat cache locations join this existing startup discovery.
+    # The bounded config snapshot is memoized; never search for cache roots.
+    if parse_meminfo()["MemTotal"] >= 20 * GIB:
+        for cache_root in startup_vrchat_cache_roots():
+            add(Path(cache_root))
 
     # System app/runtime roots. These are where installed app runtimes, Flatpaks, Snaps, /opt apps, and local apps live.
     for p in (
@@ -1268,6 +1276,10 @@ VIP_FULL_APP_PATH_NEEDLES = (
 STEAM_CLIENT_VIP_TOPLEVEL_DIRS = {
     "appcache",
     "clientui",
+    "steamui",
+    "controller_base",
+    "bin",
+    "legacycompat",
     "config",
     "friends",
     "graphics",
@@ -1277,6 +1289,7 @@ STEAM_CLIENT_VIP_TOPLEVEL_DIRS = {
     "public",
     "resource",
     "steamrt64",
+    "steamrt32",
     "ubuntu12_32",
     "ubuntu12_64",
 }
@@ -1316,6 +1329,13 @@ def steam_root_tail(path: str) -> Optional[str]:
         idx = lower.find(marker)
         if idx >= 0:
             return lower[idx + len(marker):].strip(os.sep)
+
+    # Explicit installation aliases may resolve outside the conventional
+    # names. Use the memoized startup snapshot, never probe while classifying.
+    for root in getattr(startup_steam_tools, "client_roots", ()):
+        root = root.lower().rstrip(os.sep)
+        if lower.startswith(root + os.sep):
+            return lower[len(root) + 1:]
 
     return None
 
@@ -1374,20 +1394,10 @@ def is_vip_vrchat_runtime_path(path: str) -> bool:
 
 
 def vrchat_content_cache_unit_root(path: str) -> Optional[str]:
-    lower = os.path.normpath(path).lower()
-    marker = VRCHAT_CONTENT_CACHE_SUBSTRINGS[0]
-
-    idx = lower.find(marker)
-    if idx < 0:
-        return lower
-
-    after = idx + len(marker)
-    next_sep = lower.find(os.sep, after)
-
-    if next_sep < 0:
-        return lower
-
-    return lower[:next_sep]
+    # Unity stores __data and __info in a specific version directory, not
+    # directly in the asset's parent containing every historical version.
+    full = os.path.normpath(path)
+    return os.path.dirname(full) if os.path.basename(full).lower() in {"__data", "__info"} else full
 
 
 def is_vip_path(path: str) -> bool:
@@ -1515,9 +1525,10 @@ def is_vrchat_runtime_path(path: str) -> bool:
 
 def is_vrchat_content_cache_path(path: str) -> bool:
     path = path.lower()
-    if "/vrchat/vrchat/" not in path:
+    configured = any(path_is_under(path, root.lower()) for root in startup_vrchat_cache_roots())
+    if "/vrchat/vrchat/" not in path and not configured:
         return False
-    return any("/" + name + "/" in path.rstrip("/") + "/" for name in (
+    return configured or any("/" + name + "/" in path.rstrip("/") + "/" for name in (
         "cache-windowsplayer", "texturediskcache-windowsplayer",
         "httpcache-windowsplayer", "avatars", "avatarparts", "worlds",
     ))
@@ -1550,16 +1561,16 @@ ELECTRON_USER_PATH_RE = re.compile(
 WEB_CACHE_FILE_MAX = 512 * MIB
 
 
-# Startup policy only. The scanner, saved-record schema, loader and holding
-# loop are unchanged. The small Steam manifest snapshot is memoized per process;
-# no recursive walk, per-file stat, timer, watcher or background task is added.
+# Startup selection and metadata snapshots only. No recursive walk, timer,
+# watcher or background worker is added by these policy helpers.
 STARTUP_BUDGETS = ("firefox_webcache", "steam_htmlcache", "discord_startup",
                    "vrchat_startup", "warrobots_startup")
+STARTUP_BUDGET_KEYS = frozenset(STARTUP_BUDGETS) | {"vrchat_content_cache"}
 STARTUP_RAM_BUDGETS = (
-    (20, ("2G", "2G", "1G", "1G", "1G")),
-    (28, ("4G", "3G", "2G", "1536M", "1536M")),
-    (48, ("6G", "5G", "2G", "2G", "2G")),
-    (float("inf"), ("8G", "6G", "2G", "3G", "3G")),
+    (20, ("3G", "3G", "1G", "0", "1G")),
+    (28, ("4G", "4G", "2G", "3G", "1536M")),
+    (48, ("6G", "6G", "2G", "5G", "2G")),
+    (float("inf"), ("8G", "8G", "2G", "5G", "3G")),
 )
 DISCORD_USER_RE = re.compile(
     r"/(?:\.config|\.cache|config|cache)/(?:vesktop|discord(?:canary|ptb|development)?)(?=/|$)|"
@@ -1580,6 +1591,115 @@ STARTUP_DB_NAMES = {"cookies", "history", "web data", "login data", "favicons",
     "local state", "preferences", "secure preferences", "visited links"}
 STARTUP_STATE_SUFFIXES = (".sqlite", ".sqlite3", ".db", "-wal", "-shm", "-journal",
     ".reg", ".json", ".jsonlz4", ".json.lz4", ".conf", ".cfg", ".ini", ".vdf", ".acf")
+STARTUP_CONTENT_ROLES = {"http", "site-data", "content", "shader"}
+STEAM_CEF_NAMES = ELECTRON_RUNTIME_NAMES | {"steamwebhelper", "steamwebhelper.sh", "libcef.so", "steamclient.so"}
+VRCHAT_BUDGETS = {"vrchat_startup", "vrchat_content_cache"}
+DESKTOP_LIBRARY_HEADS = (
+    "libgtk", "libgdk", "libqt", "libwayland", "libx11", "libxcb", "libegl",
+    "libgl", "libvulkan", "libdrm", "libnvidia", "libgbm", "libpipewire",
+    "libpulse", "libasound", "libfontconfig", "libfreetype", "libharfbuzz",
+    "libpango", "libcairo", "libcosmic", "libsmithay")
+DESKTOP_PROGRAM_HEADS = ("cosmic-", "gnome-shell", "kwin_", "plasmashell", "pipewire", "wireplumber")
+DESKTOP_MODULE_DIRS = ("qt5", "qt6", "qml", "gtk-3.0", "gtk-4.0", "gdk-pixbuf-2.0", "gio")
+UNITY_BOOTSTRAP_RE = re.compile(
+    r"/(?:vrchat_data|warrobots_data|war robots_data)/(?:"
+    r"(?:globalgamemanagers|resources|sharedassets\d+)(?:\.(?:assets|resource|ress))*|"
+    r"level\d+(?:\.ress)?|boot\.config|app\.info|"
+    r"resources/(?:unity default resources|unity_builtin_extra)|"
+    r"il2cpp_data/(?:metadata/global-metadata\.dat|resources/[^/]+))$")
+
+
+@functools.lru_cache(maxsize=1)
+def startup_vrchat_cache_roots():
+    """Read only known VRChat config files and explicit Wine drive mappings.
+
+    Called once at process startup. There is no payload walk or rediscovery.
+    Both normal and configured-cache prefixes remain usable by the classifier.
+    """
+    if parse_meminfo()["MemTotal"] < 20 * GIB:
+        return ()
+    startup_steam_tools()
+    libraries = {Path(root) for root in getattr(startup_steam_tools, "library_roots", ())}
+    found = set()
+    for library in sorted(libraries):
+        prefix = library / "steamapps/compatdata/438100/pfx"
+        config = prefix / "drive_c/users/steamuser/AppData/LocalLow/VRChat/VRChat/config.json"
+        try:
+            with config.open("rb") as source:
+                raw = source.read(MIB + 1)
+            if len(raw) > MIB:
+                continue
+            value = json.loads(raw).get("cache_directory")
+            if not isinstance(value, str) or not value or "\0" in value:
+                continue
+            value = value.replace("\\", "/")
+            drive = re.match(r"^([a-zA-Z]):/(.*)$", value)
+            if drive:
+                letter, tail = drive.groups()
+                # Resolve the one explicitly named drive, not dosdevices trees.
+                base = prefix / "dosdevices" / (letter.lower() + ":")
+                if not base.exists() and letter.lower() == "c":
+                    base = prefix / "drive_c"
+                if not base.exists():
+                    continue
+                target = os.path.realpath(base / tail)
+            elif value.startswith("/"):
+                target = os.path.realpath(value)
+            else:
+                continue
+            broad_roots = {"/", "/home", "/usr", "/usr/lib", "/etc", "/var", "/var/lib", "/opt", "/tmp"}
+            if target not in broad_roots and not path_has_prefix(target, ("/proc", "/sys", "/dev", "/run")):
+                found.add(target)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return tuple(sorted(found))
+
+
+@functools.lru_cache(maxsize=1)
+def startup_policy_context():
+    """Persist the snapshot identity inside the existing saved-plan header.
+
+    A changed configured tool/cache root needs an indexed priority refresh on
+    the next start even when the software policy version itself is unchanged.
+    """
+    value = (startup_steam_tools(), startup_vrchat_cache_roots(),
+             getattr(startup_steam_tools, "client_roots", ()))
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def desktop_startup_resource(path, name, size=0):
+    """Recognize actual desktop dependencies, not every installed program."""
+    if not path.startswith("/usr/") and not any(marker in path for marker in (
+            "/.pki/nssdb/", "/.local/share/pki/nssdb/", "/.config/cosmic/", "/.local/share/vulkan/implicit_layer.d/")):
+        return False
+    if path_has_prefix(path, ("/usr/bin", "/usr/libexec")) and name.startswith(DESKTOP_PROGRAM_HEADS):
+        return True
+    if path_has_prefix(path, ("/usr/lib", "/usr/lib64", "/usr/local/lib")) and (
+            is_shared_library_name(name) and name.startswith(DESKTOP_LIBRARY_HEADS)):
+        return True
+    if path_has_prefix(path, ("/usr/lib", "/usr/lib64", "/usr/local/lib")) and not any(
+            part in path for part in STARTUP_DIAGNOSTIC_PARTS + ("/examples/",)):
+        if name in {"giomodule.cache", "loaders.cache", "immodules.cache"}:
+            return True
+        if any("/" + part + "/" in path for part in DESKTOP_MODULE_DIRS) and (
+                is_shared_library_name(name) or name.endswith((".qml", ".qmltypes", ".js", ".qsb", ".rcc")) or name == "qmldir"):
+            return True
+    if (path.startswith(("/usr/share/egl/egl_external_platform.d/", "/usr/share/vulkan/icd.d/",
+                         "/usr/share/vulkan/implicit_layer.d/", "/usr/share/vulkan/explicit_layer.d/"))
+            or "/.local/share/vulkan/implicit_layer.d/" in path) and name.endswith(".json"):
+        return True
+    if re.search(r"/(?:\.pki/nssdb|\.local/share/pki/nssdb)/", path) and (
+            name in {"cert9.db", "key4.db", "pkcs11.txt"} or name.endswith(("-wal", "-shm", "-journal"))):
+        return size <= 64 * MIB
+    if size <= 16 * MIB and (path_has_prefix(path, ("/usr/share/cosmic",))
+            or re.search(r"/\.config/cosmic/com\.system76\.cosmic(?:theme|tk)", path)):
+        return True
+    if size <= 64 * MIB and path.startswith("/usr/lib/locale/") and (
+            name == "locale-archive" or "/en_us" in path or "/c.utf" in path
+            or (os.environ.get("LANG", "").split(".")[0].lower() not in {"", "c", "posix"}
+                and "/" + os.environ["LANG"].split(".")[0].lower() in path)):
+        return True
+    return False
 
 
 def _read_policy_vdf(path):
@@ -1703,7 +1823,8 @@ def startup_steam_tools():
             required = _vdf_find(_read_policy_vdf(tool / "toolmanifest.vdf"), "require_tool_appid")
             tools[identifier.lower()] = (str(tool).lower(), str(required or ""), directory.name.lower())
     preferred = []
-    for appid in ("438100", "767560", "0"):
+    vrchat_enabled = parse_meminfo()["MemTotal"] >= 20 * GIB
+    for appid in (("438100", "767560", "0") if vrchat_enabled else ("767560", "0")):
         for config in configs:
             mapping = _vdf_find(config, "compattoolmapping") or {}
             entry = mapping.get(appid, {}) if isinstance(mapping, dict) else {}
@@ -1715,13 +1836,28 @@ def startup_steam_tools():
         mapping = _vdf_find(config, "compattoolmapping") or {}
         if isinstance(mapping, dict):
             for appid in sorted(installed_ids):
+                if appid == "438100" and not vrchat_enabled:
+                    continue
                 entry = mapping.get(appid, {})
                 if isinstance(entry, dict) and isinstance(entry.get("name"), str):
                     preferred.append(entry["name"].lower())
     # Fill empty slots with one latest stable, Experimental, and latest custom.
     stable = [k for k,v in tools.items() if "experimental" not in v[2] and v[2].startswith("proton") and "compatibilitytools.d" not in v[0]]
     experimental = [k for k,v in tools.items() if "experimental" in v[2]]
-    custom = [k for k,v in tools.items() if "compatibilitytools.d" in v[0]]
+    vr_only = set()
+    if not vrchat_enabled:
+        shared = set()
+        for config in configs:
+            mapping = _vdf_find(config, "compattoolmapping") or {}
+            if isinstance(mapping, dict):
+                for appid, entry in mapping.items():
+                    if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                        if appid == VRCHAT_APPID:
+                            vr_only.add(entry["name"].lower())
+                        elif appid == "0" or appid in installed_ids:
+                            shared.add(entry["name"].lower())
+        vr_only.difference_update(shared)
+    custom = [k for k,v in tools.items() if "compatibilitytools.d" in v[0] and k not in vr_only]
     for group in (stable, experimental, custom):
         if group:
             preferred.append(max(group, key=lambda k:_natural_tool_key(tools[k][0])))
@@ -1763,7 +1899,11 @@ def startup_steam_tools():
             inventory_prefixes.append(str(library / "steamapps/shadercache" / appid))
     inventory_prefixes.extend(str(p) for p in installed_runtime_dirs)
     inventory_prefixes.extend(str(p) for p in tool_dirs if p.name != "compatibilitytool.vdf")
+    inventory_prefixes.extend(str(Path(root) / "steam/cached") for root in seen_roots)
+    inventory_prefixes.extend(str(Path(root) / "steam/games") for root in seen_roots)
     startup_steam_tools.inventory_prefixes = tuple(inventory_prefixes)
+    startup_steam_tools.library_roots = tuple(str(p) for p in sorted(libraries))
+    startup_steam_tools.client_roots = tuple(sorted(seen_roots))
     return tuple(selected), tuple(runtimes)
 
 
@@ -1775,7 +1915,7 @@ def startup_browser_role(path, name, firefox=False):
         return "state"
     if "/indexeddb/" in path or (firefox and "/idb/" in path):
         if ".files/" in path or "/blob_storage/" in path:
-            return "payload"
+            return "site-data"
         return "state"
     if "/startupcache/" in path or "/code cache/" in path or "/service worker/scriptcache/" in path:
         return "code"
@@ -1785,7 +1925,7 @@ def startup_browser_role(path, name, firefox=False):
         return "diagnostic"
     if any(part in path for part in ("/cache2/entries/", "/offlinecache/", "/cache/", "/service worker/cachestorage/")):
         return "http"
-    if any(part in path for part in ("/gpucache/", "/shadercache/", "/dawnwebgpucache/", "/dawngraphitecache/", "/grshadercache/")):
+    if any(part in path for part in ("/gpucache/", "/gpupersistentcache/", "/shadercache/", "/dawnwebgpucache/", "/dawngraphitecache/", "/grshadercache/")):
         return "shader"
     if "/shared dictionary/" in path or "/shared_dictionary/" in path:
         return "code"
@@ -1808,9 +1948,13 @@ def startup_policy_role(path, name):
         return "discord_startup", "code"
     if "/obs-studio/plugin_config/obs-browser/" in path:
         return "electron_webcache", startup_browser_role(path, name)
+    if is_vrchat_content_cache_path(path):
+        if name == "vrc-version" or name in {"index", "the-real-index"}:
+            return "vrchat_startup", "index"
+        return "vrchat_content_cache", "content"
     for game, appid, family in SELECTED_GAME_NAMES:
         if f"/steamapps/common/{game}/" in path or f"/steamapps/compatdata/{appid}/" in path:
-            if is_vrchat_content_cache_path(path) or any(p in path for p in ("/worlds/", "/avatars/", "/blob_storage/")):
+            if appid != VRCHAT_APPID and any(p in path for p in ("/worlds/", "/avatars/", "/blob_storage/")):
                 return family, "payload"
             return family, "game"
         if f"/steamapps/shadercache/{appid}/" in path:
@@ -1824,11 +1968,16 @@ def startup_policy_role(path, name):
     if tail:
         if tail.startswith("config/htmlcache/"):
             return "steam_htmlcache", startup_browser_role(path, name)
-        if tail.startswith(("steamrt64/", "ubuntu12_32/steam-runtime/", "ubuntu12_64/steam-runtime/")):
-            browser_code = (name in ELECTRON_RUNTIME_NAMES
-                            or name in {"steamwebhelper", "steamwebhelper.sh", "libcef.so", "steamclient.so"}
+        if tail.startswith(("steamui/", "clientui/", "steam/cached/")):
+            return "steam_htmlcache", "code"
+        if tail.startswith("steam/games/"):
+            return "steam_htmlcache", "state"
+        if tail.startswith(("steamrt64/", "steamrt32/", "ubuntu12_32/steam-runtime/", "ubuntu12_64/steam-runtime/")):
+            browser_code = (name in STEAM_CEF_NAMES
                             or ("/locales/" in path and name.endswith(".pak")))
             return "steam_htmlcache", "code" if browser_code else "runtime"
+        if tail.startswith(("ubuntu12_32/", "ubuntu12_64/")) and name in STEAM_CEF_NAMES:
+            return "steam_htmlcache", "code"
         if tail.split("/", 1)[0] in STEAM_CLIENT_VIP_TOPLEVEL_DIRS or tail in STEAM_CLIENT_VIP_TOPLEVEL_FILES:
             return "steam_htmlcache", "client"
         if "/" not in tail and (name.endswith((".so", ".dll", ".vdf", ".json")) or name.startswith("ssfn")):
@@ -1837,6 +1986,8 @@ def startup_policy_role(path, name):
             return "steam_htmlcache", "state"
         if name.startswith("appmanifest_") and name.endswith(".acf") or tail == "steamapps/libraryfolders.vdf":
             return "steam_htmlcache", "state"
+    if path in {"/usr/games/steam", "/usr/bin/steam"}:
+        return "steam_htmlcache", "code"
     return None
 
 
@@ -1847,41 +1998,78 @@ def classify_startup_resource(rec, path, name, policy):
         return (99, 0, 0)
     if role == "unused-runtime":
         return (99, 0, 0)
+    if role == "content":
+        # This is a content-object ceiling, not a limit on game DLLs/assets.
+        # A single world/avatar cache file of >=1 GiB must not buy the pool.
+        if rec.size >= GIB or name.startswith("__lock"):
+            return (99, 0, 0)
+        return (1, 10100, 0)
+    if role == "runtime" and name in {"usr-mtree.txt.gz", "usr-mtree.txt", "mtree.txt.gz", "versions.txt"}:
+        return (1, 11500, 0)
     if not journal and role != "index" and (any(part in path for part in STARTUP_DIAGNOSTIC_PARTS)
                         or name.endswith((".log", ".pma", ".dmp"))):
         return (99, 0, 0)
     # Bulk game/download payloads do not become code because of their directory.
-    if (role not in ("http", "index", "state", "shader") and name not in ELECTRON_RUNTIME_NAMES
+    bootstrap = role == "game" and (UNITY_BOOTSTRAP_RE.search(path) is not None
+                                    or name == "base.bin" and "/easyanticheat/certificates/" in path)
+    vr_bulk = (family == "vrchat_startup" and role == "game" and not bootstrap
+               and not file_is_executable(rec) and name.endswith(
+                   GAME_ASSET_SUFFIXES + (".assets", ".ress", ".resource", ".vrca", ".vrcw", ".unity3d", ".bin")))
+    if vr_bulk:
+        # Retain non-bootstrap installed assets as bounded residual candidates;
+        # no small file-size cutoff blocks VRChat's legitimate runtime data.
+        return (5, 40, 0)
+    if (not bootstrap and family != "vrchat_startup" and role not in ("http", "index", "state", "shader", "site-data") and name not in ELECTRON_RUNTIME_NAMES
             and name.endswith(GAME_ASSET_SUFFIXES + (".assets", ".ress", ".resource", ".vrca", ".vrcw", ".unity3d"))
             and not (role == "code" and name.endswith(".pak"))):
         if rec.size > 16 * MIB or role == "runtime":
             return (99, 0, 0)
-    ui_image = role == "client" and name.endswith((".jpg", ".jpeg", ".webp")) and rec.size <= 16 * MIB
-    if role not in ("http", "index", "state", "shader") and not ui_image and name.endswith(MEDIA_SUFFIXES + ARCHIVE_SUFFIXES + PACKAGE_IMAGE_SUFFIXES):
+    ui_image = role in {"client", "code"} and name.endswith((".jpg", ".jpeg", ".webp"))
+    if role not in ("http", "index", "state", "shader", "site-data") and not ui_image and name.endswith(MEDIA_SUFFIXES + ARCHIVE_SUFFIXES + PACKAGE_IMAGE_SUFFIXES):
+        if family == "steam_htmlcache" and (steam_root_tail(path) or "").startswith((
+                "steamui/", "steam/cached/", "controller_base/", "bin/", "legacycompat/", "steamrt32/")):
+            return (5, 40, 0)  # Preserve previous residual eligibility in newly recognized trees.
         return (99, 0, 0)
     if role == "runtime" and not (file_is_executable(rec) or is_shared_library_name(name)
-            or name.endswith(RUNTIME_SUFFIXES + CONFIG_SUFFIXES + (".dat", ".ttf", ".otf", ".nls", ".inf"))
-            or name in {"proton", "wine", "wine64", "wineserver", "version", "qmldir"}):
+            or name.endswith(RUNTIME_SUFFIXES + CONFIG_SUFFIXES + (".dat", ".ttf", ".otf", ".ttc", ".mo", ".qm", ".nls", ".inf", ".sh", ".bash"))
+            or name in {"proton", "wine", "wine64", "wineserver", "version", "qmldir", "run", "_v2-entry-point", "locale-archive"}):
         return (5, 40, 0)
-    if role == "game" and name.endswith(".bin") and rec.size > 16 * MIB:
+    if role == "game" and family != "vrchat_startup" and name.endswith(".bin") and rec.size > 16 * MIB:
         return (99, 0, 0)
-    if role == "game" and not (file_is_executable(rec) or is_shared_library_name(name)
+    if role == "game" and not (bootstrap or file_is_executable(rec) or is_shared_library_name(name)
             or name.endswith(RUNTIME_SUFFIXES + STARTUP_STATE_SUFFIXES)
             or name == "global-metadata.dat"
             or rec.size <= 16 * MIB):
         return (5, 40, 0)
     confidence = {"code": 11600, "index": 11400, "state": 11200, "client": 11000,
                   "runtime": 10800, "game": 10600, "shader": 10400,
-                  "support": 10200, "http": 10900}[role]
+                  "support": 10200, "site-data": 10850, "http": 10900}[role]
+    if role == "game" and (bootstrap or file_is_executable(rec)
+                           or name.endswith((".dll", ".exe", ".so")) or is_shared_library_name(name)):
+        confidence = 11550
+    # Prefer a broad working set before oversized ordinary cache/database
+    # objects. They stay eligible for residual space; code is never size-cut.
+    if rec.size > 256 * MIB and role in {"http", "site-data", "state", "shader", "support"}:
+        confidence = 9800
+    # Mutable container copies remain eligible, but persistent source code
+    # precedes them and existing inode deduplication prevents double warming.
+    if role == "runtime" and "/var/tmp-" in path:
+        confidence -= 300
+    if role == "runtime":
+        tool = STEAM_TOOL_RE.search(path)
+        selected, _ = startup_steam_tools()
+        if tool is not None and path[:tool.end()] in selected:
+            # The configured game/global tools lead the fallback selections.
+            confidence -= selected.index(path[:tool.end()]) * 50
     return (1, confidence, 0)
 
 
 
-def browser_cache_kind(path: str) -> Optional[tuple[str, str]]:
+def browser_cache_kind(path: str, _policy=...) -> Optional[tuple[str, str]]:
     """Return a bounded cache family and resource kind, including cache roots."""
-    policy = startup_policy_role(path, os.path.basename(path))
-    if policy is not None and policy[1] in {"index", "code", "state", "http", "shader"}:
-        return policy
+    policy = startup_policy_role(path, os.path.basename(path)) if _policy is ... else _policy
+    if policy is not None and policy[1] in {"index", "code", "state", "http", "shader", "site-data"}:
+        return (policy[0], "http") if policy[1] == "site-data" else policy
     # Most inventory files are system/app code, not browser caches.
     if not any(token in path for token in ("cache", "storage", "shared dictionary", "shared_dictionary")):
         return None
@@ -2270,12 +2458,16 @@ def is_hard_cold_file(path: str, name: str, size: int) -> bool:
 
     return False
 
-def classify_file(rec: FileRec) -> tuple[int, int, int]:
+def classify_file(rec: FileRec, _policy=..., _desktop=...) -> tuple[float, int, int]:
     path = os.path.normpath(rec.path).lower()
     name = os.path.basename(path)
     size = rec.size
 
-    policy = startup_policy_role(path, name)
+    desktop = desktop_startup_resource(path, name, size) if _desktop is ... else _desktop
+    if desktop:
+        return (0.25, 1500, 0)
+
+    policy = startup_policy_role(path, name) if _policy is ... else _policy
     if policy is not None:
         return classify_startup_resource(rec, path, name, policy)
 
@@ -2605,9 +2797,32 @@ def cache_budget_caps(cfg: dict) -> dict[str, int]:
     total_gib = parse_meminfo()["MemTotal"] / GIB
     values = next(values for maximum, values in STARTUP_RAM_BUDGETS if total_gib < maximum)
     defaults.update(zip(STARTUP_BUDGETS, values))
-    return {key: max(0, parse_size(default if cfg.get(key + "_budget_bytes") is None
+    defaults["vrchat_content_cache"] = defaults["vrchat_startup"]
+    caps = {key: max(0, parse_size(default if cfg.get(key + "_budget_bytes") is None
                                   else cfg[key + "_budget_bytes"]) or 0)
             for key, default in defaults.items()}
+    # This profile deliberately excludes all VRChat-specific warming. Shared
+    # Steam/Proton dependencies remain within Steam's independent allowance.
+    if total_gib < 20:
+        caps["vrchat_startup"] = caps["vrchat_content_cache"] = 0
+    caps["vrchat_content_cache"] = min(caps["vrchat_content_cache"], caps["vrchat_startup"])
+    return caps
+
+
+def budget_fits(key, cost, count, used, counts, caps, file_caps, default_limit):
+    """Apply both the optional content sub-cap and the one combined VR cap."""
+    keys = (key, "vrchat_startup") if key == "vrchat_content_cache" else (key,)
+    return all(used.get(k, 0) + cost <= caps.get(k, default_limit)
+               and (k not in file_caps or counts.get(k, 0) + count <= file_caps[k])
+               for k in keys if k)
+
+
+def charge_budget(key, cost, count, used, counts):
+    keys = (key, "vrchat_startup") if key == "vrchat_content_cache" else (key,)
+    for k in keys:
+        if k:
+            used[k] = used.get(k, 0) + cost
+            counts[k] = counts.get(k, 0) + count
 
 
 def cache_budget_file_caps(cfg: dict) -> dict[str, int]:
@@ -2615,21 +2830,21 @@ def cache_budget_file_caps(cfg: dict) -> dict[str, int]:
     # family count is a count limit; zero means unlimited.
     families = ("steam_htmlcache", "firefox_webcache", "chromium_webcache", "electron_webcache",
                 "desktop_shader_cache", "desktop_compiled_cache", "app_catalog",
-                "discord_startup", "vrchat_startup", "warrobots_startup")
+                "discord_startup", "vrchat_startup", "vrchat_content_cache", "warrobots_startup")
     return {key: int(cfg[key + "_max_files"]) for key in families
             if int(cfg.get(key + "_max_files", 0)) > 0}
 
 
-def cache_budget_key(rec: FileRec) -> Optional[str]:
+def cache_budget_key(rec: FileRec, _policy=...) -> Optional[str]:
     path = os.path.normpath(rec.path).lower()
-    policy = startup_policy_role(path, os.path.basename(path))
+    policy = startup_policy_role(path, os.path.basename(path)) if _policy is ... else _policy
     if policy is not None:
         return policy[0]
     if rec.budget:
         return rec.budget
     path = os.path.normpath(rec.path).lower()
 
-    web_cache = browser_cache_kind(path)
+    web_cache = browser_cache_kind(path, _policy=policy)
     if web_cache is not None:
         return web_cache[0]
 
@@ -2682,10 +2897,7 @@ def dynamic_cache_root_key(rec: FileRec) -> Optional[str]:
         return hytale_save_root(path)
 
     if is_vrchat_content_cache_path(path):
-        # Treat each Cache-WindowsPlayer first-level directory as one content
-        # unit. select_files() can then keep whole recent units, skip tiny
-        # marker units, and enforce the total 2G cap.
-        return vrchat_content_cache_unit_root(path)
+        return vrchat_content_cache_unit_root(rec.path)
 
     return None
 
@@ -2892,17 +3104,17 @@ def maybe_cooldown(
         time.sleep(delay)
 
 
-def selection_sort_key(rec: FileRec) -> Optional[tuple]:
+def selection_sort_key(rec: FileRec, _classification=None, _budget=None) -> Optional[tuple]:
     if rec.priority:
         return rec.priority
-    tier, confidence, _ = classify_file(rec)
+    tier, confidence, _ = classify_file(rec) if _classification is None else _classification
 
     if tier >= 99:
         return None
 
     path = os.path.normpath(rec.path).lower()
     name = os.path.basename(path)
-    budget_key = cache_budget_key(rec)
+    budget_key = cache_budget_key(rec) if _budget is None else _budget
     recency_first = budget_key in RECENCY_FIRST_BUDGET_KEYS
 
     if tier == 5:
@@ -2919,6 +3131,11 @@ def selection_sort_key(rec: FileRec) -> Optional[tuple]:
         )
 
     if recency_first:
+        if budget_key in STARTUP_BUDGET_KEYS or "/obs-studio/plugin_config/obs-browser/" in path:
+            # File contents' modification time, not preload-induced atime.
+            # ctime is only a tie-break, never mislabeled as creation time.
+            modified = rec.mtime_ns / 1e9 if rec.mtime_ns else rec.mtime
+            return (tier, -confidence, -modified, -rec.ctime_ns / 1e9, rec.size, rec.path)
         return (
             tier,
             -confidence,
@@ -3854,12 +4071,20 @@ def classify_batch(items):
     Spawn workers never receive the inventory/database or walk payload trees.
     """
     rows = []
+    if items:
+        startup_steam_tools()  # One memoized snapshot per spawned classifier.
     for rec, hits, last_use in items:
-        priority = selection_sort_key(rec)
+        # Reuse these pure metadata decisions within this batch record. No
+        # path cache is retained across files or grows with the inventory.
+        lower = os.path.normpath(rec.path).lower()
+        startup = startup_policy_role(lower, os.path.basename(lower))
+        desktop = desktop_startup_resource(lower, os.path.basename(lower), rec.size)
+        classification = classify_file(rec, _policy=startup, _desktop=desktop)
+        budget = cache_budget_key(rec, _policy=startup) or ""
+        priority = selection_sort_key(rec, _classification=classification, _budget=budget)
         if priority is None:
             rows.append((rec, None, "", ""))
             continue
-        budget = cache_budget_key(rec) or ""
         unit = dynamic_cache_root_key(rec) or ""
         key = list(priority[:5])
         # Learn portable/custom applications too, without turning a frequent
@@ -3875,7 +4100,7 @@ def classify_batch(items):
             age_days = max(0.0, (time.time() - last_use) / 86400)
             if min(32.0, hits) * (0.5 ** (age_days / 14.0)) >= 0.5:
                 key[0] = 1
-        if key[0] == 0 and not os.path.basename(rec.path).lower().startswith((
+        if key[0] == 0 and not desktop and not os.path.basename(rec.path).lower().startswith((
                 "ld-linux", "ld-musl", "libc.", "libpthread.", "libdl.", "librt.",
                 "libm.", "libstdc++.", "libgcc_s.", "libglib-", "libgobject-", "libgio-")):
             # Installed != frequently used. Keep the loader/ABI foundation
@@ -3883,7 +4108,7 @@ def classify_batch(items):
             key[0] = 1.5
         # Real recurring use outranks unused installations. Never promote
         # downloaded game content or bulk fallback media to executable priority.
-        if hits > 0 and key[0] < 5:
+        if hits > 0 and key[0] < 5 and startup is None and not desktop:
             age_days = max(0.0, (time.time() - last_use) / 86400)
             frequency = min(32.0, hits) * (0.5 ** (age_days / 14.0))
             browser_kind = browser_cache_kind(rec.path.lower())
@@ -3893,6 +4118,10 @@ def classify_batch(items):
                 key[1] = -20000 - min(10000, frequency * 200)
                 if budget:
                     key[2] = -last_use
+        elif hits > 0 and startup is not None and startup[1] not in STARTUP_CONTENT_ROLES:
+            # Retain learning within a semantic role without letting a large
+            # learned Proton tree leap ahead of the client/browser it supports.
+            key[2] = -max(-key[2], last_use)
         rows.append((rec, tuple(key), budget, unit))
     return rows
 
@@ -4124,7 +4353,9 @@ class InventoryDB:
         an old priority index from being published as a new-policy startup plan.
         Later starts take only the version check.
         """
-        if self.meta("policy_version", 0) == POLICY_VERSION:
+        context = startup_policy_context()
+        previous_context = getattr(self, "_startup_context", None) or self.meta("saved_plan_header", {}).get("startup_context")
+        if self.meta("policy_version", 0) == POLICY_VERSION and previous_context == context:
             return
         if self.connection.execute("SELECT 1 FROM files LIMIT 1").fetchone():
             prefixes = list(BROWSER_RUNTIME_PREFIXES[:3]) + [
@@ -4133,7 +4364,10 @@ class InventoryDB:
                 "/usr/lib64/vesktop", "/usr/share/discord", "/usr/share/vesktop",
                 "/var/lib/flatpak/app/org.mozilla.firefox",
                 "/var/lib/flatpak/app/dev.vencord.Vesktop",
-                "/var/lib/flatpak/app/com.discordapp.Discord", "/snap/firefox"]
+                "/var/lib/flatpak/app/com.discordapp.Discord", "/snap/firefox",
+                "/usr/games/steam", "/usr/bin/steam", "/usr/share/cosmic", "/usr/lib/locale",
+                "/usr/share/egl/egl_external_platform.d", "/usr/share/vulkan/icd.d",
+                "/usr/share/vulkan/implicit_layer.d", "/usr/share/vulkan/explicit_layer.d"]
             for home in iter_home_dirs():
                 prefixes.extend(str(home / part) for part in (
                     ".mozilla/firefox", ".config/mozilla/firefox", ".config/firefox", ".cache/mozilla/firefox", ".cache/firefox",
@@ -4145,26 +4379,46 @@ class InventoryDB:
                     ".cache/vesktop", ".cache/discord", ".cache/discordcanary", ".cache/discordptb",
                     ".var/app/org.mozilla.firefox", ".var/app/dev.vencord.Vesktop", ".var/app/com.discordapp.Discord",
                     ".local/share/flatpak/app/org.mozilla.firefox", ".local/share/flatpak/app/dev.vencord.Vesktop",
-                    ".local/share/flatpak/app/com.discordapp.Discord", ".config/obs-studio/plugin_config/obs-browser"))
+                    ".local/share/flatpak/app/com.discordapp.Discord", ".config/obs-studio/plugin_config/obs-browser",
+                    ".pki/nssdb", ".local/share/pki/nssdb", ".config/cosmic", ".local/share/vulkan/implicit_layer.d"))
             startup_steam_tools()
             prefixes.extend(getattr(startup_steam_tools, "inventory_prefixes", ()))
+            prefixes.extend(startup_vrchat_cache_roots())
             prefixes = compact_prefixes([os.path.realpath(p) for p in prefixes])
+            ranges = []
             for prefix in prefixes:
                 raw = os.fsencode(prefix)
-                low, high = raw.rstrip(b"/") + b"/", raw.rstrip(b"/") + b"0"
-                cursor = raw
+                ranges.append((raw, raw + b"\0"))
+                ranges.append((raw.rstrip(b"/") + b"/", raw.rstrip(b"/") + b"0"))
+            # Filename-prefix ranges use the existing path primary key. Avoid
+            # reranking every record under /usr/lib during a policy upgrade.
+            libdirs = ["/usr/lib", "/usr/lib64", "/usr/local/lib", "/usr/local/lib64"]
+            libdirs += [base + "/" + abi for base in ("/usr/lib", "/usr/local/lib")
+                        for abi in ("x86_64-linux-gnu", "i386-linux-gnu", "aarch64-linux-gnu", "arm-linux-gnueabihf")]
+            named = [base + "/" + head for base in libdirs for head in DESKTOP_LIBRARY_HEADS]
+            named += [base + "/" + head for base in ("/usr/bin", "/usr/libexec") for head in DESKTOP_PROGRAM_HEADS]
+            for prefix in (base + "/" + part for base in libdirs for part in DESKTOP_MODULE_DIRS):
+                raw = os.fsencode(prefix)
+                ranges.append((raw, raw + b"\0"))
+                ranges.append((raw + b"/", raw + b"0"))
+            for prefix in named:
+                raw = os.fsencode(prefix)
+                ranges.append((raw, raw[:-1] + bytes([raw[-1] + 1])))
+            for low, high in ranges:
+                cursor = low
                 while True:
                     rows = self.connection.execute("""SELECT f.path,f.size,f.stamp,f.mode,f.dev,f.ino,
                         f.mtime_ns,f.ctime_ns,coalesce(u.hits,0),coalesce(u.last_use,0)
                         FROM files f LEFT JOIN usage u ON f.path=u.path
-                        WHERE (f.path=? OR (f.path>=? AND f.path<?)) AND f.path>=?
-                        ORDER BY f.path LIMIT 256""", (raw, low, high, cursor)).fetchall()
+                        WHERE f.path>=? AND f.path<?
+                        ORDER BY f.path LIMIT 256""", (cursor, high)).fetchall()
                     if not rows:
                         break
                     work = []
                     for row in rows:
                         path = os.fsdecode(row[0])
-                        if startup_policy_role(path.lower(), os.path.basename(path).lower()) is not None:
+                        if (startup_policy_role(path.lower(), os.path.basename(path).lower()) is not None
+                                or desktop_startup_resource(path.lower(), os.path.basename(path).lower(), row[1])):
                             work.append((FileRec(path, *row[1:8]), row[8], row[9]))
                     for rec, priority, budget, unit in classify_batch(work):
                         if priority is None:
@@ -4174,6 +4428,8 @@ class InventoryDB:
                                 (*priority, budget, os.fsencode(unit), os.fsencode(rec.path)))
                     cursor = rows[-1][0] + b"\0"
         self.set_meta("policy_version", POLICY_VERSION)
+        self._startup_context = context
+        self.force_publish = True
 
 
     def begin_scan(self, roots: list[str], cfg: dict, *, resume=True):
@@ -4341,6 +4597,50 @@ class InventoryDB:
         self.connection.executemany("DELETE FROM usage WHERE path=?", [(row[0],) for row in rows])
         return len(rows)
 
+    def content_units(self, *, interruptible=False):
+        """Use the existing budget/unit index; never stat or parse payloads.
+
+        Unity version members share the payload's timestamp so selection is
+        newest-first by content, not by recently touched __info markers.
+        Flat texture/HTTP objects each form their own unit. Dirty triggers
+        record only changed ranks in the existing checkpoint bookkeeping.
+        """
+        units = {}
+        checked = time.monotonic()
+        query = """SELECT unit,path,size,dev,ino,mtime_ns,ctime_ns FROM files
+                   WHERE budget='vrchat_content_cache' ORDER BY unit,path"""
+        for unit, raw, size, dev, ino, modified, changed in self.connection.execute(query):
+            if interruptible and time.monotonic() - checked >= 1:
+                checked = time.monotonic()
+                if not RUNNING or discovery_is_parked():
+                    raise PlanDeferred()
+            item = units.setdefault(unit, {"members": {}, "mtime": 0, "ctime": 0,
+                                            "payload": None, "has_info": False})
+            path = os.fsdecode(raw)
+            identity = (dev, ino)
+            if identity not in item["members"]:
+                item["members"][identity] = (page_bytes(size), record_metadata_bytes(path, "vrchat_content_cache"))
+            stamp = (modified / 1e9, changed / 1e9)
+            if stamp > (item["mtime"], item["ctime"]):
+                item["mtime"], item["ctime"] = stamp
+            name = os.path.basename(path).lower()
+            if name == "__data":
+                item["payload"] = stamp
+            elif name == "__info":
+                item["has_info"] = True
+        updates = []
+        for unit, item in units.items():
+            item["complete"] = (item["has_info"] and item["payload"] is not None
+                                if item["has_info"] or item["payload"] is not None else True)
+            if item["payload"] is not None:
+                item["mtime"], item["ctime"] = item["payload"]
+            if item["complete"]:
+                updates.append((-item["mtime"], -item["ctime"], unit,
+                                -item["mtime"], -item["ctime"]))
+        self.connection.executemany("""UPDATE files SET k2=?,k3=?,k4=0
+            WHERE budget='vrchat_content_cache' AND unit=? AND (k2<>? OR k3<>? OR k4<>0)""", updates)
+        return units
+
     def publish(self, cfg: dict, roots: list[str], *, reason: str):
         """Stream from the priority index. No all-inventory Python list/sort."""
         interruptible = self.volatile and reason != "shutdown"
@@ -4356,11 +4656,9 @@ class InventoryDB:
         caps, file_caps = cache_budget_caps(cfg), cache_budget_file_caps(cfg)
         used, counts, units, inodes = {}, {}, {}, set()
         chosen_units = set()
-        # This indexed aggregate only visits bounded game content, never every
-        # inventory record before each selection as the old controller did.
-        for unit, size in self.connection.execute(
-                "SELECT unit,sum(size) FROM files WHERE budget='vrchat_content_cache' GROUP BY unit"):
-            units[unit] = size
+        # Only the indexed VR content range needs group aggregation. All other
+        # families retain the existing streaming priority-index selection.
+        units = self.content_units(interruptible=interruptible) if caps["vrchat_content_cache"] else {}
         # The live plan is IPC in /run (tmpfs on supported systemd desktops).
         # Reboot persistence uses changed saved_plan rows at checkpoint time.
         plan_dir = RUNTIME_PATH if self.volatile else STATE_PATH
@@ -4378,7 +4676,8 @@ class InventoryDB:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as output:
                 header = {"schema": 1, "policy": POLICY_VERSION, "created": time.time(),
-                          "generation": uuid.uuid4().hex, "reason": reason}
+                          "generation": uuid.uuid4().hex, "reason": reason,
+                          "startup_context": startup_policy_context()}
                 output.write(json.dumps(header) + "\n")
                 query = """SELECT f.path,f.size,f.stamp,f.mode,f.dev,f.ino,f.mtime_ns,f.ctime_ns,
                     f.k0,f.k1,f.k2,f.k3,f.k4,f.budget,f.unit,s.record,d.path FROM files f
@@ -4413,7 +4712,7 @@ class InventoryDB:
                     if metadata_used + metadata_cost > metadata_limit:
                         resource_skipped = True
                         continue
-                    if (not fallback and metadata_used >= metadata_limit // 2
+                    if (budget != "vrchat_content_cache" and not fallback and metadata_used >= metadata_limit // 2
                             and cost * (metadata_limit - metadata_used) < metadata_cost * (limit - byte_count)):
                         # Reserve byte coverage when bookkeeping is expensive
                         # relative to data. No count or fixed file-size cutoff.
@@ -4421,17 +4720,25 @@ class InventoryDB:
                         continue
                     if budget:
                         budget_cost = cost
+                        budget_count = 1
                         if budget == "vrchat_content_cache":
                             if unit not in chosen_units:
-                                budget_cost = units.get(unit, cost)
+                                group = units.get(unit)
+                                if not group or not group["complete"]:
+                                    continue
+                                members = [value for identity, value in group["members"].items() if identity not in inodes]
+                                budget_cost = sum(value[0] for value in members)
+                                budget_count = len(members)
+                                if (byte_count + budget_cost > limit
+                                        or metadata_used + sum(value[1] for value in members) > metadata_limit
+                                        or max_files is not None and count + budget_count > max_files):
+                                    continue
                             else:
                                 budget_cost = 0
-                        if used.get(budget, 0) + budget_cost > caps.get(budget, limit):
+                                budget_count = 0
+                        if not budget_fits(budget, budget_cost, budget_count, used, counts, caps, file_caps, limit):
                             continue
-                        if budget in file_caps and counts.get(budget, 0) >= file_caps[budget]:
-                            continue
-                        used[budget] = used.get(budget, 0) + budget_cost
-                        counts[budget] = counts.get(budget, 0) + 1
+                        charge_budget(budget, budget_cost, budget_count, used, counts)
                         if budget == "vrchat_content_cache":
                             chosen_units.add(unit)
                     inodes.add(identity)
@@ -4461,7 +4768,8 @@ class InventoryDB:
                     os.fsync(output.fileno())
             self.connection.execute("DELETE FROM saved_plan WHERE path NOT IN (SELECT path FROM plan_members)")
             invalid = RUNTIME_PATH / "plan-invalid.json"
-            if self.meta("plan_digest") == digest.hexdigest() and path.exists() and not invalid.exists():
+            if (self.meta("plan_digest") == digest.hexdigest() and path.exists() and not invalid.exists()
+                    and self.meta("saved_plan_header", {}).get("startup_context") == header["startup_context"]):
                 os.unlink(temp)
                 header["generation"] = self.meta("plan_generation", header["generation"])
             else:
@@ -4592,8 +4900,26 @@ def bootstrap_paths(cfg: dict, roots: list[str]) -> list[str]:
             ".cache/mozilla", ".cache/google-chrome", ".cache/chromium"))
         for root in (home / ".steam/root", home / ".local/share/Steam", home / ".steam/debian-installation"):
             for child in ("ubuntu12_64", "ubuntu12_32", "resource", "config", "steamapps/common/VRChat"):
+                if child.endswith("/VRChat") and not cache_budget_caps(cfg)["vrchat_startup"]:
+                    continue
                 wanted.append(os.path.realpath(root / child))
-    return [path for path in compact_prefixes(wanted)
+    targeted = list(BROWSER_RUNTIME_PREFIXES[:3]) + ["/opt/Vesktop", "/opt/vesktop", "/opt/discord"]
+    startup_steam_tools()
+    for root in getattr(startup_steam_tools, "client_roots", ()):
+        targeted.extend(str(Path(root) / child) for child in (
+            "steamui", "clientui", "steam/cached", "ubuntu12_64", "ubuntu12_32",
+            "resource", "config/htmlcache", "appcache", "config", "steamrt64"))
+    if cache_budget_caps(cfg)["vrchat_startup"]:
+        for root in getattr(startup_steam_tools, "library_roots", ()):
+            base = Path(root) / "steamapps"
+            targeted.append(str(base / "common/VRChat"))
+            local = base / "compatdata/438100/pfx/drive_c/users/steamuser/AppData/LocalLow/VRChat/VRChat"
+            targeted.extend(str(local / child) for child in (
+                "Cache-WindowsPlayer", "TextureDiskCache-WindowsPlayer", "HTTPCache-WindowsPlayer"))
+        targeted.extend(startup_vrchat_cache_roots())
+    # Retain the broad original roots. The existing todo/visited generation
+    # keys prevent duplicate directory visits when a targeted child goes first.
+    return [path for path in dict.fromkeys(os.path.realpath(p) for p in targeted + wanted)
             if os.path.isdir(path) and cache_path_allowed(path, cfg, roots)]
 
 
@@ -4621,8 +4947,10 @@ def run_planner() -> int:
     # State survives interruption at directory granularity. Restat selected
     # files in the supervisor before warming, then reconcile the rest here.
     first_install = not db.meta("saved_plan_header") and not (STATE_PATH / "startup-plan.jsonl").exists()
+    policy_upgrade = (db.meta("policy_version", 0) != POLICY_VERSION
+                      or db.meta("saved_plan_header", {}).get("startup_context") != startup_policy_context())
     generation = db.begin_scan(roots, cfg)
-    if first_install:
+    if first_install or policy_upgrade:
         # Put useful small discovery roots ahead of the broad filesystem walk.
         original = db.connection.execute("SELECT path,dev,stay FROM todo").fetchall()
         db.connection.execute("DELETE FROM todo")
@@ -5361,8 +5689,16 @@ class PlanReader:
                         continue
                     if header.get("schema") != 1:
                         raise ValueError("unsupported startup plan")
+                    if (header.get("policy") != POLICY_VERSION
+                            or header.get("startup_context") != startup_policy_context()):
+                        # Let the existing planner rerank indexed metadata and
+                        # publish once. Do not restat/reclassify an obsolete
+                        # million-file plan or fill from old priorities first.
+                        self.stop.wait(0.5)
+                        continue
                     self.put(("begin", header))
                     batch, skipped, seen = [], 0, set()
+                    newly_oversized = []
                     index = 0
                     maximum = explicit_plan_file_limit(self.cfg)
                     metadata_limit = selection_metadata_budget(self.cfg, parse_meminfo()["MemTotal"])
@@ -5378,6 +5714,7 @@ class PlanReader:
                         if len(line) > 65536:
                             raise ValueError("oversized startup plan record")
                         saved = record_from_list(json.loads(line))
+                        defer_large = False
                         metadata_cost = record_metadata_bytes(saved.path, saved.budget)
                         if metadata_used + metadata_cost > metadata_limit:
                             skipped += 1
@@ -5394,22 +5731,33 @@ class PlanReader:
                             if priority is None:
                                 skipped += 1
                                 continue
+                            defer_large = (priority[:2] == (1, -9800)
+                                           and saved.priority[:2] != (1, -9800))
                             saved = FileRec(actual.path, actual.size, actual.mtime, actual.mode,
                                             actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
                                             tuple(priority[:5]), cache_budget_key(actual) or "")
                         seen.add((actual.dev, actual.ino))
                         metadata_used += metadata_cost
+                        if defer_large:
+                            # A formerly small site DB/blob may have grown
+                            # since checkpointing. Do not warm it at its old
+                            # early position ahead of the normal working set.
+                            newly_oversized.append(saved)
+                            continue
                         batch.append(saved)
                         if len(batch) >= 512:
                             self.put(("batch", batch))
                             batch = []
                     if batch:
                         self.put(("batch", batch))
+                    for offset in range(0, len(newly_oversized), 512):
+                        self.put(("batch", newly_oversized[offset:offset + 512]))
                     self.put(("end", {"skipped": skipped, **header}))
                     # Validation's duplicate-inode set is temporary; do not
                     # retain millions of tuples throughout the idle interval.
                     seen.clear()
                     batch = []
+                    newly_oversized.clear()
                 last_identity = identity
             except FileNotFoundError:
                 pass
@@ -5420,42 +5768,139 @@ class PlanReader:
             self.stop.wait(0.5)
 
 
-def choose_candidates(records, budget, cfg, *, existing=()):
+def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
     total = 0
     selected = []
-    used = {}
-    counts = {}
+    used, counts, present = {}, {}, set()
     caps, file_caps = cache_budget_caps(cfg), cache_budget_file_caps(cfg)
     maximum = parse_size(cfg.get("vmtouch_max_file_size", "128G"))
-    # A refill with an unchanged plan retains the current worker records.
-    # Identity integers are much smaller than rebuilding millions of path/
-    # timestamp tuples, and only newly selected records are returned.
-    present = set()
+    existing_content = []
     for rec in existing:
         present.add(id(rec))
         cost = page_bytes(rec.size)
         total += cost
-        if rec.budget:
-            used[rec.budget] = used.get(rec.budget, 0) + cost
-            counts[rec.budget] = counts.get(rec.budget, 0) + 1
+        charge_budget(rec.budget, cost, 1, used, counts)
+        if rec.budget == "vrchat_content_cache":
+            existing_content.append(rec)
+
+    # Only the bounded VR content subset needs grouping/sorting; the main
+    # selection stays in its saved priority order without a full list sort.
+    units = {}
+    if caps["vrchat_content_cache"]:
+        content_ids = set()
+        for rec in records:
+            if rec.budget == "vrchat_content_cache":
+                units.setdefault(vrchat_content_cache_unit_root(rec.path), []).append(rec)
+                content_ids.add(id(rec))
+        for rec in existing_content:
+            if id(rec) not in content_ids:
+                units.setdefault(vrchat_content_cache_unit_root(rec.path), []).append(rec)
+
+    def unit_time(members):
+        payload = [r for r in members if os.path.basename(r.path).lower() == "__data"]
+        return max(((r.mtime_ns / 1e9 if r.mtime_ns else r.mtime, r.ctime_ns) for r in payload or members), default=(0, 0))
+
+    content_done = False
     for rec in records:
-        if present and id(rec) in present:
+        if rec.budget == "vrchat_content_cache":
+            if content_done:
+                continue
+            content_done = True
+            ordered = sorted(units.items(), key=lambda item: (-unit_time(item[1])[0], -unit_time(item[1])[1], item[0]))
+            for _, members in ordered:
+                names = {os.path.basename(r.path).lower() for r in members}
+                if names & {"__info", "__data"} and not {"__info", "__data"} <= names:
+                    continue
+                missing = [r for r in members if id(r) not in present]
+                if not missing or any((maximum is not None and r.size > maximum) or r.size >= GIB
+                                      or (excluded and record_key(r) in excluded) for r in missing):
+                    continue
+                cost = sum(page_bytes(r.size) for r in missing)
+                if total + cost > budget or not budget_fits(
+                        "vrchat_content_cache", cost, len(missing), used, counts, caps, file_caps, budget):
+                    continue
+                charge_budget("vrchat_content_cache", cost, len(missing), used, counts)
+                selected.extend(missing)
+                total += cost
+            continue
+        if id(rec) in present or (excluded and record_key(rec) in excluded):
             continue
         if maximum is not None and rec.size > maximum:
             continue
         cost = page_bytes(rec.size)
-        if total + cost > budget:
+        if total + cost > budget or not budget_fits(rec.budget, cost, 1, used, counts, caps, file_caps, budget):
             continue
-        if rec.budget:
-            if used.get(rec.budget, 0) + cost > caps.get(rec.budget, budget):
-                continue
-            if rec.budget in file_caps and counts.get(rec.budget, 0) >= file_caps[rec.budget]:
-                continue
-            used[rec.budget] = used.get(rec.budget, 0) + cost
-            counts[rec.budget] = counts.get(rec.budget, 0) + 1
+        charge_budget(rec.budget, cost, 1, used, counts)
         selected.append(rec)
         total += cost
     return selected
+
+
+def refill_candidates(records, budget, cfg, existing, failed_until, *, control_tick=None):
+    """Reuse the remembered selection, validating only proposed new reads.
+
+    Unchanged records retain their objects/priorities; no inventory query,
+    directory traversal or new plan publication is needed. Local metadata
+    changes update this existing in-memory view. The normal next-start scan
+    persists current records through the same SQLite bookkeeping.
+    """
+    additions = choose_candidates(records, budget, cfg, existing=existing, excluded=failed_until)
+    updates, verified, identities = {}, [], set()
+    replaced = reclassified = False
+    roots = cfg.get("_resolved_roots", cfg.get("include_paths", ["/"]))
+    last_control = time.monotonic()
+    for rec in additions:
+        if control_tick is not None and time.monotonic() - last_control >= 1:
+            last_control = time.monotonic()
+            if control_tick():
+                break  # Return promptly to the unchanged pressure-release loop.
+        actual = stat_record(rec.path)
+        if (actual is None or not cache_path_allowed(actual.path, cfg, roots)
+                or not record_device_allowed(actual, cfg, roots)):
+            updates[id(rec)] = None
+            continue
+        if (actual.dev, actual.ino) in identities:
+            updates[id(rec)] = None
+            continue
+        identities.add((actual.dev, actual.ino))
+        if record_key(actual) == record_key(rec):
+            verified.append(rec)
+            continue
+        if (actual.dev, actual.ino, actual.size, actual.mtime_ns, actual.mode) == (rec.dev, rec.ino, rec.size, rec.mtime_ns, rec.mode):
+            # Creating/removing Steam's hard links can change ctime without
+            # changing contents or ownership of the underlying cached pages.
+            refreshed = FileRec(actual.path, actual.size, actual.mtime, actual.mode,
+                                actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
+                                rec.priority, rec.budget)
+        else:
+            reclassified = True
+            replaced = replaced or (actual.dev, actual.ino) != (rec.dev, rec.ino)
+            _, priority, family, _ = classify_batch([(actual, 0, 0)])[0]
+            refreshed = (FileRec(actual.path, actual.size, actual.mtime, actual.mode,
+                                 actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
+                                 priority, family) if priority is not None else None)
+        updates[id(rec)] = refreshed
+        if refreshed is not None:
+            verified.append(refreshed)
+    if updates:
+        # Replace only changed references. Do not rebuild keys/sort for every
+        # healthy worker as general reconciliation previously did on regrowth.
+        if reclassified:
+            changed = [value for value in updates.values() if value is not None]
+            order = lambda r: (r.priority or (99,), r.path)
+            changed.sort(key=order)
+            records[:] = heapq.merge((rec for rec in records if id(rec) not in updates), changed, key=order)
+            verified.sort(key=order)
+        else:
+            records[:] = [value for rec in records if (value := updates.get(id(rec), rec)) is not None]
+    if replaced:
+        healthy = {(r.dev, r.ino) for r in existing}
+        verified = [r for r in verified if (r.dev, r.ino) not in healthy]
+    if not reclassified and len(verified) == len(additions):
+        return verified  # Unchanged/ctime-only reads already fit: no second selection.
+    # Size/family changes and complete content groups must be re-budgeted from
+    # their actual metadata before launching. This list is only new reads.
+    return choose_candidates(verified, budget, cfg, existing=existing, excluded=failed_until)
 
 
 def planner_command():
@@ -5517,6 +5962,16 @@ def run_supervisor() -> int:
     pause = False
     was_holding = False
     refill_from_plan = False
+    filled_once = False
+
+    def refill_control_tick():
+        # Keep the existing IPC lease fresh during a long known-path metadata
+        # batch. Never let its 10-s safety expiry accidentally wake discovery.
+        atomic_json(RUNTIME_PATH / "pressure.json", {
+            "timestamp": time.time(), "pause_discovery": True,
+            "cache_holding": False, "refill_from_plan": True,
+        })
+        return not RUNNING or parse_meminfo()["MemAvailable"] < reserve
     try:
         while RUNNING:
             now = time.monotonic()
@@ -5602,9 +6057,14 @@ def run_supervisor() -> int:
                 budget_policy.evaluate(meminfo, cfg, owned_locked, inflight, paused=pause, now=now)
             budget = budget_policy.target
             holding = not budget_policy.refilling
-            grow_existing = (not holding and budget > last_budget and validated
-                             and not plan_changed and not failed_until and not retired)
-            defer_plan = holding or refill_from_plan or grow_existing
+            if not holding and filled_once:
+                refill_from_plan = True
+            grow_existing = refill_from_plan or (
+                not holding and budget > last_budget and validated
+                and not plan_changed and not failed_until and not retired)
+            # An interrupted initial saved-plan stream may still finish, but
+            # discovery stays parked and a validated list is never re-read.
+            defer_plan = holding or (validated and (refill_from_plan or grow_existing))
             (reader.paused.set if defer_plan else reader.paused.clear)()
 
             # Stream useful validated records immediately, without waiting for
@@ -5639,29 +6099,18 @@ def run_supervisor() -> int:
 
             if not holding and not pause and records and now - last_reconcile >= 1 and (
                     plan_changed or budget != last_budget
-                    or any(deadline <= now for deadline in failed_until.values())):
+                    or any(deadline <= now for deadline in failed_until.values())) and not (grow_existing and retired):
                 failed_until = {key: deadline for key, deadline in failed_until.items() if deadline > now}
                 if grow_existing:
-                    # No plan change: append only the newly affordable files.
-                    # Healthy workers and their bookkeeping stay in place.
-                    additions = choose_candidates(records, budget, cfg, existing=(
-                        rec for worker in workers for rec in worker.records))
-                    # A held plan may be hours old. Validate just the new
-                    # reads, not the millions of records already cached.
-                    verified = []
-                    for rec in additions:
-                        actual = stat_record(rec.path)
-                        if actual is not None and record_key(actual) == record_key(rec):
-                            verified.append(rec)
-                    if len(verified) != len(additions):
-                        atomic_json(RUNTIME_PATH / "plan-invalid.json", {
-                            "timestamp": time.time(), "reason": "refill candidates changed while holding"})
-                    additions = verified
+                    refill_from_plan = True
+                    refill_control_tick()
+                    existing = [rec for worker in workers for rec in worker.records]
+                    additions = refill_candidates(records, budget, cfg, existing, failed_until,
+                                                   control_tick=refill_control_tick)
                     cache_goal = sum(worker.requested for worker in workers) + sum(
                         page_bytes(rec.size) for rec in additions)
                     pending_chunks = deque(worker_chunks(additions, cfg))
-                    del additions, verified
-                    refill_from_plan = cache_goal >= budget - 128 * MIB
+                    del additions, existing
                     last_reconcile, last_budget, plan_changed = now, budget, False
                 else:
                     refill_from_plan = False
@@ -5745,12 +6194,23 @@ def run_supervisor() -> int:
             # Full means stop expensive work in BOTH processes. The latch also
             # covers a small whole-file tail that cannot fit the reserve.
             if (budget_policy.refilling and validated and not active_loading
-                    and not pending_chunks and cache_goal >= budget - 128 * MIB):
+                    and not pending_chunks and not retired
+                    and (not refill_from_plan or not plan_changed)
+                    and (cache_goal >= budget - 128 * MIB or refill_from_plan)):
+                # A refill may exhaust the remembered pool before headroom.
+                # Hold there; exhaustion must never restart filesystem work.
+                # Keep the headroom target latched even if the known pool is
+                # smaller. Lowering it to cache_goal would retry this same
+                # exhausted pool every 30 s with unchanged available memory.
                 budget_policy.hold(budget)
             holding = not budget_policy.refilling
             if holding:
+                # Pressure can interrupt the very first fill. Only a normal
+                # transition to holding establishes a completed selection;
+                # otherwise its unfinished boot discovery must still resume.
+                filled_once = filled_once or (bool(records) and not was_holding and not pause)
                 refill_from_plan = False
-            (reader.paused.set if holding or refill_from_plan else reader.paused.clear)()
+            (reader.paused.set if holding or (refill_from_plan and validated) else reader.paused.clear)()
             if holding and not was_holding:
                 release_unused_heap()
             was_holding = holding
@@ -5874,6 +6334,7 @@ def run_supervisor() -> int:
                                 retired.append((now, worker))
                         reader.stop.set()
                         reader = PlanReader(cfg, roots)
+                        filled_once = refill_from_plan = False
                         plan_changed = True
                         try:
                             os.killpg(planner.pid, signal.SIGTERM)
@@ -6108,7 +6569,7 @@ write_config() {
 import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 path = Path('/etc/ramcache-controller/config.json')
-defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":4,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null}''')
+defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":null,"target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":5,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null}''')
 legacy = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":10,"incremental_rescan_interval_seconds":300,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":96,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":30,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"4G","target_shrink_to_available_bytes":"6G","target_grow_above_available_bytes":"7G","target_grow_to_available_bytes":"6G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"8G","vmtouch_chunk_target_bytes":"1024M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{}}''')
 current = {}
 if path.exists():
@@ -6137,7 +6598,12 @@ if int(current.get('config_version', 1)) < 4:
                      'steam_htmlcache_budget_bytes': ('1G', '768M')}.items():
         if current.get(key) in old:
             merged[key] = None
-merged['config_version'] = 4
+# Fold only the previous shipped content default into the combined VRChat cap.
+# Explicit non-default sub-caps (including zero) remain effective.
+if int(current.get('config_version', 1)) < 5:
+    if current.get('vrchat_content_cache_budget_bytes') in ('2G', '1G'):
+        merged['vrchat_content_cache_budget_bytes'] = None
+merged['config_version'] = 5
 if current == merged:
     subprocess.run([sys.executable, sys.argv[1], '--config', str(path), '--check-config'], check=True, stdout=subprocess.DEVNULL)
     print('Existing configuration preserved.')
@@ -6152,7 +6618,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.25.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.4.26.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -7567,7 +8033,7 @@ install_all() {
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.25. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.4.26. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
@@ -7643,7 +8109,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.25"
+  echo "RAM cache controller installer: v1.4.26"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
