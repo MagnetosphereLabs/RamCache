@@ -63,7 +63,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.3"
+CONTROLLER_VERSION = "1.4.4"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -4047,20 +4047,40 @@ def worker_chunks(records: list[FileRec], cfg: dict):
                        256 * MIB)
     mutable_limit = min(stable_limit, 64 * MIB)
     max_paths = min(8192, int(cfg.get("vmtouch_chunk_max_paths", 8192)))
-    current, size, previous_mutable = [], 0, None
-    for rec in records:
+    # Keep stable and mutable mappings in separate workers, but do not flush
+    # on every alternation between them. That creates one sleeping process per
+    # tiny file in interleaved plans, exhausting TasksMax and making every
+    # memory-monitor tick poll thousands of otherwise idle processes.
+    buffers = {False: [], True: []}
+    sizes = {False: 0, True: 0}
+    first = {}
+    previous_role = None
+
+    def flush():
+        for kind in sorted(first, key=first.get):
+            yield buffers[kind]
+            buffers[kind] = []
+            sizes[kind] = 0
+        first.clear()
+
+    for position, rec in enumerate(records):
+        # Preserve priority-tier boundaries; per-file learning/recency ranks
+        # can differ for every path and must not fragment the batches again.
+        role = rec.priority[:1]
+        if first and role != previous_role:
+            yield from flush()
         mutable = bool(rec.budget) or any(marker in rec.path.lower() for marker in (
             "/.config/", "/.cache/", "/.mozilla/", "/.var/app/", "/config/", "/pfx/"))
         limit = mutable_limit if mutable else stable_limit
         cost = page_bytes(rec.size)
-        if current and (mutable != previous_mutable or size + cost > limit or len(current) >= max_paths):
-            yield current
-            current, size = [], 0
-        current.append(rec)
-        size += cost
-        previous_mutable = mutable
-    if current:
-        yield current
+        if buffers[mutable] and (sizes[mutable] + cost > limit or len(buffers[mutable]) >= max_paths):
+            yield from flush()
+        if not buffers[mutable]:
+            first[mutable] = position
+        buffers[mutable].append(rec)
+        sizes[mutable] += cost
+        previous_role = role
+    yield from flush()
 
 DB_SCHEMA = 1
 
@@ -6191,6 +6211,16 @@ def run_supervisor() -> int:
                     logging.exception("unable to start cache worker")
                     break
 
+            # A complete, fully budgeted selection is already enough work to
+            # fill the cache. Finish its queue with discovery/plan publication
+            # parked instead of repeatedly replacing and revalidating a
+            # million-file plan while its final loaders are still running.
+            # Initial discovery remains active until a whole usable plan fits
+            # the target; pressure release and refill use the existing paths.
+            if (validated and not plan_changed and (pending_chunks or active_loading)
+                    and cache_goal >= budget - 128 * MIB):
+                refill_from_plan = True
+
             # Full means stop expensive work in BOTH processes. The latch also
             # covers a small whole-file tail that cannot fit the reserve.
             if (budget_policy.refilling and validated and not active_loading
@@ -6618,7 +6648,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.3.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.4.4.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -8033,7 +8063,7 @@ install_all() {
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.3. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.4.4. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
@@ -8109,7 +8139,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.3"
+  echo "RAM cache controller installer: v1.4.4"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
@@ -8212,5 +8242,6 @@ case "$ACTION" in
     exit 1
     ;;
 esac
+
 
 
