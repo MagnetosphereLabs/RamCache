@@ -63,7 +63,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.4"
+CONTROLLER_VERSION = "1.4.5"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -3439,6 +3439,12 @@ class Watcher:
         )
         self.thread.start()
 
+        boot_id = current_boot_id()
+        if boot_id is not None:
+            atomic_json(RUNTIME_PATH / "boot-watch.json", {
+                "boot_id": boot_id, "token": uuid.uuid4().hex,
+            }, mode=0o600)
+
     def stop(self) -> None:
         self.stop_event.set()
         if self.proc is not None:
@@ -4185,6 +4191,8 @@ def discovery_control():
 
 def discovery_is_parked():
     control = discovery_control()
+    if control.get("boot_refresh_request") and not control.get("boot_refresh_paused", True):
+        return False
     return bool(control.get("cache_holding") or control.get("refill_from_plan"))
 
 
@@ -4195,6 +4203,173 @@ def release_unused_heap():
         ctypes.CDLL(None).malloc_trim(0)
     except (AttributeError, OSError):
         pass
+
+
+@functools.lru_cache(maxsize=1)
+def current_boot_id():
+    try:
+        return str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+    except (OSError, ValueError):
+        return None
+
+
+def boot_refresh_config(cfg, roots):
+    values = {key: value for key, value in cfg.items() if not key.startswith("_")}
+    return hashlib.sha256(json.dumps([values, roots], sort_keys=True).encode()).hexdigest()
+
+
+def directory_signature(path):
+    try:
+        st = os.lstat(path)
+        if stat.S_ISDIR(st.st_mode):
+            return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns)
+    except OSError:
+        pass
+    return None
+
+
+def confirmed_absence(path, cfg, roots, expected_dev=None):
+    """An inaccessible or unmounted tree is not evidence of deletion."""
+    try:
+        os.lstat(path)
+        return False
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTDIR):
+            return False
+    root = governing_include_root(path, roots)
+    if root is None:
+        return False
+    device = safe_dev(root)
+    if device is None or (expected_dev is not None and device != expected_dev):
+        return False
+    return True
+
+
+class ValidationReceipt:
+    """One generation identifier plus exceptions, never a second inventory."""
+    def __init__(self, header):
+        self.path = None
+        self.output = None
+        self.complete = True
+        self.bytes = 0
+        self.watch_token = None
+        self.boot_id = current_boot_id()
+        if self.boot_id is None:
+            return
+        try:
+            fd, self.path = tempfile.mkstemp(prefix="validation.", dir=RUNTIME_PATH)
+            self.output = os.fdopen(fd, "w", encoding="utf-8")
+            self.output.write(json.dumps({"boot_id": self.boot_id,
+                                          "generation": header["generation"]}) + "\n")
+        except (OSError, KeyError):
+            self.abort()
+
+    def watch(self):
+        if self.watch_token is None:
+            marker = read_json(RUNTIME_PATH / "boot-watch.json", {}) or {}
+            if marker.get("boot_id") == self.boot_id:
+                self.watch_token = marker.get("token")
+
+    def note(self, path, *, record=None, missing=False, untrusted=False):
+        if self.output is None or not self.complete:
+            return
+        line = json.dumps({"path": path, "record": record_to_list(record) if record else None,
+                           "missing": missing, "untrusted": untrusted}, ensure_ascii=True, separators=(",", ":")) + "\n"
+        self.bytes += len(line)
+        # This bounds only an optional optimization, never file eligibility.
+        if self.bytes > 16 * MIB:
+            self.complete = False
+            return
+        try:
+            self.output.write(line)
+        except OSError:
+            self.complete = False
+
+    def finish(self):
+        if self.output is None:
+            return
+        try:
+            self.output.write(json.dumps({"end": True, "complete": self.complete,
+                                          "watch_token": self.watch_token}) + "\n")
+            self.output.close()
+            self.output = None
+            os.replace(self.path, RUNTIME_PATH / "startup-validation.jsonl")
+            self.path = None
+        except OSError:
+            self.abort()
+
+    def abort(self):
+        if self.output is not None:
+            try:
+                self.output.close()
+            except OSError:
+                pass
+            self.output = None
+        if self.path is not None:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+            self.path = None
+
+
+class BootEvidence:
+    def __init__(self, db, boot_id, watch_token):
+        self.trusted = False
+        self.exceptions = {}
+        self.changed = []
+        self.missing = []
+        self.reused = 0
+        try:
+            with (RUNTIME_PATH / "startup-validation.jsonl").open(encoding="utf-8") as source:
+                header = json.loads(next(source))
+                if (header.get("boot_id") != boot_id
+                        or header.get("generation") != db.meta("saved_plan_header", {}).get("generation")):
+                    return
+                total = 0
+                footer = {}
+                for line in source:
+                    total += len(line)
+                    if total > 17 * MIB:
+                        return
+                    item = json.loads(line)
+                    if item.get("end"):
+                        footer = item
+                        break
+                    self.exceptions[item["path"]] = item
+                self.trusted = bool(footer.get("complete") and watch_token
+                                    and footer.get("watch_token") == watch_token)
+                if self.trusted:
+                    for item in self.exceptions.values():
+                        if item.get("record"):
+                            self.changed.append(record_from_list(item["record"]))
+                        elif item.get("missing"):
+                            self.missing.append(item["path"])
+        except (OSError, ValueError, TypeError, KeyError, StopIteration):
+            self.trusted = False
+
+    def reusable(self, path, row, invalidated):
+        if not self.trusted or invalidated or row is None:
+            return None
+        exception = self.exceptions.get(path)
+        if exception is not None:
+            if exception.get("untrusted"):
+                return None
+            value = exception.get("record")
+            if value:
+                self.reused += 1
+                return record_from_list(value)
+            return None
+        # The saved generation was validated this boot. Only matching source
+        # records receive credit; unselected inventory entries were not checked.
+        saved = row[-1]
+        if saved is None:
+            return None
+        rec = record_from_list(json.loads(saved))
+        if (rec.size, rec.dev, rec.ino, rec.mtime_ns, rec.ctime_ns) != tuple(row[1:6]):
+            return None
+        self.reused += 1
+        return rec
 
 
 class InventoryDB:
@@ -4259,13 +4434,20 @@ class InventoryDB:
             CREATE TABLE IF NOT EXISTS scan_marks (
                 path BLOB PRIMARY KEY, generation INTEGER NOT NULL, dir_token INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS directory_state (
+                path BLOB PRIMARY KEY, parent BLOB NOT NULL,
+                dev INTEGER NOT NULL, ino INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS directory_parent ON directory_state(parent);
         """)
         self.connection.execute(f"PRAGMA user_version={DB_SCHEMA}")
         self.connection.commit()
         os.chmod(path, 0o600)
         self.tables = {name: key for name, key in (
             ("files", "path"), ("usage", "path"), ("todo", "path"),
-            ("visited", "path"), ("dirty", "path"), ("meta", "key"), ("saved_plan", "path"))}
+            ("visited", "path"), ("dirty", "path"), ("meta", "key"), ("saved_plan", "path"),
+            ("directory_state", "path"))}
         self.columns = {table: [row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")]
                         for table in self.tables}
         self.connection.executescript("""
@@ -4365,6 +4547,21 @@ class InventoryDB:
 
     def set_meta(self, key, value):
         self.connection.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(value)))
+
+    def remember_directory(self, path, signature):
+        if signature is None:
+            return
+        self.connection.execute("""INSERT INTO directory_state VALUES (?,?,?,?,?,?)
+            ON CONFLICT(path) DO UPDATE SET parent=excluded.parent,dev=excluded.dev,
+                ino=excluded.ino,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns
+            WHERE directory_state.dev<>excluded.dev OR directory_state.ino<>excluded.ino
+                OR directory_state.mtime_ns<>excluded.mtime_ns OR directory_state.ctime_ns<>excluded.ctime_ns""",
+            (os.fsencode(path), os.fsencode(os.path.dirname(path)), *signature))
+
+    def forget_file(self, path):
+        raw = os.fsencode(path)
+        for table in ("files", "usage", "saved_plan", "dirty"):
+            self.connection.execute(f"DELETE FROM {table} WHERE path=?", (raw,))
 
     def refresh_startup_policy(self):
         """One policy-upgrade rerank of affected cached metadata, no file walk.
@@ -4495,7 +4692,7 @@ class InventoryDB:
         end = prefix[:-1] + b"0"
         self.connection.execute("DELETE FROM files WHERE path=? OR (path>=? AND path<?)", (raw, prefix, end))
         self.connection.execute("DELETE FROM usage WHERE path=? OR (path>=? AND path<?)", (raw, prefix, end))
-        for table in ("visited", "todo", "dirty", "scan_seen", "scan_marks"):
+        for table in ("visited", "todo", "dirty", "scan_seen", "scan_marks", "saved_plan", "directory_state"):
             self.connection.execute(f"DELETE FROM {table} WHERE path=? OR (path>=? AND path<?)", (raw, prefix, end))
 
     def invalidate_directory(self, path, active=()):
@@ -4821,6 +5018,408 @@ class InventoryDB:
                 "plan_budget_bytes": limit}
 
 
+def boot_priority_paths(cfg, roots):
+    # Reuse resolved installations, profiles and runtime roots. Broad system
+    # roots use directory signatures rather than a forced recursive rescan.
+    paths = bootstrap_paths(cfg, roots)
+    broad = {"/usr/bin", "/usr/libexec", "/usr/lib", "/usr/lib64", "/opt",
+             "/var/lib/flatpak/app", "/var/lib/flatpak/runtime"}
+    paths = [p for p in paths if p not in broad]
+    for home in iter_home_dirs():
+        for relative in (
+                ".mozilla/firefox", ".config/mozilla/firefox", ".config/firefox",
+                ".cache/mozilla/firefox", ".cache/firefox", ".librewolf", ".zen", ".floorp", ".waterfox",
+                ".config/librewolf", ".config/zen", ".config/floorp", ".config/waterfox",
+                ".cache/librewolf", ".cache/zen", ".cache/floorp", ".cache/waterfox",
+                ".config/discord", ".config/Discord", ".config/vesktop", ".config/Vesktop",
+                ".config/discordcanary", ".config/discordptb", ".cache/discord", ".cache/vesktop",
+                ".config/google-chrome", ".config/chromium", ".cache/google-chrome", ".cache/chromium",
+                ".config/cosmic", ".cache/fontconfig", ".cache/mesa_shader_cache",
+                ".cache/mesa_shader_cache_db", ".cache/mesa_shader_cache_sf", ".cache/nvidia", ".nv/GLCache",
+                ".var/app/org.mozilla.firefox/.mozilla/firefox",
+                ".var/app/org.mozilla.firefox/.cache/mozilla/firefox",
+                ".var/app/com.discordapp.Discord/config", ".var/app/com.discordapp.Discord/cache",
+                ".var/app/dev.vencord.Vesktop/config", ".var/app/dev.vencord.Vesktop/cache"):
+            paths.append(os.path.realpath(home / relative))
+    selected, runtimes = startup_steam_tools()
+    tools = set(selected) | set(runtimes)
+    paths.extend(p for p in getattr(startup_steam_tools, "inventory_prefixes", ()) if p.lower() in tools)
+    for root in getattr(startup_steam_tools, "client_roots", ()):
+        paths.extend(str(Path(root)/p) for p in ("userdata", "steam/games"))
+    return compact_prefixes([p for p in paths if os.path.isdir(p) and cache_path_allowed(p, cfg, roots)])
+
+
+def boot_directory_is_mutable(path):
+    lower = path.lower()
+    return bool(FIREFOX_USER_PATH_RE.search(lower) or CHROMIUM_USER_PATH_RE.search(lower)
+                or ELECTRON_USER_PATH_RE.search(lower) or is_vrchat_content_cache_path(lower)
+                or any(p in lower+"/" for p in ("/.cache/", "/.config/", "/config/", "/userdata/")))
+
+
+class BootInventoryRefresh:
+    """One finite namespace reconciliation over the existing directory map."""
+    def __init__(self, db, cfg, roots, evidence, events=()):
+        self.db, self.cfg, self.roots, self.evidence = db, cfg, roots, evidence
+        self.generation = db.meta("generation", 0)
+        self.priority = boot_priority_paths(cfg, roots)
+        self.invalidated = set()
+        self.device_aliases = {}
+        for root in roots:
+            old = db.connection.execute("SELECT dev FROM directory_state WHERE path=?", (os.fsencode(root),)).fetchone()
+            now = directory_signature(root)
+            if old and now:
+                self.device_aliases[old[0]] = now[0]
+        self.stats = dict(checked_directories=0, listed_directories=0, examined_files=0,
+                          new_files=0, updated_files=0, removed_files=0, scan_errors=0)
+        self.connection = db.connection
+        # executescript() would implicitly commit the planner's buffered
+        # transaction. TEMP setup must obey the existing checkpoint boundary.
+        for statement in (
+                "DROP TABLE IF EXISTS temp.boot_directories",
+                "DROP TABLE IF EXISTS temp.boot_directories_seen",
+                "DROP TABLE IF EXISTS temp.boot_entries",
+                "CREATE TEMP TABLE boot_directories (path BLOB PRIMARY KEY, priority INTEGER, force INTEGER)",
+                "CREATE INDEX boot_directory_order ON boot_directories(priority,path)",
+                "CREATE TEMP TABLE boot_directories_seen (path BLOB PRIMARY KEY) WITHOUT ROWID",
+                "CREATE TEMP TABLE boot_entries (path BLOB PRIMARY KEY) WITHOUT ROWID"):
+            self.connection.execute(statement)
+        # One metadata-index pass, not a file walk or a Python inventory copy.
+        for query in ("SELECT path FROM directory_state", "SELECT path FROM visited",
+                      "SELECT parent FROM files GROUP BY parent", "SELECT path FROM todo"):
+            self.connection.execute("INSERT OR IGNORE INTO boot_directories SELECT path,1,0 FROM (" +
+                                    query.replace("SELECT parent FROM", "SELECT parent AS path FROM") + ")")
+        for root in roots:
+            self.queue(root)
+        for prefix in self.priority:
+            self.queue(prefix)
+            raw = os.fsencode(prefix.rstrip("/"))
+            self.connection.execute("UPDATE boot_directories SET priority=0 WHERE path=? OR (path>=? AND path<?)",
+                                    (raw, raw+b"/", raw+b"0"))
+        for (raw,) in self.connection.execute("SELECT path FROM dirty").fetchall():
+            self.invalidated.add(os.fsdecode(raw))
+            self.queue(os.path.dirname(os.fsdecode(raw)), force=True)
+        self.capture(events)
+        self.work = self.run()
+
+    def is_priority(self, path):
+        return any(path_is_under(path, prefix) for prefix in self.priority)
+
+    def queue(self, path, force=False):
+        if not cache_path_allowed(path, self.cfg, self.roots) or should_prune_dir(path.lower()):
+            return
+        raw = os.fsencode(path)
+        if self.connection.execute("SELECT 1 FROM boot_directories_seen WHERE path=?", (raw,)).fetchone():
+            return
+        self.connection.execute("""INSERT INTO boot_directories VALUES (?,?,?)
+            ON CONFLICT(path) DO UPDATE SET priority=min(priority,excluded.priority),force=max(force,excluded.force)""",
+            (raw, 0 if self.is_priority(path) else 1, int(force)))
+
+    def capture(self, events, *, deferred=False):
+        for _, path in events:
+            if not cache_path_allowed(path, self.cfg, self.roots):
+                continue
+            self.invalidated.add(path)
+            self.connection.execute("INSERT OR IGNORE INTO dirty VALUES (?)", (os.fsencode(path),))
+            if not deferred:
+                self.queue(os.path.dirname(path), force=True)
+        # Notifications collected later than the snapshot never extend its
+        # lifetime indefinitely. Their dirty keys survive for the next boot.
+
+    def forget(self, path):
+        raw = os.fsencode(path)
+        present = self.connection.execute("SELECT 1 FROM files WHERE path=?", (raw,)).fetchone()
+        if present is None and not self.connection.execute(
+                "SELECT 1 FROM usage WHERE path=? UNION ALL SELECT 1 FROM saved_plan WHERE path=? LIMIT 1",
+                (raw, raw)).fetchone():
+            return
+        self.db.forget_file(path)
+        self.stats["removed_files"] += bool(present)
+
+    def store_batch(self, entries):
+        if not entries:
+            return
+        raw_paths = [os.fsencode(entry.path) for entry in entries]
+        slots = ",".join("?" for _ in raw_paths)
+        query = """SELECT f.path,f.size,f.dev,f.ino,f.mtime_ns,f.ctime_ns,f.mode,s.record
+            FROM files f LEFT JOIN saved_plan s ON s.path=f.path WHERE f.path IN ("""+slots+")"
+        known = {os.fsdecode(row[0]): row for row in self.connection.execute(query, raw_paths)}
+        changed = []
+        for entry in entries:
+            path = entry.path
+            row = known.get(path)
+            try:
+                actual = self.evidence.reusable(path, row, path in self.invalidated)
+                if actual is None:
+                    actual = stat_record(path, entry.stat(follow_symlinks=False))
+                self.stats["examined_files"] += 1
+                if actual is None:
+                    if row is not None:
+                        self.forget(path)
+                    continue
+                if row is not None and (actual.size, actual.dev, actual.ino, actual.mtime_ns,
+                                        actual.ctime_ns, actual.mode) == tuple(row[1:7]):
+                    continue
+                changed.append((actual, row is None))
+            except OSError:
+                self.stats["scan_errors"] += 1
+        if changed:
+            original = {r.path: fresh for r, fresh in changed}
+            rows = classify_batch(self.db.prepare([r for r, _ in changed], self.generation))
+            for rec, priority, budget, unit in rows:
+                if priority is None:
+                    self.forget(rec.path)
+                else:
+                    self.db.store([(rec, priority, budget, unit)], self.generation)
+                    self.stats["new_files" if original[rec.path] else "updated_files"] += 1
+
+    def run(self):
+        while True:
+            item = self.connection.execute("SELECT path,force FROM boot_directories ORDER BY priority,path LIMIT 1").fetchone()
+            if item is None:
+                return
+            raw, forced = item
+            path = os.fsdecode(raw)
+            self.connection.execute("DELETE FROM boot_directories WHERE path=?", (raw,))
+            self.connection.execute("INSERT OR IGNORE INTO boot_directories_seen VALUES (?)", (raw,))
+            if not cache_path_allowed(path, self.cfg, self.roots) or should_prune_dir(path.lower()):
+                yield
+                continue
+            before = directory_signature(path)
+            previous = self.connection.execute("SELECT dev,ino,mtime_ns,ctime_ns FROM directory_state WHERE path=?", (raw,)).fetchone()
+            self.stats["checked_directories"] += 1
+            if before is None:
+                expected = self.device_aliases.get(previous[0], previous[0]) if previous else None
+                if confirmed_absence(path, self.cfg, self.roots, expected):
+                    prefix = raw.rstrip(b"/")+b"/"
+                    self.stats["removed_files"] += self.connection.execute(
+                        "SELECT count(*) FROM files WHERE path>=? AND path<?", (prefix, prefix[:-1]+b"0")).fetchone()[0]
+                    self.db.remove_prefix(path)
+                else:
+                    try:
+                        st = os.lstat(path)
+                        replaced = not stat.S_ISDIR(st.st_mode)
+                    except OSError:
+                        replaced = False
+                    if replaced:
+                        # A directory can be replaced by a regular file or a
+                        # symlink. Retire its old descendants, retaining any
+                        # newly eligible regular file at that same pathname.
+                        self.db.remove_prefix(path)
+                        current = stat_record(path, st)
+                        if current is not None:
+                            self.db.store(classify_batch(self.db.prepare([current], self.generation)), self.generation)
+                    else:
+                        self.stats["scan_errors"] += 1
+                yield
+                continue
+            # Old mount identities must not cause traversal into another FS.
+            root = governing_include_root(path, self.roots)
+            expected = self.device_aliases.get(previous[0], previous[0]) if previous else None
+            if (previous and root is not None and path != root and expected != before[0]
+                    and before[0] == safe_dev(root)):
+                # An unmounted volume commonly leaves an empty mountpoint on
+                # its parent's filesystem. Do not erase the volume's records.
+                self.stats["scan_errors"] += 1
+                yield
+                continue
+            if (self.cfg.get("stay_on_filesystem", True) and root is not None
+                    and not root_allows_cross_filesystem(root, self.cfg) and before[0] != safe_dev(root)):
+                yield
+                continue
+            if previous == before and not forced and not (self.is_priority(path) and boot_directory_is_mutable(path)):
+                yield
+                continue
+            self.connection.execute("DELETE FROM boot_entries")
+            entries, names = [], []
+            success = True
+            try:
+                with os.scandir(path) as children:
+                    self.stats["listed_directories"] += 1
+                    for entry in children:
+                        names.append((os.fsencode(entry.path),))
+                        try:
+                            if cache_path_allowed(entry.path, self.cfg, self.roots):
+                                if entry.is_symlink():
+                                    self.forget(entry.path)
+                                elif entry.is_dir(follow_symlinks=False):
+                                    self.forget(entry.path)
+                                    if not should_prune_dir(entry.path.lower()):
+                                        self.queue(entry.path)
+                                        # Persist new frontier directories with the existing todo bookkeeping.
+                                        if not self.connection.execute("SELECT 1 FROM directory_state WHERE path=?", (os.fsencode(entry.path),)).fetchone():
+                                            self.connection.execute("INSERT OR IGNORE INTO todo(path,dev,stay) VALUES (?,?,?)",
+                                                                    (os.fsencode(entry.path), before[0], 1))
+                                elif entry.is_file(follow_symlinks=False):
+                                    entries.append(entry)
+                        except OSError:
+                            success = False
+                            self.stats["scan_errors"] += 1
+                        if len(names) >= 128:
+                            self.connection.executemany("INSERT OR IGNORE INTO boot_entries VALUES (?)", names)
+                            names = []
+                            self.store_batch(entries)
+                            entries = []
+                            yield
+                    if names:
+                        self.connection.executemany("INSERT OR IGNORE INTO boot_entries VALUES (?)", names)
+                    self.store_batch(entries)
+            except OSError:
+                success = False
+                self.stats["scan_errors"] += 1
+            after = directory_signature(path)
+            if success:
+                # Absence is meaningful only inside a successfully listed directory.
+                while True:
+                    missing = self.connection.execute("""SELECT path FROM files WHERE parent=?
+                        AND NOT EXISTS (SELECT 1 FROM boot_entries e WHERE e.path=files.path) LIMIT 128""", (raw,)).fetchall()
+                    if not missing:
+                        break
+                    for (gone,) in missing:
+                        self.forget(os.fsdecode(gone))
+                    yield
+                self.connection.execute("DELETE FROM todo WHERE path=?", (raw,))
+                if after == before:
+                    self.db.remember_directory(path, after)
+                else:
+                    self.connection.execute("DELETE FROM directory_state WHERE path=?", (raw,))
+                self.connection.execute("DELETE FROM dirty WHERE path IN (SELECT path FROM boot_entries)")
+            yield
+
+
+def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
+    watcher = watcher or Watcher()
+    observer = observer or UsageObserver(cfg, roots)
+    refresh = None
+    config_signature = boot_refresh_config(cfg, roots)
+    config_changed = db.meta("boot_refresh_config", config_signature) != config_signature
+    completed = db.meta("boot_refresh_complete") == boot_id and not config_changed
+    state = "complete" if completed else "waiting for initial fill"
+    pending_generation = None
+    reuse_safe = False
+    checkpoint_due = time.monotonic() + max(60, float(cfg.get("persistence_interval_seconds", 1800)))
+    last_status = last_events = 0.0
+    checkpoint_error = ""
+    inventory_count = db.count()
+    try:
+        if watcher.proc is None:
+            try:
+                watcher.start(cfg)
+            except OSError:
+                logging.exception("boot change watcher unavailable; directory refresh remains available")
+        observer.paused.set()
+        if cfg.get("learning_enabled", True) and not observer.threads:
+            observer.start()
+        # Unchanged reboot metadata does not require publishing another full plan.
+        db.force_publish = config_changed
+        while RUNNING:
+            now = time.monotonic()
+            control = discovery_control()
+            requested = control.get("boot_refresh_request") == boot_id
+            paused = bool(control.get("boot_refresh_paused", True))
+            if requested and not completed and not paused:
+                if refresh is None:
+                    marker = read_json(RUNTIME_PATH / "boot-watch.json", {}) or {}
+                    evidence = BootEvidence(db, boot_id, marker.get("token"))
+                    if watcher.dead() or watcher.needs_resync():
+                        evidence.trusted = False
+                    # Persist only actual differences found during the initial validation.
+                    for rec in evidence.changed:
+                        db.store(classify_batch(db.prepare([rec], db.meta("generation", 0))), db.meta("generation", 0))
+                    for path in evidence.missing:
+                        if confirmed_absence(path, cfg, roots):
+                            db.forget_file(path)
+                    refresh = BootInventoryRefresh(db, cfg, roots, evidence, watcher.take_changes())
+                    observations = observer.take(observer.limit)
+                    if observations:
+                        db.observe(observations, db.meta("generation", 0))
+                    db.refresh_usage_priorities()
+                    state = "checking changes"
+                if state == "checking changes":
+                    deadline = time.monotonic() + 0.025
+                    try:
+                        while time.monotonic() < deadline:
+                            next(refresh.work)
+                    except StopIteration:
+                        refresh.capture(watcher.take_changes(), deferred=True)
+                        state = "publishing changes"
+                if state == "publishing changes":
+                    try:
+                        if db.selection_changed():
+                            old_digest = db.meta("plan_digest")
+                            db.publish(cfg, roots, reason="boot refresh")
+                            pending_generation = db.meta("saved_plan_header", {}).get("generation")
+                            invalidated = sorted(refresh.invalidated)
+                            reuse_safe = refresh.evidence.trusted and sum(len(os.fsencode(p))+8 for p in invalidated) <= 16*MIB
+                            atomic_json(RUNTIME_PATH / "boot-refresh-invalid.json",
+                                        invalidated if reuse_safe else [], mode=0o600)
+                            db.checkpoint(reason="boot refresh selection")
+                            state = "waiting for cache update" if old_digest != db.meta("plan_digest") else "saving changes"
+                        else:
+                            state = "saving changes"
+                    except PlanDeferred:
+                        pass
+                if state == "waiting for cache update" and control.get("boot_refresh_applied") == pending_generation:
+                    state = "saving changes"
+                if state == "saving changes":
+                    db.set_meta("boot_refresh_complete", boot_id)
+                    db.set_meta("boot_refresh_config", config_signature)
+                    db.set_meta("boot_refresh_stats", {**refresh.stats, "reused_files": refresh.evidence.reused})
+                    db.set_meta("scan_pending", False)
+                    db.checkpoint(reason="boot refresh complete")
+                    checkpoint_due = now + max(60, float(cfg.get("persistence_interval_seconds", 1800)))
+                    completed = True
+                    state = "complete"
+                    inventory_count = db.count()
+                    refresh.work.close()
+                    refresh.invalidated.clear()
+                    refresh.evidence.exceptions.clear()
+                    refresh.evidence.changed.clear()
+                    refresh.evidence.missing.clear()
+                    for table in ("boot_directories", "boot_directories_seen", "boot_entries"):
+                        db.connection.execute("DROP TABLE IF EXISTS temp."+table)
+                    db.connection.execute("PRAGMA shrink_memory")
+                    release_unused_heap()
+            if refresh is not None and not completed and now-last_events >= 1:
+                last_events = now
+                refresh.capture(watcher.take_changes(), deferred=True)
+                if watcher.dead() or watcher.needs_resync():
+                    refresh.evidence.trusted = False
+            if now >= checkpoint_due:
+                try:
+                    db.checkpoint(reason="periodic while holding")
+                    checkpoint_error = ""
+                    checkpoint_due = now + max(60, float(cfg.get("persistence_interval_seconds", 1800)))
+                except (OSError, sqlite3.Error) as error:
+                    checkpoint_error = str(error)
+                    checkpoint_due = now + 60
+            if now-last_status >= 1:
+                stats = refresh.stats if refresh is not None else db.meta("boot_refresh_stats", {})
+                atomic_json(RUNTIME_PATH / "planner-status.json", {
+                    "timestamp": time.time(), "pid": os.getpid(),
+                    "phase": "holding" if completed or not requested else "boot-refresh",
+                    "boot_refresh_state": state, "boot_refresh_completed": completed,
+                    "boot_refresh_generation": pending_generation,
+                    "boot_refresh_reuse_safe": reuse_safe,
+                    "boot_refresh": {**stats, "reused_files": refresh.evidence.reused if refresh else stats.get("reused_files", 0)},
+                    "watcher_mode": watcher.mode, "include_roots": roots,
+                    "inventory_files": inventory_count,
+                    "scanned_files": stats.get("examined_files", 0),
+                    "scan_errors": stats.get("scan_errors", 0),
+                    "checkpoint_error": checkpoint_error, "last_checkpoint_epoch": db.last_checkpoint,
+                    "last_checkpoint_reason": db.last_checkpoint_reason,
+                    "last_checkpoint_rows": db.last_checkpoint_rows,
+                    "last_checkpoint_seconds": round(db.last_checkpoint_seconds, 3),
+                })
+                last_status = now
+            time.sleep(0.05 if requested and not completed and not paused else 1)
+    finally:
+        if refresh is not None:
+            refresh.work.close()
+        observer.close()
+        watcher.stop()
+    return 0
+
+
 class DirectoryScanner:
     """Bounded I/O pipeline. SQLite retains pending directories across reboots."""
     def __init__(self, cfg: dict, roots: list[str], workers: int):
@@ -4852,6 +5451,7 @@ class DirectoryScanner:
                 continue
             records, children = [], []
             success = False
+            before = directory_signature(directory)
             try:
                 with os.scandir(directory) as entries:
                     for entry in entries:
@@ -4892,7 +5492,8 @@ class DirectoryScanner:
                 pass
             if records or children:
                 self.send(("batch", directory, records, children))
-            self.send(("done", directory, success, None))
+            after = directory_signature(directory)
+            self.send(("done", directory, success, after if success and before == after else None))
             self.tasks.task_done()
 
     def close(self):
@@ -4969,6 +5570,12 @@ def run_planner() -> int:
     first_install = not db.meta("saved_plan_header") and not (STATE_PATH / "startup-plan.jsonl").exists()
     policy_upgrade = (db.meta("policy_version", 0) != POLICY_VERSION
                       or db.meta("saved_plan_header", {}).get("startup_context") != startup_policy_context())
+    boot_id = current_boot_id()
+    if boot_id is not None and not first_install and not policy_upgrade:
+        try:
+            return run_boot_planner(db, cfg, roots, boot_id)
+        finally:
+            db.close()
     generation = db.begin_scan(roots, cfg)
     if first_install or policy_upgrade:
         # Put useful small discovery roots ahead of the broad filesystem walk.
@@ -4998,6 +5605,7 @@ def run_planner() -> int:
     futures = {}  # bounded to a few batches, never millions of Python objects
     directory_pending = {}
     directory_finished = {}
+    directory_signatures = {}
     directory_tokens = {}
     refresh_again = set()
     reclassify = db.meta("policy_version") != POLICY_VERSION
@@ -5037,6 +5645,11 @@ def run_planner() -> int:
             (scanner.paused.set if paused else scanner.paused.clear)()
             (observer.paused.set if paused else observer.paused.clear)()
             if holding:
+                if boot_id is not None and control.get("boot_refresh_request") == boot_id:
+                    scanner.close()
+                    observer.paused.set()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return run_boot_planner(db, cfg, roots, boot_id, watcher, observer)
                 # Keep queued directories/results and bounded notification
                 # buffers intact. No scan, classification, usage SQL, COUNT,
                 # or plan publication while the completed cache is holding.
@@ -5136,6 +5749,7 @@ def run_planner() -> int:
                         (SELECT s.dir_token FROM scan_seen s WHERE s.path=files.path),
                         (SELECT s.dir_token FROM scan_marks s WHERE s.path=files.path AND s.generation=?),-1)<>?""",
                                           (raw, generation, directory_tokens.get(directory, 0)))
+                    db.remember_directory(directory, directory_signatures.pop(directory, None))
                 else:
                     # Preserve old entries below a temporarily unavailable path.
                     prefix = raw.rstrip(b"/") + b"/"
@@ -5167,6 +5781,7 @@ def run_planner() -> int:
                         break
                     if kind == "done":
                         directory_finished[directory] = bool(first)
+                        directory_signatures[directory] = second
                     else:
                         records, children = first, second
                         scanned += len(records)
@@ -5681,6 +6296,8 @@ class PlanReader:
         self.messages = queue.Queue(maxsize=8)
         self.stop = threading.Event()
         self.paused = threading.Event()
+        self.reuse_records = {}
+        self.reuse_generation = None
         self.thread = threading.Thread(target=self.run, daemon=True, name="startup-plan-validation")
         self.thread.start()
 
@@ -5698,6 +6315,7 @@ class PlanReader:
             if self.paused.is_set():
                 self.stop.wait(1)
                 continue
+            receipt = None
             try:
                 with startup_plan_source() as (identity, source):
                     header = json.loads(next(source))
@@ -5717,7 +6335,9 @@ class PlanReader:
                         self.stop.wait(0.5)
                         continue
                     self.put(("begin", header))
+                    receipt = ValidationReceipt(header)
                     batch, skipped, seen = [], 0, set()
+                    reused = 0
                     newly_oversized = []
                     index = 0
                     maximum = explicit_plan_file_limit(self.cfg)
@@ -5729,33 +6349,49 @@ class PlanReader:
                         if self.stop.is_set():
                             return
                         if maximum is not None and index >= maximum:
+                            receipt.complete = False
                             break
                         index += 1
                         if len(line) > 65536:
                             raise ValueError("oversized startup plan record")
                         saved = record_from_list(json.loads(line))
+                        if index % 512 == 1:
+                            receipt.watch()
+                        if receipt.watch_token is None:
+                            receipt.note(saved.path, untrusted=True)
                         defer_large = False
                         metadata_cost = record_metadata_bytes(saved.path, saved.budget)
                         if metadata_used + metadata_cost > metadata_limit:
                             skipped += 1
+                            receipt.note(saved.path)
                             continue
                         if not cache_path_allowed(saved.path, self.cfg, self.roots):
                             skipped += 1
+                            receipt.note(saved.path)
                             continue
-                        actual = stat_record(saved.path)
+                        memo = self.reuse_records.get(saved.path) if header.get("generation") == self.reuse_generation else None
+                        actual = memo if memo is not None and record_key(memo) == record_key(saved) else stat_record(saved.path)
+                        if actual is memo and memo is not None:
+                            reused += 1
+                            if memo.priority == saved.priority and memo.budget == saved.budget:
+                                saved = memo
                         if actual is None or (actual.dev, actual.ino) in seen or not record_device_allowed(actual, self.cfg, self.roots):
                             skipped += 1
+                            receipt.note(saved.path, missing=actual is None and confirmed_absence(
+                                saved.path, self.cfg, self.roots, saved.dev))
                             continue
                         if record_key(actual) != record_key(saved) or header.get("policy") != POLICY_VERSION:
                             priority = selection_sort_key(actual)
                             if priority is None:
                                 skipped += 1
+                                receipt.note(saved.path)
                                 continue
                             defer_large = (priority[:2] == (1, -9800)
                                            and saved.priority[:2] != (1, -9800))
                             saved = FileRec(actual.path, actual.size, actual.mtime, actual.mode,
                                             actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
                                             tuple(priority[:5]), cache_budget_key(actual) or "")
+                            receipt.note(saved.path, record=saved, untrusted=receipt.watch_token is None)
                         seen.add((actual.dev, actual.ino))
                         metadata_used += metadata_cost
                         if defer_large:
@@ -5772,7 +6408,8 @@ class PlanReader:
                         self.put(("batch", batch))
                     for offset in range(0, len(newly_oversized), 512):
                         self.put(("batch", newly_oversized[offset:offset + 512]))
-                    self.put(("end", {"skipped": skipped, **header}))
+                    receipt.finish()
+                    self.put(("end", {"skipped": skipped, "reused": reused, **header}))
                     # Validation's duplicate-inode set is temporary; do not
                     # retain millions of tuples throughout the idle interval.
                     seen.clear()
@@ -5785,6 +6422,9 @@ class PlanReader:
                 atomic_json(RUNTIME_PATH / "plan-invalid.json", {"timestamp": time.time(), "reason": str(error)})
                 self.put(("error", str(error)))
                 self.stop.wait(5)
+            finally:
+                if receipt is not None:
+                    receipt.abort()
             self.stop.wait(0.5)
 
 
@@ -5983,6 +6623,11 @@ def run_supervisor() -> int:
     was_holding = False
     refill_from_plan = False
     filled_once = False
+    boot_id = current_boot_id()
+    boot_requested = False
+    boot_apply_generation = None
+    boot_applied_generation = None
+    boot_validation_reused = 0
 
     def refill_control_tick():
         # Keep the existing IPC lease fresh during a long known-path metadata
@@ -6077,14 +6722,15 @@ def run_supervisor() -> int:
                 budget_policy.evaluate(meminfo, cfg, owned_locked, inflight, paused=pause, now=now)
             budget = budget_policy.target
             holding = not budget_policy.refilling
+            boot_fetch = boot_apply_generation is not None
             if not holding and filled_once:
                 refill_from_plan = True
-            grow_existing = refill_from_plan or (
+            grow_existing = not boot_fetch and (refill_from_plan or (
                 not holding and budget > last_budget and validated
-                and not plan_changed and not failed_until and not retired)
+                and not plan_changed and not failed_until and not retired))
             # An interrupted initial saved-plan stream may still finish, but
             # discovery stays parked and a validated list is never re-read.
-            defer_plan = holding or (validated and (refill_from_plan or grow_existing))
+            defer_plan = not boot_fetch and (holding or (validated and (refill_from_plan or grow_existing)))
             (reader.paused.set if defer_plan else reader.paused.clear)()
 
             # Stream useful validated records immediately, without waiting for
@@ -6110,6 +6756,7 @@ def run_supervisor() -> int:
                     incoming = None
                     plan_generation = payload["generation"]
                     plan_skipped = payload["skipped"]
+                    boot_validation_reused = payload.get("reused", 0)
                     plan_changed = True
                     validated = True
                 elif kind == "error":
@@ -6117,7 +6764,15 @@ def run_supervisor() -> int:
                     last_error = "startup-plan validation: " + payload
                     logging.warning("%s", last_error)
 
-            if not holding and not pause and records and now - last_reconcile >= 1 and (
+            if (boot_id is not None and validated and incoming is None and not records
+                    and not workers and not boot_fetch):
+                # A saved list whose files all disappeared still needs its
+                # post-boot discovery; it cannot wait for non-existent reads.
+                pending_chunks.clear()
+                cache_goal = 0
+                plan_changed = False
+            boot_apply = bool(boot_fetch and plan_generation == boot_apply_generation and incoming is None)
+            if (not holding or boot_apply) and not pause and (records or boot_apply) and now - last_reconcile >= 1 and (
                     plan_changed or budget != last_budget
                     or any(deadline <= now for deadline in failed_until.values())) and not (grow_existing and retired):
                 failed_until = {key: deadline for key, deadline in failed_until.items() if deadline > now}
@@ -6181,7 +6836,7 @@ def run_supervisor() -> int:
             # fast completion never lets us spend stale MemAvailable twice.
             unsampled = sum(max(0, worker.requested - sampled_locked.get(worker.proc.pid, 0))
                             for worker in workers)
-            while pending_chunks and not holding and not pause and active_loading < loading_limit and launches < 2:
+            while pending_chunks and (not holding or boot_apply) and not pause and active_loading < loading_limit and launches < 2:
                 free_room = max(0, meminfo["MemAvailable"] - reserve - unsampled)
                 chunk, cost = pop_fitting_chunk(pending_chunks, free_room, inflight, inflight_limit)
                 if chunk is None:
@@ -6221,6 +6876,15 @@ def run_supervisor() -> int:
                     and cache_goal >= budget - 128 * MIB):
                 refill_from_plan = True
 
+            if (boot_apply and validated and not plan_changed and not active_loading
+                    and not pending_chunks and not retired and not pause):
+                budget_policy.hold(budget)
+                boot_applied_generation = boot_apply_generation
+                boot_apply_generation = None
+                reader.reuse_records = {}
+                reader.reuse_generation = None
+                release_unused_heap()
+
             # Full means stop expensive work in BOTH processes. The latch also
             # covers a small whole-file tail that cannot fit the reserve.
             if (budget_policy.refilling and validated and not active_loading
@@ -6240,7 +6904,7 @@ def run_supervisor() -> int:
                 # otherwise its unfinished boot discovery must still resume.
                 filled_once = filled_once or (bool(records) and not was_holding and not pause)
                 refill_from_plan = False
-            (reader.paused.set if holding or (refill_from_plan and validated) else reader.paused.clear)()
+            (reader.paused.set if (holding or (refill_from_plan and validated)) and boot_apply_generation is None else reader.paused.clear)()
             if holding and not was_holding:
                 release_unused_heap()
             was_holding = holding
@@ -6265,6 +6929,25 @@ def run_supervisor() -> int:
 
             if now - last_status >= 1:
                 planner_status = read_json(RUNTIME_PATH / "planner-status.json", {}) or {}
+                known_pool_done = (planner_status.get("boot_refresh_state") == "waiting for initial fill"
+                                   or planner_status.get("phase") == "watching")
+                if (boot_id is not None and validated and incoming is None and (not plan_changed or holding) and not pause
+                        and not active_loading and not pending_chunks and not retired
+                        and (filled_once or known_pool_done)):
+                    boot_requested = True
+                    if known_pool_done and not holding:
+                        budget_policy.hold(budget)
+                        holding = True
+                generation = planner_status.get("boot_refresh_generation")
+                if (boot_requested and planner_status.get("boot_refresh_state") == "waiting for cache update"
+                        and generation and generation != boot_applied_generation and boot_apply_generation is None):
+                    boot_apply_generation = generation
+                    invalidated = read_json(RUNTIME_PATH / "boot-refresh-invalid.json", []) or []
+                    invalidated = set(invalidated) if isinstance(invalidated, list) else set()
+                    reader.reuse_records = ({r.path: r for r in records if r.path not in invalidated}
+                                            if planner_status.get("boot_refresh_reuse_safe") else {})
+                    reader.reuse_generation = generation
+                    reader.paused.clear()
                 discovered = planner_status.get("include_roots")
                 if (isinstance(discovered, list) and discovered != roots
                         and all(isinstance(path, str) and path.startswith("/") for path in discovered)):
@@ -6280,11 +6963,18 @@ def run_supervisor() -> int:
                 atomic_json(RUNTIME_PATH / "pressure.json", {
                     "timestamp": time.time(), "pause_discovery": pause or io_busy or holding or refill_from_plan,
                     "cache_holding": holding, "refill_from_plan": refill_from_plan,
+                    "boot_refresh_request": boot_id if boot_requested and not planner_status.get("boot_refresh_completed") else None,
+                    "boot_refresh_paused": bool(pause or io_busy or active_loading or pending_chunks or retired
+                                                or (not holding and boot_apply_generation is None)),
+                    "boot_refresh_applied": boot_applied_generation,
                 })
                 actual = sum(worker.locked for worker in workers)
                 requested = sum(worker.requested for worker in workers)
                 if pause:
                     fill_state = "memory pressure or reserve"
+                elif (boot_requested and not planner_status.get("boot_refresh_completed")
+                      and planner_status.get("phase") == "boot-refresh" and not active_loading):
+                    fill_state = "cache filled; completing once-per-boot refresh"
                 elif holding and not active_loading:
                     fill_state = "holding cache; discovery and selection asleep"
                 elif pending_chunks or active_loading:
@@ -6306,9 +6996,12 @@ def run_supervisor() -> int:
                     fill_state = "usable-memory target reached"
                 payload = {
                     "controller_version": CONTROLLER_VERSION, "timestamp": int(time.time()),
+                    "boot_refresh_state": planner_status.get("boot_refresh_state", "waiting for initial fill"),
+                    "boot_refresh_completed": planner_status.get("boot_refresh_completed", False),
+                    "boot_validation_reused_files": boot_validation_reused,
                     "uptime_seconds": round(now - started, 2), "memory_profile": cfg.get("memory_profile", "normal"),
-                    "phase": "pressure-paused" if pause and (policy.reason != "available" or now < policy.pause_until) else ("holding" if holding and not active_loading else ("discovering" if not records else
-                             ("warming" if pending_chunks or active_loading else ("degraded" if failed_until else "ready")))),
+                    "phase": "pressure-paused" if pause and (policy.reason != "available" or now < policy.pause_until) else ("boot-refresh" if boot_requested and planner_status.get("phase") == "boot-refresh" and not active_loading else ("holding" if holding and not active_loading else ("discovering" if not records else
+                             ("warming" if pending_chunks or active_loading else ("degraded" if failed_until else "ready"))))),
                     "target_locked_gib": bytes_to_gib(budget), "selected_files": sum(len(worker.records) for worker in workers),
                     "cache_goal_gib": bytes_to_gib(cache_goal),
                     "fill_state": fill_state, "candidate_gib": bytes_to_gib(candidate_bytes),
@@ -6365,6 +7058,8 @@ def run_supervisor() -> int:
                         reader.stop.set()
                         reader = PlanReader(cfg, roots)
                         filled_once = refill_from_plan = False
+                        boot_requested = False
+                        boot_apply_generation = boot_applied_generation = None
                         plan_changed = True
                         try:
                             os.killpg(planner.pid, signal.SIGTERM)
@@ -6648,7 +7343,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.4.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.4.5.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -8063,7 +8758,7 @@ install_all() {
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.4. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.4.5. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
@@ -8139,7 +8834,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.4"
+  echo "RAM cache controller installer: v1.4.5"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
