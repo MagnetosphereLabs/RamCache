@@ -12,7 +12,7 @@
 <img src="https://img.shields.io/badge/ADAPTIVE-MEMORY_AWARE-34D8A3?style=for-the-badge&labelColor=090D18" alt="Adaptive">
 <img src="https://img.shields.io/badge/VMTouch-MLOCK-806DF7?style=for-the-badge&labelColor=090D18" alt="vmtouch">
 <img src="https://img.shields.io/badge/SYSTEMD-MANAGED-70B5FF?style=for-the-badge&labelColor=090D18" alt="systemd">
-<img src="https://img.shields.io/badge/VERSION-1.3.2-9B73FF?style=for-the-badge&labelColor=090D18" alt="Version 1.3.2">
+<img src="https://img.shields.io/badge/VERSION-1.3.2-9B73FF?style=for-the-badge&labelColor=090D18" alt="Version 1.4.5">
 
 <br><br>
 
