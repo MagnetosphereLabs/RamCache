@@ -194,8 +194,6 @@ Saved state contains metadata. File data is loaded into RAM again after reboot.
 
 RAMCache maintains an available-memory reserve and adjusts its locked cache around application demand.
 
-The normal configuration starts with a **2 GiB pressure floor**, a **3 GiB reserve**, and a **4 GiB refill threshold**. Adaptive policy adjusts the effective values for memory capacity and swap availability, with additional headroom on systems without swap.
-
 Memory is sampled every **1 second** by default. Three signals guide the supervisor:
 
 ```mermaid
@@ -216,19 +214,13 @@ The controller accounts separately for its own locked pages and supervisor/plann
 
 The cache is divided into worker chunks. Lower-priority chunks are released first, preserving useful data while returning memory.
 
-| Data | Chunk target |
-| :---: | :---: |
-| **Stable files, normal profile** | 256 MiB |
-| **Stable files, low-RAM profile** | 128 MiB |
-| **Mutable profile and cache data** | Up to approximately 64 MiB |
-
 Files are loaded whole, so an individual file may exceed a chunk target. Multiple workers are signaled together when more memory needs to be released.
 
-Refilling requires **at least 30 seconds of sustained headroom** above the effective refill threshold, together with the pressure cooldown. This avoids repeatedly taking back memory that an application has just needed.
+Refilling requires **at least 30 seconds of sustained headroom** above the refill threshold, together with the pressure cooldown. This avoids repeatedly taking back memory that an application has just needed.
 
 ### Adapt to system capacity
 
-Below **20 GiB of effective RAM**, the automatic `low_ram` profile reduces several cache allowances, scan and classification concurrency, and the individual candidate-file ceiling to **2 GiB**. This includes typical 16 GB desktops.
+Below **20 GiB of installed RAM**, the automatic `low_ram` profile reduces several cache allowances, scan and classification concurrency, and the individual candidate-file ceiling to **2 GiB**. This includes typical 16 GB systems.
 
 The controller also respects cgroup v2 `memory.max` and `memory.high` limits, including parent limits. Its effective memory total therefore reflects applicable service or container limits as well as physical RAM.
 
