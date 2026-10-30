@@ -67,7 +67,7 @@ CONTROLLER_VERSION = "1.4.5"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-POLICY_VERSION = 4
+POLICY_VERSION = 5
 _SCAN_STORAGE_PROFILE_CACHE: dict[tuple[str, ...], str] = {}
 
 @dataclass(frozen=True, slots=True)
@@ -492,6 +492,9 @@ def discover_extra_include_paths(cfg: dict) -> list[str]:
             # Flatpak Steam layout.
             home / ".var/app/com.valvesoftware.Steam",
             home / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+
+            # Flatpak Hytale launcher, game packages, and persistent worlds.
+            home / ".var/app/com.hypixel.HytaleLauncher",
         ):
             add(p)
 
@@ -1106,7 +1109,8 @@ FIREFOX_WEB_CACHE_TARGET_SUBSTRINGS = (
 )
 
 HYTALE_SUBSTRINGS = (
-    "/.var/app/com.hypixel.hytalelauncher/data/hytale/",
+    "/.var/app/com.hypixel.hytalelauncher/",
+    "/flatpak/app/com.hypixel.hytalelauncher/",
 )
 
 HYTALE_WORLD_CHUNK_SUBSTRINGS = (
@@ -1119,14 +1123,22 @@ HYTALE_WORLD_DATA_COLD_SUBSTRINGS = (
     "/logs/",
     "/telemetry/",
     "/.sentry-cache/",
+    "/backups/",
+    "/downloads/",
+    "/crashes/",
 )
 
 HYTALE_WORLD_DATA_COLD_SUFFIXES = (
     ".log",
     ".log.gz",
+    ".jsonl",
     ".jsonl.gz",
     ".tmp",
     ".bak",
+    ".lock",
+    ".lck",
+    "-shm",
+    " (deleted)",
 )
 
 VRCHAT_RUNTIME_SUBSTRINGS = (
@@ -1407,6 +1419,7 @@ def is_vip_path(path: str) -> bool:
         or is_vip_steam_client_path(path)
         or is_vip_vrchat_runtime_path(path)
         or is_vrchat_content_cache_path(path)
+        or is_hytale_path(path)
     )
 
 
@@ -1450,7 +1463,25 @@ def is_firefox_web_cache_path(path: str) -> bool:
 
 
 def is_hytale_path(path: str) -> bool:
-    return path_contains_any(path, HYTALE_SUBSTRINGS)
+    return (path_contains_any(path, HYTALE_SUBSTRINGS)
+            or path.endswith("/flatpak/overrides/com.hypixel.hytalelauncher"))
+
+
+def is_hytale_cold_path(path: str) -> bool:
+    name = os.path.basename(path)
+    # A user's world name may itself be "Logs" or "Backups".
+    probe = path
+    if "/userdata/saves/" in path:
+        probe = "/" + path.split("/userdata/saves/", 1)[1].partition("/")[2]
+    elif "/userdata/" in path:
+        probe = "/" + path.split("/userdata/", 1)[1]
+    elif "/data/hytale/" in path:
+        probe = "/" + path.split("/data/hytale/", 1)[1]
+    # Anchor diagnostic directories at their real roots: Prefabs/Trees/Logs
+    # contains wooden-log assets, not application diagnostics.
+    return (probe.startswith(HYTALE_WORLD_DATA_COLD_SUBSTRINGS)
+            or name.endswith(HYTALE_WORLD_DATA_COLD_SUFFIXES)
+            or ".tmp." in name)
 
 
 HYTALE_WORLD_ROOT_FILES = {
@@ -1459,6 +1490,7 @@ HYTALE_WORLD_ROOT_FILES = {
     "permissions.json",
     "whitelist.json",
     "client_metadata.json",
+    "preview.png",
 }
 
 
@@ -1478,21 +1510,20 @@ def is_hytale_world_chunk_path(path: str) -> bool:
 
 
 def is_hytale_world_data_path(path: str) -> bool:
-    if not is_hytale_world_save_path(path):
+    if not is_hytale_path(path) or is_hytale_cold_path(path):
         return False
 
     name = os.path.basename(path)
 
-    if path_contains_any(path, HYTALE_WORLD_DATA_COLD_SUBSTRINGS):
-        return False
-
-    if name.endswith(HYTALE_WORLD_DATA_COLD_SUFFIXES):
+    # Shared compiled prefabs are used when creating and loading worlds.
+    if "/userdata/prefabcache/" in path:
+        return name.endswith(".lpf")
+    if not is_hytale_world_save_path(path):
         return False
 
     return (
         is_hytale_world_chunk_path(path)
-        or "/universe/worlds/" in path
-        or "/universe/players/" in path
+        or "/universe/" in path
         or "/mods/" in path
         or name in HYTALE_WORLD_ROOT_FILES
     )
@@ -1505,6 +1536,7 @@ def is_hytale_runtime_path(path: str, name: str) -> bool:
     return (
         name in {
             "hytale-launcher",
+            "hytale-launcher-wrapper",
             "hytaleclient",
             "hytaleserver.jar",
             "libjvm.so",
@@ -1513,10 +1545,39 @@ def is_hytale_runtime_path(path: str, name: str) -> bool:
             "libdiscord_partner_sdk.so",
             "libquiche.so",
         }
-        or "/package/game/latest/client/" in path
-        or "/package/game/latest/server/" in path
-        or "/package/jre/latest/" in path
+        # Channels, package versions, architectures and deployment hashes vary.
+        or ("/data/hytale/install/" in path
+            and ("/package/game/" in path or "/package/jre/" in path))
     )
+
+
+def classify_hytale_resource(rec: FileRec, path: str, name: str) -> tuple[int, int, int]:
+    # All Hytale resources share one allowance, including the large Assets.zip.
+    # These checks precede generic archive/media exclusions only for this app.
+    if is_hytale_cold_path(path):
+        return (99, 0, 0)
+    if is_hytale_world_save_path(path):
+        if not is_hytale_world_data_path(path) or rec.size > HYTALE_WORLD_FILE_MAX:
+            return (99, 0, 0)
+        return (1, 11200, 0)
+    if "/userdata/prefabcache/" in path:
+        if not is_hytale_world_data_path(path) or rec.size > HYTALE_WORLD_FILE_MAX:
+            return (99, 0, 0)
+        return (1, 10400, 0)
+    if is_hytale_runtime_path(path, name):
+        if (file_is_executable(rec) or is_shared_library_name(name)
+                or name.endswith((".jar", ".jsa")) or name == "modules"):
+            return (1, 11600, 0)
+        return (1, 10800 if name == "assets.zip" else 11000, 0)
+    if "/userdata/mods/" in path or "/userdata/earlyplugins/" in path:
+        return (1, 11550 if name.endswith(".jar") else 11100, 0)
+    if is_global_shader_cache_path(path):
+        return (1, 10400, 0)
+    if "/cache/hytale-launcher/" in path:
+        return (1, 10900, 0)
+    # Launcher local storage/WAL, settings, asset indexes, thumbnails, env.dat,
+    # Flatpak metadata and loader state stay inside the same bounded family.
+    return (1, 11100, 0)
 
 
 def is_vrchat_runtime_path(path: str) -> bool:
@@ -1938,6 +1999,8 @@ def startup_browser_role(path, name, firefox=False):
 
 def startup_policy_role(path, name):
     """Return (existing byte-budget family, resource role) using path metadata."""
+    if is_hytale_path(path):
+        return "hytale_world", "hytale"
     if FIREFOX_USER_PATH_RE.search(path) is not None:
         return "firefox_webcache", startup_browser_role(path, name, firefox=True)
     if path_has_prefix(path, BROWSER_RUNTIME_PREFIXES[:3]) or "/flatpak/app/org.mozilla.firefox/" in path or "/snap/firefox/" in path:
@@ -1993,6 +2056,8 @@ def startup_policy_role(path, name):
 
 def classify_startup_resource(rec, path, name, policy):
     family, role = policy
+    if family == "hytale_world":
+        return classify_hytale_resource(rec, path, name)
     journal = role == "state"
     if role in ("payload", "diagnostic"):
         return (99, 0, 0)
@@ -2393,6 +2458,9 @@ def should_prune_dir(path: str) -> bool:
             "/.cache/pip/", "/.cache/uv/", "/.npm/_cacache/", "/.cargo/registry/cache/")):
         return True
 
+    if is_hytale_path(p) and is_hytale_cold_path(p + "/"):
+        return True
+
     # VIP paths must survive pruning, especially Vesktop/Electron cache trees
     # and Flatpak/app payload folders that look like generic browser/app data.
     if is_vip_path(p):
@@ -2495,40 +2563,6 @@ def classify_file(rec: FileRec, _policy=..., _desktop=...) -> tuple[float, int, 
 
     # Targeted bounded caches and game/runtime paths.
     # These are intentionally handled before broad Steam/browser/game logic.
-
-    if is_hytale_world_data_path(path):
-        if size <= HYTALE_WORLD_FILE_MAX:
-            confidence = 820
-
-            if is_hytale_world_chunk_path(path):
-                confidence += 160
-
-            if "/universe/worlds/" in path:
-                confidence += 120
-
-            if "/universe/players/" in path:
-                confidence += 100
-
-            if name in {
-                "config.json",
-                "client_metadata.json",
-                "permissions.json",
-                "whitelist.json",
-                "bans.json",
-            }:
-                confidence += 120
-
-            return (6, confidence, 0)
-
-        return (99, 0, 0)
-
-    if is_hytale_runtime_path(path, name):
-        confidence = 980
-        if name in {"hytaleserver.jar", "hytaleclient", "hytale-launcher", "libjvm.so"}:
-            confidence += 220
-        if shared_lib or executable or name.endswith((".jar", ".so")):
-            confidence += 140
-        return (1, confidence, 0)
 
     if is_vrchat_content_cache_path(path):
         if size <= VRCHAT_CONTENT_CACHE_FILE_MAX:
@@ -2791,16 +2825,22 @@ def cache_budget_caps(cfg: dict) -> dict[str, int]:
     defaults = {
         "steam_htmlcache": "1G", "firefox_webcache": "4G", "chromium_webcache": "4G",
         "electron_webcache": "2G", "desktop_shader_cache": "1G", "desktop_compiled_cache": "256M",
-        "app_catalog": "256M", "hytale_world": "2G", "vrchat_content_cache": "2G",
+        "app_catalog": "256M", "vrchat_content_cache": "2G",
     }
     # Existing cached memory sample; no additional memory-monitor polling.
     total_gib = parse_meminfo()["MemTotal"] / GIB
+    # Retain the low-RAM allowance; bound the entire Hytale installation and
+    # recent world together, rather than allowing uncapped runtime payloads.
+    hytale_max = (GIB if total_gib < 20 else 2 * GIB if total_gib <= 24
+                  else 3 * GIB if total_gib < 48 else 5 * GIB)
+    defaults["hytale_world"] = hytale_max
     values = next(values for maximum, values in STARTUP_RAM_BUDGETS if total_gib < maximum)
     defaults.update(zip(STARTUP_BUDGETS, values))
     defaults["vrchat_content_cache"] = defaults["vrchat_startup"]
     caps = {key: max(0, parse_size(default if cfg.get(key + "_budget_bytes") is None
                                   else cfg[key + "_budget_bytes"]) or 0)
             for key, default in defaults.items()}
+    caps["hytale_world"] = min(caps["hytale_world"], hytale_max)
     # This profile deliberately excludes all VRChat-specific warming. Shared
     # Steam/Proton dependencies remain within Steam's independent allowance.
     if total_gib < 20:
@@ -2872,29 +2912,18 @@ def cache_budget_key(rec: FileRec, _policy=...) -> Optional[str]:
 
 def hytale_save_root(path: str) -> Optional[str]:
     norm = os.path.normpath(path)
-    lower = norm.lower()
-    marker = "/userdata/saves/"
-
-    idx = lower.find(marker)
-    if idx < 0:
-        return None
-
-    after = idx + len(marker)
-    next_sep = lower.find(os.sep, after)
-    if next_sep < 0:
-        return None
-
-    return lower[:next_sep]
+    match = re.search(r"/userdata/saves/[^/]+(?=/)", norm, re.IGNORECASE)
+    return norm[:match.end()] if match else None
 
 
 def dynamic_cache_root_key(rec: FileRec) -> Optional[str]:
     path = os.path.normpath(rec.path).lower()
 
     if is_hytale_world_data_path(path):
-        # Pick one active Hytale save per scan when the file belongs to a save.
+        # The publisher picks the newest save per Hytale installation.
         # Shared PrefabCache files do not have a save root, so they are allowed
         # inside the same Hytale world budget without forcing a different save.
-        return hytale_save_root(path)
+        return hytale_save_root(rec.path)
 
     if is_vrchat_content_cache_path(path):
         return vrchat_content_cache_unit_root(rec.path)
@@ -2903,6 +2932,11 @@ def dynamic_cache_root_key(rec: FileRec) -> Optional[str]:
 
 def recency_timestamp_for_path(path: str, st: os.stat_result) -> float:
     lower = os.path.normpath(path).lower()
+
+    if is_hytale_path(lower):
+        # Warming changes atime. Only real modifications should refresh a
+        # world's or prefab's recency; launcher enumeration reads old saves.
+        return float(st.st_mtime)
 
     if (
         browser_cache_kind(lower) is not None
@@ -3131,7 +3165,7 @@ def selection_sort_key(rec: FileRec, _classification=None, _budget=None) -> Opti
         )
 
     if recency_first:
-        if budget_key in STARTUP_BUDGET_KEYS or "/obs-studio/plugin_config/obs-browser/" in path:
+        if budget_key in STARTUP_BUDGET_KEYS or budget_key == "hytale_world" or "/obs-studio/plugin_config/obs-browser/" in path:
             # File contents' modification time, not preload-induced atime.
             # ctime is only a tie-break, never mislabeled as creation time.
             modified = rec.mtime_ns / 1e9 if rec.mtime_ns else rec.mtime
@@ -4581,6 +4615,8 @@ class InventoryDB:
                 "/usr/lib64/vesktop", "/usr/share/discord", "/usr/share/vesktop",
                 "/var/lib/flatpak/app/org.mozilla.firefox",
                 "/var/lib/flatpak/app/dev.vencord.Vesktop",
+                "/var/lib/flatpak/app/com.hypixel.HytaleLauncher",
+                "/var/lib/flatpak/overrides/com.hypixel.HytaleLauncher",
                 "/var/lib/flatpak/app/com.discordapp.Discord", "/snap/firefox",
                 "/usr/games/steam", "/usr/bin/steam", "/usr/share/cosmic", "/usr/lib/locale",
                 "/usr/share/egl/egl_external_platform.d", "/usr/share/vulkan/icd.d",
@@ -4597,6 +4633,8 @@ class InventoryDB:
                     ".var/app/org.mozilla.firefox", ".var/app/dev.vencord.Vesktop", ".var/app/com.discordapp.Discord",
                     ".local/share/flatpak/app/org.mozilla.firefox", ".local/share/flatpak/app/dev.vencord.Vesktop",
                     ".local/share/flatpak/app/com.discordapp.Discord", ".config/obs-studio/plugin_config/obs-browser",
+                    ".var/app/com.hypixel.HytaleLauncher", ".local/share/flatpak/app/com.hypixel.HytaleLauncher",
+                    ".local/share/flatpak/overrides/com.hypixel.HytaleLauncher",
                     ".pki/nssdb", ".local/share/pki/nssdb", ".config/cosmic", ".local/share/vulkan/implicit_layer.d"))
             startup_steam_tools()
             prefixes.extend(getattr(startup_steam_tools, "inventory_prefixes", ()))
@@ -4858,6 +4896,21 @@ class InventoryDB:
             WHERE budget='vrchat_content_cache' AND unit=? AND (k2<>? OR k3<>? OR k4<>0)""", updates)
         return units
 
+    def hytale_active_save_units(self):
+        """Choose the most recently modified save in each installation.
+
+        Reuse the existing budget/unit index and stored modification times.
+        Reading old menu entries or warming them must not make them active.
+        """
+        newest = {}
+        for unit, modified in self.connection.execute("""SELECT unit,MAX(mtime_ns)
+                FROM files WHERE budget='hytale_world' AND unit<>X'' GROUP BY unit"""):
+            parent = os.path.dirname(unit)
+            candidate = (modified, unit)
+            if parent not in newest or candidate > newest[parent]:
+                newest[parent] = candidate
+        return {unit for _, unit in newest.values()}
+
     def publish(self, cfg: dict, roots: list[str], *, reason: str):
         """Stream from the priority index. No all-inventory Python list/sort."""
         interruptible = self.volatile and reason != "shutdown"
@@ -4873,8 +4926,9 @@ class InventoryDB:
         caps, file_caps = cache_budget_caps(cfg), cache_budget_file_caps(cfg)
         used, counts, units, inodes = {}, {}, {}, set()
         chosen_units = set()
-        # Only the indexed VR content range needs group aggregation. All other
-        # families retain the existing streaming priority-index selection.
+        hytale_saves = self.hytale_active_save_units() if caps["hytale_world"] else set()
+        # VR content retains its complete-unit aggregation. Candidate files
+        # still stream from the existing priority index.
         units = self.content_units(interruptible=interruptible) if caps["vrchat_content_cache"] else {}
         # The live plan is IPC in /run (tmpfs on supported systemd desktops).
         # Reboot persistence uses changed saved_plan rows at checkpoint time.
@@ -4925,6 +4979,8 @@ class InventoryDB:
                     if byte_count + cost > limit:
                         continue
                     priority, budget, unit = tuple(tail[:5]), tail[5], tail[6]
+                    if budget == "hytale_world" and unit and unit not in hytale_saves:
+                        continue
                     metadata_cost = record_metadata_bytes(path_text, budget)
                     if metadata_used + metadata_cost > metadata_limit:
                         resource_skipped = True
@@ -5518,6 +5574,7 @@ def bootstrap_paths(cfg: dict, roots: list[str]) -> list[str]:
             ".local/share/flatpak/app", ".local/share/flatpak/runtime", ".local/bin",
             ".config/mozilla", ".mozilla", ".config/obs-studio", ".config/vesktop",
             ".config/discord", ".config/google-chrome", ".config/chromium",
+            ".var/app/com.hypixel.HytaleLauncher",
             ".cache/mozilla", ".cache/google-chrome", ".cache/chromium"))
         for root in (home / ".steam/root", home / ".local/share/Steam", home / ".steam/debian-installation"):
             for child in ("ubuntu12_64", "ubuntu12_32", "resource", "config", "steamapps/common/VRChat"):
@@ -7294,7 +7351,7 @@ write_config() {
 import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 path = Path('/etc/ramcache-controller/config.json')
-defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":null,"target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":5,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null}''')
+defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":null,"vrchat_content_cache_budget_bytes":null,"target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":6,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null}''')
 legacy = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":10,"incremental_rescan_interval_seconds":300,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":96,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":30,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"4G","target_shrink_to_available_bytes":"6G","target_grow_above_available_bytes":"7G","target_grow_to_available_bytes":"6G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"8G","vmtouch_chunk_target_bytes":"1024M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{}}''')
 current = {}
 if path.exists():
@@ -7328,7 +7385,12 @@ if int(current.get('config_version', 1)) < 4:
 if int(current.get('config_version', 1)) < 5:
     if current.get('vrchat_content_cache_budget_bytes') in ('2G', '1G'):
         merged['vrchat_content_cache_budget_bytes'] = None
-merged['config_version'] = 5
+# Apply automatic combined Hytale allowances to previous shipped defaults only.
+# Preserve explicit non-default limits, including a disabled (zero) budget.
+if int(current.get('config_version', 1)) < 6:
+    if current.get('hytale_world_budget_bytes') in ('2G', '1G'):
+        merged['hytale_world_budget_bytes'] = None
+merged['config_version'] = 6
 if current == merged:
     subprocess.run([sys.executable, sys.argv[1], '--config', str(path), '--check-config'], check=True, stdout=subprocess.DEVNULL)
     print('Existing configuration preserved.')
