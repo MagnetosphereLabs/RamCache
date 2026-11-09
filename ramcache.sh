@@ -63,7 +63,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.4.5"
+CONTROLLER_VERSION = "1.5.0"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -115,7 +115,7 @@ def validate_config(cfg: dict) -> None:
               "learning_pending_max", "max_pending_fs_events"}
     flags = {"learning_enabled", "learn_file_opens", "adaptive_memory_reserve", "stay_on_filesystem",
              "auto_include_common_app_paths", "prefer_fanotify_filesystem_watch",
-             "watch_attribute_events", "low_ram_profile_enabled"}
+             "watch_attribute_events", "low_ram_profile_enabled", "hotseat_enabled"}
     for key, value in list(cfg.items()):
         if (key.endswith("_bytes") or key in {"vmtouch_max_file_size", "target_relock_min_delta"}) and value is not None:
             if isinstance(value, bool) or parse_size(value) < 0:
@@ -137,6 +137,14 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("low_ram_profile_overrides must be a non-nested JSON object")
     if overrides:
         validate_config({**cfg, **overrides, "low_ram_profile_overrides": {}})
+    for key in ("hotseat_exclude_prefixes",):
+        paths = cfg.get(key, [])
+        if not isinstance(paths, list) or any(not isinstance(p, str) or not p.startswith("/") or "\0" in p for p in paths):
+            raise ValueError(key + " must contain absolute paths")
+    for key, low, high in (("hotseat_metadata_mib", 8, 256), ("hotseat_max_files", 256, 65536),
+                           ("hotseat_event_rate_limit", 10000, 10000000)):
+        if key in cfg and (isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or not low <= cfg[key] <= high):
+            raise ValueError(key + " is outside its supported integer range")
     binary = cfg.get("vmtouch_binary")
     if binary is not None and (not isinstance(binary, str) or not os.path.isabs(binary) or "\0" in binary):
         raise ValueError("vmtouch_binary must be an absolute executable path")
@@ -3738,12 +3746,16 @@ def explicit_plan_file_limit(cfg: dict) -> Optional[int]:
     return value if value > 0 else None
 
 
-def pop_fitting_chunk(pending, free_room, inflight, inflight_limit):
+def pop_fitting_chunk(pending, free_room, inflight, inflight_limit, excluded=()):
     # Rotate deferred chunks instead of letting one large file block every
     # smaller, higher-value read behind it. Bounded work per control tick.
     oversized = None
     for _ in range(min(len(pending), 128)):
         chunk = pending.popleft()
+        if excluded:
+            chunk = [rec for rec in chunk if (rec.dev, rec.ino) not in excluded]
+            if not chunk:
+                continue
         cost = sum(page_bytes(rec.size) for rec in chunk)
         if cost <= free_room and (inflight == 0 or inflight + cost <= inflight_limit):
             if cost > inflight_limit and oversized is None:
@@ -3877,9 +3889,10 @@ class IOActivity:
     """Back off for other work on a busy disk, not for our own prefetch I/O."""
     def __init__(self):
         self.previous = None
+        self.extra_groups = ()
 
     @staticmethod
-    def snapshot():
+    def snapshot(extra_groups=()):
         root = Path("/sys/fs/cgroup")
         group = root
         with open("/proc/self/cgroup", encoding="utf-8") as source:
@@ -3890,11 +3903,16 @@ class IOActivity:
                         group = candidate
                     break
         own = {}
-        with (group / "io.stat").open() as source:
-            for line in source:
-                parts = line.split()
-                values = dict(part.split("=", 1) for part in parts[1:] if "=" in part)
-                own[parts[0]] = int(values.get("rbytes", 0)) + int(values.get("wbytes", 0))
+        for accounting_group in (group,) + tuple(Path(p) for p in extra_groups):
+            try:
+                with (accounting_group / "io.stat").open() as source:
+                    for line in source:
+                        parts = line.split()
+                        values = dict(part.split("=", 1) for part in parts[1:] if "=" in part)
+                        own[parts[0]] = own.get(parts[0], 0) + int(values.get("rbytes", 0)) + int(values.get("wbytes", 0))
+            except FileNotFoundError:
+                if accounting_group == group:
+                    raise
         disks = {}
         with open("/proc/diskstats", encoding="ascii") as source:
             for line in source:
@@ -3911,7 +3929,7 @@ class IOActivity:
     def busy(self, now=None):
         now = time.monotonic() if now is None else now
         try:
-            disks, own = self.snapshot()
+            disks, own = self.snapshot(self.extra_groups)
         except (OSError, ValueError, IndexError):
             return False
         previous = self.previous
@@ -6528,7 +6546,8 @@ def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
                 names = {os.path.basename(r.path).lower() for r in members}
                 if names & {"__info", "__data"} and not {"__info", "__data"} <= names:
                     continue
-                missing = [r for r in members if id(r) not in present]
+                missing = [r for r in members if id(r) not in present
+                           and (r.dev, r.ino) not in cfg.get("_hotseat_owned", ())]
                 if not missing or any((maximum is not None and r.size > maximum) or r.size >= GIB
                                       or (excluded and record_key(r) in excluded) for r in missing):
                     continue
@@ -6540,7 +6559,7 @@ def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
                 selected.extend(missing)
                 total += cost
             continue
-        if id(rec) in present or (excluded and record_key(rec) in excluded):
+        if id(rec) in present or (excluded and record_key(rec) in excluded) or (rec.dev, rec.ino) in cfg.get("_hotseat_owned", ()):
             continue
         if maximum is not None and rec.size > maximum:
             continue
@@ -6639,6 +6658,18 @@ def run_supervisor() -> int:
         logging.error("another RAMCache supervisor already owns this runtime directory")
         return 1
     config_text, cfg = load_config()
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "hotseat-1.5.0-94bdfa6c6289"))
+    from hotseat_bridge import HotseatBridge
+    hotseat = HotseatBridge(RUNTIME_PATH, enabled=True)
+    hotseat.enabled = bool(cfg.get("hotseat_enabled", True))
+    if not hotseat.enabled:
+        hotseat.status = {"state": "disabled"}
+    else:
+        native_build = read_json(Path(__file__).resolve().parent / "hotseat-1.5.0-94bdfa6c6289" / "build-status.json", {})
+        if not native_build.get("available", False):
+            hotseat.status = {"state": "unavailable", "reason": native_build.get("reason", "native components not built")}
+    cfg["_hotseat_owned"] = hotseat.owned
+    cfg["_hotseat_threshold"] = parse_size(cfg.get("low_ram_total_threshold_bytes", "20G")) or 20*GIB
     roots = normalized_roots(cfg)
     cfg["_resolved_roots"] = roots
     storage_profile = resolve_scan_storage_profile(cfg)
@@ -6693,13 +6724,17 @@ def run_supervisor() -> int:
             "timestamp": time.time(), "pause_discovery": True,
             "cache_holding": False, "refill_from_plan": True,
         })
+        hotseat.renew_paused_lease()
         return not RUNNING or parse_meminfo()["MemAvailable"] < reserve
     try:
         while RUNNING:
             now = time.monotonic()
+            hotseat.poll(now)
             monitor_interval = max(1.0, float(cfg.get("memory_monitor_interval_seconds", 1)))
             memory_tick = now - last_memory_sample >= monitor_interval
             if memory_tick:
+                hotseat.refresh_memory(process_memory)
+                io_activity.extra_groups = (hotseat.io_group,) if hotseat.io_group else ()
                 io_busy = io_activity.busy(now)
             reap_workers(retired)
             owned_locked = 0
@@ -6752,32 +6787,70 @@ def run_supervisor() -> int:
                     worker.failed.set()
                     worker.diagnostic = "a loaded mapping lost locked pages; revalidating this worker"
                 owned_locked += locked
+            # The two cache sections share one safety policy and one byte grant.
+            owned_locked += hotseat.measured_locked
+            inflight += max(0, hotseat.reserved-hotseat.measured_locked)
+            hotseat.sync_workers(workers, retired)
             release = 0
             if memory_tick:
+                hotseat.track_base_growth(workers, retired)
                 supervisor_anon = process_memory(os.getpid())[1]
                 planner_anon = process_memory(planner.pid)[1] if planner.poll() is None else 0
-                own_anon = supervisor_anon + planner_anon
+                own_anon = supervisor_anon + planner_anon + hotseat.measured_anon
                 meminfo = parse_meminfo()
+                hotseat.mark_memory_sample(_MEMINFO_SAMPLE[0])
                 last_memory_sample = now
                 sampled_locked = {worker.proc.pid: worker.locked for worker in workers}
                 release, pause = policy.evaluate(meminfo, cfg, owned_locked, own_anon, now=now)
             if release:
+                pressure_before = owned_locked
                 target = max(0, owned_locked - release)
                 # Signal all chosen workers before waiting for any exit. The
                 # main loop never waits on a slow disk or blocked feeder.
                 workers.sort(key=lambda item: item.priority)
                 while workers and owned_locked > target:
                     worker = workers.pop()
+                    hotseat.note_pressure(worker, owned_locked)
                     owned_locked -= worker.locked
                     signal_worker(worker)
                     retired.append((now, worker))
+                hotseat.release(max(0, owned_locked-target), pressure_before)
                 pending_chunks.clear()
                 plan_changed = True
 
             floor, reserve, above = memory_watermarks(meminfo, cfg)
             if memory_tick:
                 budget_policy.evaluate(meminfo, cfg, owned_locked, inflight, paused=pause, now=now)
-            budget = budget_policy.target
+            global_budget = budget_policy.target
+            if memory_tick or hotseat.changed:
+                base_requested = sum(w.requested for w in workers)
+                base_unsampled = sum(max(0, w.requested-sampled_locked.get(w.proc.pid, 0))
+                    for w in workers + [w for _, w in retired if w.proc.poll() is None])
+                funding = hotseat.budget(total=meminfo["MemTotal"], available=meminfo["MemAvailable"],
+                    reserve=reserve, target=global_budget, base_requested=base_requested,
+                    base_unsampled=base_unsampled, paused=pause, io_busy=io_busy,
+                    healthy=not pause and meminfo["MemAvailable"] >= above, cfg=cfg, now=now,
+                    retiring=sum(w.requested for _, w in retired if w.proc.poll() is None))
+                hotseat.changed = False
+                # Existing priorities determine which base chunks make room.
+                # Retiring pages are never credited to MemAvailable before a new sample.
+                if funding and filled_once:
+                    workers.sort(key=lambda item: item.priority)
+                    while workers and funding > 0:
+                        worker = workers.pop()
+                        funding -= worker.requested
+                        owned_locked -= worker.locked
+                        signal_worker(worker)
+                        retired.append((now, worker))
+                    pending_chunks.clear()
+                    cache_goal = sum(w.requested for w in workers)
+                if hotseat.reclaimed and not pause:
+                    # Borrow returned allowance using the remembered plan only.
+                    budget_policy.refilling = True
+                    refill_from_plan = True
+                    plan_changed = True
+                    hotseat.reclaimed = False
+            budget = max(0, global_budget-hotseat.reserved)
             holding = not budget_policy.refilling
             boot_fetch = boot_apply_generation is not None
             if not holding and filled_once:
@@ -6892,10 +6965,21 @@ def run_supervisor() -> int:
             # not resident at the last sample EVEN AFTER its ready signal, so
             # fast completion never lets us spend stale MemAvailable twice.
             unsampled = sum(max(0, worker.requested - sampled_locked.get(worker.proc.pid, 0))
-                            for worker in workers)
+                            for worker in workers) + max(0, hotseat.reserved-hotseat.sampled_locked)
             while pending_chunks and (not holding or boot_apply) and not pause and active_loading < loading_limit and launches < 2:
-                free_room = max(0, meminfo["MemAvailable"] - reserve - unsampled)
-                chunk, cost = pop_fitting_chunk(pending_chunks, free_room, inflight, inflight_limit)
+                # A hot-seat admission may arrive after this base queue was built.
+                # Drop overlaps before starting VMTouch and enforce the current grant.
+                while pending_chunks:
+                    filtered = [r for r in pending_chunks[0] if (r.dev, r.ino) not in hotseat.owned]
+                    if filtered:
+                        pending_chunks[0] = filtered
+                        break
+                    pending_chunks.popleft()
+                if not pending_chunks:
+                    break
+                free_room = min(max(0, meminfo["MemAvailable"] - reserve - unsampled),
+                                max(0, budget-sum(w.requested for w in workers)))
+                chunk, cost = pop_fitting_chunk(pending_chunks, free_room, inflight, inflight_limit, hotseat.owned)
                 if chunk is None:
                     launch_blocked = "outstanding I/O budget" if inflight else "insufficient headroom for remaining whole-file chunks"
                     if not active_loading:
@@ -6935,7 +7019,7 @@ def run_supervisor() -> int:
 
             if (boot_apply and validated and not plan_changed and not active_loading
                     and not pending_chunks and not retired and not pause):
-                budget_policy.hold(budget)
+                budget_policy.hold(budget + hotseat.reserved)
                 boot_applied_generation = boot_apply_generation
                 boot_apply_generation = None
                 reader.reuse_records = {}
@@ -6953,7 +7037,7 @@ def run_supervisor() -> int:
                 # Keep the headroom target latched even if the known pool is
                 # smaller. Lowering it to cache_goal would retry this same
                 # exhausted pool every 30 s with unchanged available memory.
-                budget_policy.hold(budget)
+                budget_policy.hold(budget + hotseat.reserved)
             holding = not budget_policy.refilling
             if holding:
                 # Pressure can interrupt the very first fill. Only a normal
@@ -6993,7 +7077,7 @@ def run_supervisor() -> int:
                         and (filled_once or known_pool_done)):
                     boot_requested = True
                     if known_pool_done and not holding:
-                        budget_policy.hold(budget)
+                        budget_policy.hold(budget + hotseat.reserved)
                         holding = True
                 generation = planner_status.get("boot_refresh_generation")
                 if (boot_requested and planner_status.get("boot_refresh_state") == "waiting for cache update"
@@ -7053,6 +7137,9 @@ def run_supervisor() -> int:
                     fill_state = "usable-memory target reached"
                 payload = {
                     "controller_version": CONTROLLER_VERSION, "timestamp": int(time.time()),
+                    "hotseat": hotseat.status, "combined_target_gib": bytes_to_gib(global_budget),
+                    "combined_locked_gib": bytes_to_gib(actual + hotseat.measured_locked),
+                    "hotseat_reserved_gib": bytes_to_gib(hotseat.reserved),
                     "boot_refresh_state": planner_status.get("boot_refresh_state", "waiting for initial fill"),
                     "boot_refresh_completed": planner_status.get("boot_refresh_completed", False),
                     "boot_validation_reused_files": boot_validation_reused,
@@ -7102,6 +7189,16 @@ def run_supervisor() -> int:
                     if text != config_text:
                         logging.info("configuration changed; restarting discovery and validating saved priorities")
                         cfg, config_text = new_cfg, text
+                        enabled = bool(cfg.get("hotseat_enabled", True))
+                        if hotseat.enabled and not enabled:
+                            hotseat.disconnect("disabled by configuration")
+                            hotseat.status = {"state": "disabled"}
+                        elif enabled and not hotseat.enabled:
+                            subprocess.Popen(["systemctl", "start", "ramcache-hotseat.service"],
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        hotseat.enabled = enabled
+                        cfg["_hotseat_owned"] = hotseat.owned
+                        cfg["_hotseat_threshold"] = parse_size(cfg.get("low_ram_total_threshold_bytes", "20G")) or 20*GIB
                         roots = normalized_roots(cfg)
                         cfg["_resolved_roots"] = roots
                         storage_profile = resolve_scan_storage_profile(cfg)
@@ -7128,8 +7225,14 @@ def run_supervisor() -> int:
             # Completion/feeding remains fast; memory telemetry is sampled on
             # its independent >=1-s cadence. Holding ignores deferred plans.
             busy = active_loading or (not holding and (not validated or incoming is not None or plan_changed))
-            time.sleep(0.1 if busy else monitor_interval)
+            # Publish newly launched ownership BEFORE accepting hot-seat claims.
+            hotseat.sync_workers(workers, retired)
+            hotseat.poll(now)
+            wait = .1 if busy else max(.01, monitor_interval-(time.monotonic()-last_memory_sample))
+            descriptors = ([hotseat.peer] if hotseat.peer else [hotseat.server]) if hotseat.enabled else []
+            select.select(descriptors, [], [], wait)
     finally:
+        hotseat.close()
         reader.stop.set()
         for worker in workers:
             signal_worker(worker)
@@ -7351,7 +7454,7 @@ write_config() {
 import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 path = Path('/etc/ramcache-controller/config.json')
-defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":null,"vrchat_content_cache_budget_bytes":null,"target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":6,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null}''')
+defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":null,"vrchat_content_cache_budget_bytes":null,"target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":7,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null,"hotseat_enabled":true,"hotseat_max_files":65536,"hotseat_metadata_mib":64,"hotseat_event_rate_limit":500000,"hotseat_exclude_prefixes":[]}''')
 legacy = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":10,"incremental_rescan_interval_seconds":300,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":96,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":30,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"4G","target_shrink_to_available_bytes":"6G","target_grow_above_available_bytes":"7G","target_grow_to_available_bytes":"6G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"8G","vmtouch_chunk_target_bytes":"1024M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{}}''')
 current = {}
 if path.exists():
@@ -7390,7 +7493,7 @@ if int(current.get('config_version', 1)) < 5:
 if int(current.get('config_version', 1)) < 6:
     if current.get('hytale_world_budget_bytes') in ('2G', '1G'):
         merged['hytale_world_budget_bytes'] = None
-merged['config_version'] = 6
+merged['config_version'] = 7
 if current == merged:
     subprocess.run([sys.executable, sys.argv[1], '--config', str(path), '--check-config'], check=True, stdout=subprocess.DEVNULL)
     print('Existing configuration preserved.')
@@ -7405,7 +7508,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.4.5.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.5.0.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -7507,7 +7610,7 @@ write_service() {
 [Unit]
 Description=Persistent adaptive RAM cache controller
 After=local-fs.target
-Wants=local-fs.target
+Wants=local-fs.target ramcache-hotseat.service
 
 [Service]
 Type=simple
@@ -8800,6 +8903,2915 @@ ensure_fs_watch_tools() {
   fi
 }
 
+write_hotseat() {
+  local target="/opt/ramcache-controller/hotseat-1.5.0-94bdfa6c6289"
+  local stage reason="" native_ok=1 requested=1 arch multiarch compiler
+  local -a dependencies cflags libs extra_includes
+  stage=$(mktemp -d /opt/ramcache-controller/.hotseat.XXXXXX) || return 1
+  chmod 755 "$stage" || { rm -rf -- "$stage"; return 1; }
+  cat > "$stage/hotseat_bridge.py" <<'RAMCACHE_HOTSEAT_SOURCE_0'
+"""Supervisor-side hot-seat IPC. No file loading, path resolution, or SQL here.
+
+The supervisor owns the admission grant. A lower grant is not spendable by the
+base cache until the peer acknowledges it and its actual reservations fit it.
+Peer crashes retain reservations until every registered lock holder has exited.
+"""
+import array
+import base64
+import bisect
+import collections
+import contextlib
+import json
+import os
+import select
+import signal
+import socket
+import struct
+import time
+
+MAX_PACKET = 196608
+MAX_QUEUE = 8 * 1024 * 1024
+
+
+def inode_key(dev, ino):
+    return (int(dev), int(ino))
+
+
+class BaseIndex:
+    """Compact identities for active AND retiring base workers."""
+    def __init__(self):
+        self.workers, self.devices = {}, {}
+        self.generation = 0
+
+    def add(self, pid, groups, reset=True):
+        if reset:
+            self.remove(pid)
+        result = self.workers.setdefault(pid, {})
+        for dev, encoded in groups:
+            values = array.array("Q")
+            values.frombytes(base64.b64decode(encoded, validate=True))
+            inos, sizes = values[::2], values[1::2]
+            if len(values)%2 or len(inos) > 8192 or any(a > b for a, b in zip(inos, inos[1:])):
+                raise ValueError("invalid base inode index")
+            result[int(dev)] = (inos, sizes)
+            self.devices.setdefault(int(dev), {})[pid] = (inos, sizes)
+        self.generation += 1
+
+    def remove(self, pid):
+        for dev in self.workers.pop(pid, {}):
+            self.devices[dev].pop(pid, None)
+            if not self.devices[dev]:
+                del self.devices[dev]
+        self.generation += 1
+
+    def contains(self, key, size=0):
+        dev, ino = key
+        for values, sizes in self.devices.get(dev, {}).values():
+            i = bisect.bisect_left(values, ino)
+            if i < len(values) and values[i] == ino and sizes[i] >= size:
+                return True
+        return False
+
+
+def cgroup_id(pid="self"):
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="ascii") as source:
+            for line in source:
+                if line.startswith("0::"):
+                    return os.stat("/sys/fs/cgroup/" + line.strip().split("::", 1)[1].lstrip("/")).st_ino
+    except OSError:
+        pass
+    return 0
+
+
+class HotseatBridge:
+    def __init__(self, runtime, enabled=True):
+        self.enabled = enabled
+        self.server = self.peer = None
+        self.path = str(runtime / "hotseat.sock")
+        self.out = collections.deque()
+        self.queued = 0
+        self.known = {}
+        self.base = BaseIndex()
+        self.claims = {}
+        self.owned = set()
+        self.status = {"state": "waiting for hot-seat service" if enabled else "disabled"}
+        self.grant = self.requested_grant = 0
+        self.revision = 0
+        self.want = self.locked = self.inflight = self.anon = 0
+        self.sampled_locked = 0
+        self.samples = collections.deque(maxlen=32)
+        self.last_seen = 0.
+        self.last_lease = 0.
+        self.peer_pid = 0
+        self.pidfds = {}
+        self.orphans = []
+        self.snapshot_done = False
+        self.pressure_pending = {}
+        self.pressure_ready = self.growth_ready = 0
+        self.normal_ready = 0
+        self.pressure_before = 0
+        self.last_base = {}
+        self.reclaimed = False
+        self.changed = False
+        self.measured_locked = self.measured_anon = 0
+        self.io_group = None
+        if enabled:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.path)
+            self.server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_NONBLOCK)
+            self.server.bind(self.path)
+            os.chmod(self.path, 0o600)
+            self.server.listen(1)
+
+    @property
+    def reserved(self):
+        return self.grant + sum(item[1] for item in self.orphans)
+
+    def _register_pid(self, pid):
+        pid = int(pid)
+        if pid <= 1 or pid in self.pidfds:
+            return
+        # pidfds make exit checks immune to PID reuse; required on supported kernels.
+        try:
+            fd = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            return
+        if pid != self.peer_pid:
+            try:
+                with open(f"/proc/{pid}/status", encoding="ascii") as source:
+                    parents = [int(line.split()[1]) for line in source if line.startswith("PPid:")]
+                same_group = cgroup_id(pid) == cgroup_id(self.peer_pid) != 0
+                if parents != [self.peer_pid] or not same_group or select.select([fd], [], [], 0)[0]:
+                    os.close(fd)
+                    return
+            except (OSError, ValueError):
+                os.close(fd)
+                return
+        self.pidfds[pid] = fd
+        self.changed = True
+
+    def disconnect(self, reason):
+        self.reclaimed |= bool(self.want or self.grant or self.owned)
+        self.changed = True
+        if self.status.get("state") != "unavailable":
+            self.status = {"state": "unavailable", "reason": str(reason)}
+        if self.peer:
+            self.peer.close()
+        self.peer = None
+        for fd in self.pidfds.values():
+            with contextlib.suppress(OSError):
+                signal.pidfd_send_signal(fd, signal.SIGTERM)
+        if self.grant or self.pidfds:
+            self.orphans.append((list(self.pidfds.values()), self.grant))
+        self.pidfds = {}
+        self.grant = self.requested_grant = self.want = self.locked = self.inflight = self.anon = 0
+        self.peer_pid = 0
+        self.samples.clear()
+        self.measured_locked = self.measured_anon = 0
+        self.io_group = None
+        self.sampled_locked = 0
+        # Keep identities excluded from base admission until the old holders
+        # really exit, including a helper blocked in a filesystem fault.
+        if not self.orphans:
+            self.owned.clear()
+        self.claims.clear()
+        self.out.clear()
+        self.queued = 0
+        self.known.clear()
+        self.base = BaseIndex()
+        self.snapshot_done = False
+
+    def enqueue(self, obj):
+        if not self.peer:
+            return False
+        payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        if len(payload) > MAX_PACKET or self.queued + len(payload) > MAX_QUEUE:
+            self.disconnect("hot-seat control channel exceeded its bounded backlog")
+            return False
+        self.out.append(payload)
+        self.queued += len(payload)
+        return True
+
+    def poll(self, now=None):
+        now = time.monotonic() if now is None else now
+        for pid, fd in list(self.pidfds.items()):
+            if select.select([fd], [], [], 0)[0]:
+                if pid == self.peer_pid:
+                    self.disconnect("hot-seat process exited")
+                    break
+                os.close(fd)
+                del self.pidfds[pid]
+        for item in list(self.orphans):
+            fds, reservation = item
+            if not fds or len(select.select(fds, [], [], 0)[0]) == len(fds):
+                for fd in fds:
+                    os.close(fd)
+                self.orphans.remove(item)
+                self.reclaimed = self.reclaimed or bool(reservation)
+        if not self.orphans and self.peer is None:
+            self.owned.clear()
+        if not self.enabled:
+            return
+        if self.peer is None:
+            try:
+                peer, _ = self.server.accept()
+                pid, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if uid or self.orphans:
+                    peer.close()
+                    return
+                peer.setblocking(False)
+                self.peer, self.peer_pid, self.last_seen = peer, pid, now
+                self._register_pid(pid)
+                try:
+                    with open(f"/proc/{pid}/cgroup", encoding="ascii") as source:
+                        for line in source:
+                            if line.startswith("0::"):
+                                self.io_group = "/sys/fs/cgroup/" + line.strip().split("::", 1)[1].lstrip("/")
+                                break
+                except OSError:
+                    pass
+                self.enqueue({"type": "hello", "protocol": 1, "cgroup": cgroup_id(), "pid": os.getpid()})
+            except BlockingIOError:
+                pass
+            except OSError as error:
+                self.disconnect(error)
+        if self.peer is None:
+            return
+        try:
+            # Bounded work, even when a peer has a large candidate burst.
+            for _ in range(32):
+                try:
+                    payload, _, flags, _ = self.peer.recvmsg(MAX_PACKET)
+                except BlockingIOError:
+                    break
+                if not payload or flags & socket.MSG_TRUNC:
+                    raise ValueError("hot-seat control connection closed or truncated")
+                item = json.loads(payload)
+                kind = item.get("type")
+                self.last_seen = now
+                if kind == "status":
+                    for pid in item.get("pids", []):
+                        self._register_pid(pid)
+                    self.status = item.get("status", {})
+                    want = max(0, int(item.get("want", 0)))
+                    self.changed |= want != self.want
+                    self.want = want
+                    if int(item.get("locked", 0)) < self.locked:
+                        self.samples.clear()
+                        self.sampled_locked = 0
+                    self.locked = max(0, int(item.get("locked", 0)))
+                    self.inflight = max(0, int(item.get("inflight", 0)))
+                    self.anon = max(0, int(item.get("anon", 0)))
+                    if self.locked + self.inflight > self.grant:
+                        raise ValueError("hot-seat exceeded its admission grant")
+                    self.samples.append((float(item.get("monotonic", now)), self.locked))
+                    if int(item.get("revision", -1)) == self.revision:
+                        old = self.grant
+                        self.grant = max(self.requested_grant, self.locked + self.inflight)
+                        self.reclaimed = self.reclaimed or self.grant < old
+                        self.changed |= self.grant < old
+                elif kind == "claim":
+                    key = (int(item["dev"]), int(item["ino"]))
+                    token = int(item["token"])
+                    in_base = self.base.contains(key)
+                    granted = self.snapshot_done and not in_base and key not in self.owned
+                    if granted:
+                        self.owned.add(key)
+                        self.claims[key] = token
+                    self.enqueue({"type": "claim", "dev": key[0], "ino": key[1],
+                                  "token": token, "granted": granted, "base": in_base})
+                    self.changed = True
+                elif kind == "unclaim":
+                    key = (int(item["dev"]), int(item["ino"]))
+                    if self.claims.get(key) == int(item["token"]):
+                        self.claims.pop(key)
+                        self.owned.discard(key)
+                        # A released file's old ACK must not credit later reads
+                        # against a MemAvailable snapshot from another instant.
+                        self.samples.clear()
+                        self.sampled_locked = 0
+                    self.changed = True
+                elif kind == "ready":
+                    self.status = {"state": "observing"}
+                elif kind == "unavailable":
+                    self.status = {"state": "unavailable", "reason": str(item.get("reason", "kernel observer unavailable"))}
+                else:
+                    raise ValueError("invalid hot-seat protocol message")
+                if self.peer is None:
+                    return
+            for _ in range(16):
+                if not self.out:
+                    break
+                try:
+                    sent = self.peer.send(self.out[0])
+                except BlockingIOError:
+                    break
+                if sent != len(self.out[0]):
+                    raise ValueError("short hot-seat packet")
+                self.queued -= len(self.out.popleft())
+            if now - self.last_seen > 15:
+                raise ValueError("hot-seat heartbeat expired")
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self.disconnect(error)
+
+    def sync_workers(self, workers, retired):
+        if not self.peer:
+            return
+        current = {w.proc.pid: w for w in workers}
+        current.update({w.proc.pid: w for _, w in retired if w.proc.poll() is None})
+        # Chunks are already bounded by the original controller. Transfer only
+        # new/removed workers, using compact inode arrays rather than file paths.
+        for pid in list(self.known):
+            if pid not in current:
+                if not self.enqueue({"type": "base_del", "pid": pid}):
+                    return
+                self.base.remove(pid)
+                self.known.pop(pid, None)
+        count = 0
+        for pid, worker in current.items():
+            if pid in self.known:
+                continue
+            devices = {}
+            for rec in worker.records:
+                values = devices.setdefault(rec.dev, {})
+                values[rec.ino] = max(values.get(rec.ino, 0), rec.size)
+            first = True
+            for dev, sizes in devices.items():
+                values = array.array("Q", (n for pair in sorted(sizes.items()) for n in pair))
+                groups = [[dev, base64.b64encode(values.tobytes()).decode("ascii")]]
+                if not self.enqueue({"type": "base_add", "pid": pid, "devices": groups, "reset": first}):
+                    return
+                self.base.add(pid, groups, reset=first)
+                first = False
+            self.known[pid] = True
+            count += 1
+            if count >= 8:
+                break
+        complete = len(self.known) == len(current)
+        if complete and not self.snapshot_done:
+            self.enqueue({"type": "base_done"})
+        self.snapshot_done = complete
+
+    def mark_memory_sample(self, timestamp):
+        self.sampled_locked = 0
+        for when, locked in self.samples:
+            if when <= timestamp:
+                self.sampled_locked = locked
+        self.sampled_locked = min(self.sampled_locked, self.measured_locked)
+
+    def refresh_memory(self, reader):
+        locked = anon = 0
+        for pid, fd in self.pidfds.items():
+            if not select.select([fd], [], [], 0)[0]:
+                held, heap = reader(pid)
+                locked += held
+                anon += heap
+        self.measured_locked, self.measured_anon = locked, anon
+
+    def track_base_growth(self, workers, retired=()):
+        current = {w.proc.pid: w.locked for w in workers}
+        current.update({w.proc.pid: w.locked for _, w in retired if w.proc.poll() is None})
+        self.growth_ready += sum(max(0, value-self.last_base.get(pid, 0)) for pid, value in current.items())
+        self.normal_ready += sum(value for pid, value in self.last_base.items()
+                                 if pid not in current and pid not in self.pressure_pending)
+        self.last_base = current
+        for pid, (proc, amount) in list(self.pressure_pending.items()):
+            if proc.poll() is not None:
+                self.pressure_ready += amount
+                del self.pressure_pending[pid]
+
+    def note_pressure(self, worker, before):
+        self.pressure_pending[worker.proc.pid] = (worker.proc, worker.locked)
+        self.pressure_before = max(self.pressure_before, int(before))
+
+    def renew_paused_lease(self):
+        now = time.monotonic()
+        if now-self.last_lease >= 1:
+            self.enqueue({"type": "lease"})
+            self.poll(now)
+            self.last_lease = now
+
+    def release(self, amount, before=0):
+        if self.peer and amount:
+            self.enqueue({"type": "release", "bytes": int(amount), "before": int(before), "reason": "pressure"})
+
+    def budget(self, *, total, available, reserve, target, base_requested,
+               base_unsampled, paused, io_busy, healthy, cfg, now, retiring=0):
+        if not self.peer:
+            return 0
+        threshold = int(cfg.get("_hotseat_threshold", 20*1024**3))
+        nominal = 4*1024**3 if total < threshold else 8*1024**3
+        want = min(self.want, nominal, max(0, target)) if self.snapshot_done else 0
+        if paused:
+            want = min(want, self.locked + self.inflight)
+        old = self.grant
+        free = max(0, available-reserve-base_unsampled-max(0, old-self.sampled_locked))
+        permitted = min(want, max(0, target-base_requested-retiring), old + (0 if paused or io_busy else free))
+        if permitted != self.requested_grant:
+            self.revision += 1
+        self.requested_grant = permitted
+        # Raising is charged immediately; lowering waits for the peer's ACK.
+        self.grant = max(self.grant, permitted)
+        if not self.enqueue({"type": "budget", "revision": self.revision, "cap": permitted,
+                      "registered": list(self.pidfds),
+                      "total": total, "nominal": nominal, "paused": bool(paused),
+                      "global_target": target,
+                      "io_busy": bool(io_busy), "healthy": bool(healthy), "monotonic": now,
+                      "global_locked": base_requested + self.locked,
+                      "pressure_released": self.pressure_ready, "regrown": self.growth_ready,
+                      "ordinary_released": self.normal_ready,
+                      "pressure_before": self.pressure_before}):
+            return 0
+        self.pressure_ready = self.growth_ready = self.pressure_before = self.normal_ready = 0
+        # Retire base chunks only for actual recent-file demand, after initial
+        # base startup, and never while foreground pressure or I/O asks us to wait.
+        return max(0, want-self.grant-free-retiring, want+base_requested-target) if not paused and not io_busy and self.snapshot_done else 0
+
+    def close(self):
+        self.disconnect("controller stopped")
+        if self.server:
+            self.server.close()
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.path)
+        for fds, _ in self.orphans:
+            for fd in fds:
+                os.close(fd)
+        self.orphans.clear()
+RAMCACHE_HOTSEAT_SOURCE_0
+  cat > "$stage/ramcache_hotseat.py" <<'RAMCACHE_HOTSEAT_SOURCE_1'
+#!/usr/bin/env python3
+"""RAMCache hot-seat sidecar, protocol 1. Original discovery is never invoked.
+
+Optional work is confined to its own CPU-limited systemd service. The main
+supervisor grants all admission bytes; losing that lease releases every lock.
+"""
+import array
+import base64
+import bisect
+import collections
+import concurrent.futures
+import contextlib
+import ctypes
+import errno
+import json
+import logging
+import math
+import os
+import queue
+import select
+import signal
+import socket
+import sqlite3
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from hotseat_bridge import MAX_PACKET, BaseIndex, cgroup_id
+
+MIB, GIB = 1024**2, 1024**3
+PAGE = os.sysconf("SC_PAGE_SIZE")
+QUANTUM, RELEASE_QUANTUM = 4*MIB, 64*MIB
+COMMAND = struct.Struct("=II7Q")
+REPLY = struct.Struct("=II5QiI")
+EVENT = struct.Struct("=IIII5QII")
+MAGIC = 0x52434c31
+OPEN, LOCK, TRIM, DROP, CHECK, STOP = range(1, 7)
+BULK_TRIM = 7
+RUNNING = True
+
+
+class KernelUnavailable(RuntimeError):
+    pass
+
+
+def page_bytes(size):
+    return (size + PAGE-1)//PAGE*PAGE
+
+
+def fingerprint(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+class IndexedHeap:
+    """One node per identity: timestamp updates never accumulate stale nodes."""
+    def __init__(self, newest=False):
+        self.data, self.positions = [], {}
+        self.sign = -1 if newest else 1
+
+    def __len__(self):
+        return len(self.data)
+
+    def _swap(self, a, b):
+        self.data[a], self.data[b] = self.data[b], self.data[a]
+        self.positions[self.data[a][1]] = a
+        self.positions[self.data[b][1]] = b
+
+    def _fix(self, i):
+        while i and self.data[i] < self.data[(i-1)//2]:
+            parent = (i-1)//2
+            self._swap(i, parent)
+            i = parent
+        while i*2+1 < len(self.data):
+            child = i*2+1
+            if child+1 < len(self.data) and self.data[child+1] < self.data[child]:
+                child += 1
+            if self.data[i] <= self.data[child]:
+                break
+            self._swap(i, child)
+            i = child
+
+    def set(self, key, stamp):
+        value = (self.sign*stamp, key)
+        i = self.positions.get(key)
+        if i is None:
+            i = len(self.data)
+            self.positions[key] = i
+            self.data.append(value)
+        else:
+            self.data[i] = value
+        self._fix(i)
+
+    def remove(self, key):
+        i = self.positions.pop(key, None)
+        if i is None:
+            return
+        last = self.data.pop()
+        if i < len(self.data):
+            self.data[i] = last
+            self.positions[last[1]] = i
+            self._fix(i)
+
+    def peek(self):
+        return self.data[0][1] if self.data else None
+
+    def pop(self):
+        key = self.peek()
+        if key is not None:
+            self.remove(key)
+        return key
+
+
+class PressureHistory:
+    """Unrecovered pressure debt, credited FIFO; ordinary replacement adds none."""
+    def __init__(self, nominal, now=None):
+        self.nominal = int(nominal)
+        self.target = float(nominal)
+        self.debts = collections.deque()
+        self.anchor = 0
+        self.replacement_debt = 0
+        self.healthy_since = None
+        self.last_tick = time.monotonic() if now is None else now
+
+    def record(self, released=0, regrown=0, before=0, now=None, ordinary=0):
+        now = time.monotonic() if now is None else now
+        self.expire(now)
+        if self.debts:
+            self.replacement_debt += max(0, int(ordinary))
+        # Credit only debt that already exists; growth cannot cancel a future release.
+        credit = max(0, int(regrown))
+        replacement = min(credit, self.replacement_debt)
+        credit -= replacement
+        self.replacement_debt -= replacement
+        while credit and self.debts:
+            used = min(credit, self.debts[0][1])
+            self.debts[0][1] -= used
+            credit -= used
+            if not self.debts[0][1]:
+                self.debts.popleft()
+        if not self.debts:
+            self.anchor = 0
+            self.replacement_debt = 0
+        if released > 0:
+            if not self.debts:
+                self.anchor = max(int(before), int(released), 1)
+            bucket = int(now//10)*10
+            if self.debts and self.debts[-1][0] == bucket:
+                self.debts[-1][1] += int(released)
+            else:
+                self.debts.append([bucket, int(released)])
+
+    def expire(self, now):
+        while self.debts and self.debts[0][0] <= now-1800:
+            self.debts.popleft()
+        if not self.debts:
+            self.anchor = 0
+            self.replacement_debt = 0
+
+    def tick(self, healthy, now=None):
+        now = time.monotonic() if now is None else now
+        self.expire(now)
+        ratio = min(1., sum(x[1] for x in self.debts)/max(1, self.anchor))
+        goal = self.nominal*(1-ratio) if ratio >= .25 else self.nominal
+        dt = max(0., min(60., now-self.last_tick))
+        self.last_tick = now
+        if not healthy:
+            self.healthy_since = None
+        elif self.healthy_since is None:
+            self.healthy_since = now
+        if goal < self.target:
+            self.target = max(goal, self.target-self.nominal*.125*dt/60)
+        elif healthy and now-self.healthy_since >= 300:
+            self.target = min(goal, self.target+self.nominal*.0625*dt/60)
+        return int(max(0, min(self.nominal, self.target)))//PAGE*PAGE
+
+    def export(self, now):
+        self.expire(now)
+        return {"target": int(self.target), "anchor": self.anchor, "replacement_debt": self.replacement_debt,
+                "debts": [[max(0, now-t), amount] for t, amount in self.debts], "wall": time.time()}
+
+    def restore(self, value, now):
+        age = max(0., time.time()-float(value.get("wall", 0)))
+        self.target = min(self.nominal, max(0, int(value.get("target", self.nominal))))
+        self.anchor = max(0, int(value.get("anchor", 0)))
+        self.replacement_debt = max(0, int(value.get("replacement_debt", 0)))
+        for old_age, amount in value.get("debts", [])[:181]:
+            elapsed = float(old_age)+age
+            if 0 <= elapsed < 1800 and int(amount) > 0:
+                self.debts.append([now-elapsed, int(amount)])
+        self.expire(now)
+
+
+@dataclass
+class Entry:
+    key: tuple
+    path: str
+    size: int
+    mtime: int
+    ctime: int
+    seen: int
+    target: int = 0
+    worker: object = None
+    token: int = 0
+    locked: int = 0
+    reserved: int = 0
+    remote_fd: int = -1
+    watch: int = -1
+    in_base: bool = False
+    dirty: bool = False
+    dropping: bool = False
+    retry: float = 0.
+    check_at: float = 0.
+    locator: object = None
+    drop_ack: bool = False
+    claimed: bool = False
+
+
+def path_allowed(path, excludes, state, runtime):
+    if not path or not path.startswith("/") or "\0" in path or path.endswith(" (deleted)"):
+        return False
+    forbidden = ("/proc", "/sys", "/dev", "/run", str(state), str(runtime)) + tuple(excludes)
+    return not any(path == p.rstrip("/") or path.startswith(p.rstrip("/")+"/") for p in forbidden)
+
+
+def process_matches(pid, birth):
+    try:
+        with open(f"/proc/{pid}/stat") as source:
+            ticks = int(source.read().rsplit(")", 1)[1].split()[19])
+        hz = os.sysconf("SC_CLK_TCK")
+        return abs(ticks*1_000_000_000//hz-birth) <= 1_000_000_000//hz
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def resolve_event(event, excludes, state, runtime, known_path=None):
+    """Try the observed name first; inspect only its process if that fails."""
+    key, seen, pid, birth, start, end, path = event
+
+    def attempt(name):
+        fd = -1
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+            st = os.fstat(fd)
+            canonical = os.readlink(f"/proc/self/fd/{fd}")
+            if (st.st_dev, st.st_ino) != key or not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or not st.st_nlink:
+                raise ValueError("identity changed or file is not eligible")
+            if not path_allowed(canonical, excludes, state, runtime):
+                raise ValueError("excluded file")
+            return fd, canonical, st, seen, event
+        except (OSError, ValueError):
+            if fd >= 0:
+                os.close(fd)
+            return None
+
+    for name in dict.fromkeys((path, known_path)):
+        if path_allowed(name, excludes, state, runtime):
+            result = attempt(name)
+            if result is not None:
+                return result
+    if process_matches(pid, birth):
+        candidates = []
+        if path and path.startswith("/"):
+            candidates.append(f"/proc/{pid}/root"+path)
+        if start and end:
+            candidates.append(f"/proc/{pid}/map_files/{start:x}-{end:x}")
+        for name in candidates:
+            result = attempt(name)
+            if result is not None:
+                return result
+        # Last resort: at most 256 descriptors of this one process, never /proc
+        # as a whole. A normal successfully named read performs none of this.
+        try:
+            with os.scandir(f"/proc/{pid}/fd") as iterator:
+                for i, item in enumerate(iterator):
+                    if i >= 256:
+                        break
+                    try:
+                        st = item.stat()
+                        if (st.st_dev, st.st_ino) == key:
+                            result = attempt(item.path)
+                            if result is not None:
+                                return result
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+    raise FileNotFoundError("observed identity could not be resolved")
+
+
+class FileWatches:
+    def __init__(self):
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.libc.inotify_init1.argtypes = [ctypes.c_int]
+        self.libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        self.libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        self.keys = {}
+
+    def add(self, fd, key):
+        # Follow this already validated descriptor to the inode, avoiding path races.
+        mask = 0x2 | 0x4 | 0x8 | 0x400 | 0x800
+        wd = self.libc.inotify_add_watch(self.fd, os.fsencode(f"/proc/self/fd/{fd}"), mask)
+        if wd >= 0:
+            self.keys[wd] = key
+        return wd
+
+    def remove(self, wd):
+        if wd >= 0 and wd in self.keys:
+            self.keys.pop(wd, None)
+            self.libc.inotify_rm_watch(self.fd, wd)
+
+    def read(self):
+        changed, overflow = set(), False
+        for _ in range(4):
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            pos = 0
+            while pos+16 <= len(data):
+                wd, mask, _, length = struct.unpack_from("iIII", data, pos)
+                pos += 16+length
+                if mask & 0x4000:
+                    overflow = True
+                if wd in self.keys:
+                    changed.add(self.keys[wd])
+                if mask & 0x8000:
+                    self.keys.pop(wd, None)
+        return changed, overflow
+
+    def close(self):
+        os.close(self.fd)
+
+
+class Locker:
+    def __init__(self, binary):
+        self.sock, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.setblocking(False)
+        try:
+            self.proc = subprocess.Popen([str(binary)], stdin=child, close_fds=True)
+        finally:
+            child.close()
+        self.pending = None
+        self.control_pending = {}
+        self.buffered_replies = collections.deque()
+        self.started = 0.
+        self.entries = set()
+        self.actions = collections.OrderedDict()
+        self.loading = IndexedHeap(newest=True)
+        self.oldest = IndexedHeap()
+
+    def command(self, entry, op, value=0, fd=None, reason="ordinary"):
+        is_control = op in (TRIM, DROP)
+        if (is_control and entry.token in self.control_pending) or (not is_control and self.pending is not None):
+            return False
+        packet = COMMAND.pack(MAGIC, op, entry.token, value, *entry.key, entry.size, entry.mtime, entry.ctime)
+        ancillary = [] if fd is None else [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))]
+        try:
+            count = self.sock.sendmsg([packet], ancillary)
+        except BlockingIOError:
+            return False
+        if count != len(packet):
+            raise OSError("short locker command")
+        if is_control:
+            self.control_pending[entry.token] = (entry, op, value, reason)
+        else:
+            self.pending = (entry, op, value, reason)
+            self.started = time.monotonic()
+        return True
+
+    def reply(self):
+        if self.buffered_replies:
+            packet = self.buffered_replies.popleft()
+        else:
+            try:
+                packet = self.sock.recv(REPLY.size*2049+1)
+            except BlockingIOError:
+                return None
+            if len(packet) >= REPLY.size:
+                head = REPLY.unpack_from(packet)
+                if head[0] == MAGIC and head[1] == BULK_TRIM:
+                    count = head[4]
+                    if count > 2048 or count == 0 or len(packet) != (count+1)*REPLY.size:
+                        raise OSError("invalid bulk release acknowledgement")
+                    self.buffered_replies.extend(packet[i*REPLY.size:(i+1)*REPLY.size] for i in range(1, count+1))
+                    packet = self.buffered_replies.popleft()
+        if len(packet) != REPLY.size:
+            raise OSError("invalid locker reply")
+        magic, op, token, locked, size, mtime, ctime, error, remote_fd = REPLY.unpack(packet)
+        pending = self.control_pending.get(token) if op in (TRIM, DROP) else self.pending
+        if pending is None:
+            raise OSError("unsolicited locker reply")
+        entry, expected_op, value, reason = pending
+        if magic != MAGIC or op != expected_op or token != entry.token:
+            raise OSError("mismatched locker reply")
+        if op in (TRIM, DROP):
+            del self.control_pending[token]
+        else:
+            self.pending = None
+        return entry, op, value, locked, size, mtime, ctime, error, remote_fd, reason
+
+    def trim_many(self, values, reason="ordinary"):
+        if not values or len(values) > 2048 or self.control_pending:
+            return False
+        header = COMMAND.pack(MAGIC, BULK_TRIM, 0, len(values), 0, 0, 0, 0, 0)
+        packet = header + b"".join(struct.pack("=QQ", entry.token, keep) for entry, keep in values)
+        try:
+            sent = self.sock.send(packet)
+        except BlockingIOError:
+            return False
+        if sent != len(packet):
+            raise OSError("short bulk release command")
+        for entry, keep in values:
+            self.control_pending[entry.token] = (entry, TRIM, keep, reason)
+        return True
+
+    def stop(self):
+        with contextlib.suppress(OSError):
+            self.sock.shutdown(socket.SHUT_RDWR)
+        self.sock.close()
+        with contextlib.suppress(ProcessLookupError):
+            self.proc.terminate()
+
+
+class Store:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        if not self.path.exists():
+            return [], {}
+        try:
+            with sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=2) as db:
+                if db.execute("PRAGMA user_version").fetchone()[0] != 1:
+                    raise ValueError("unsupported hot-seat state schema")
+                rows = list(db.execute("SELECT path,dev,ino,size,mtime,ctime,rank FROM files ORDER BY rank LIMIT 65536"))
+                row = db.execute("SELECT value FROM meta WHERE key='pressure'").fetchone()
+                return rows, json.loads(row[0]) if row else {}
+        except (sqlite3.Error, ValueError, TypeError) as error:
+            logging.warning("Hot-seat state could not be restored: %s", error)
+            return [], {}
+
+    def save(self, rows, pressure):
+        # Build a complete new database and replace atomically. Existing inventory
+        # DB, journal mode, schema and checkpoint schedule are never touched.
+        fd, path = tempfile.mkstemp(prefix=".hotseat-", dir=self.path.parent)
+        os.fchmod(fd, 0o600)
+        os.close(fd)
+        try:
+            with sqlite3.connect(path) as db:
+                db.execute("PRAGMA synchronous=FULL")
+                db.executescript("PRAGMA user_version=1; CREATE TABLE files(path BLOB,dev TEXT,ino TEXT,size INTEGER,mtime INTEGER,ctime INTEGER,rank INTEGER); CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);")
+                db.executemany("INSERT INTO files VALUES(?,?,?,?,?,?,?)", rows)
+                db.execute("INSERT INTO meta VALUES('pressure',?)", (json.dumps(pressure),))
+                db.commit()
+            with open(path, "rb") as source:
+                os.fsync(source.fileno())
+            os.replace(path, self.path)
+            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+
+
+def resolve_path(path, seen, excludes, state, runtime):
+    if not path_allowed(path, excludes, state, runtime):
+        raise FileNotFoundError("ineligible saved path")
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        canonical = os.readlink(f"/proc/self/fd/{fd}")
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or not st.st_nlink:
+            raise FileNotFoundError("saved file is no longer eligible")
+        if not path_allowed(canonical, excludes, state, runtime):
+            raise FileNotFoundError("saved file moved to an excluded path")
+        return fd, canonical, st, seen, None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class Sidecar:
+    def __init__(self, directory, state, runtime, cfg):
+        self.directory, self.state, self.runtime, self.cfg = directory, state, runtime, cfg
+        self.excludes = tuple(cfg.get("exclude_prefixes", ())) + tuple(cfg.get("hotseat_exclude_prefixes", ()))
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.settimeout(10)
+        deadline = time.monotonic()+10
+        while True:
+            try:
+                self.sock.connect(str(runtime / "hotseat.sock"))
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                if not RUNNING or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.05)
+        pid, uid, _ = struct.unpack("3i", self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid:
+            raise RuntimeError("hot-seat supervisor is not root")
+        hello = json.loads(self.sock.recv(MAX_PACKET))
+        if hello.get("type") != "hello" or hello.get("protocol") != 1 or hello.get("pid") != pid:
+            raise RuntimeError("hot-seat supervisor protocol mismatch")
+        self.sock.setblocking(False)
+        self.out = collections.deque()
+        self.out_bytes = 0
+        self.last_budget = time.monotonic()
+        self.cap = self.revision = self.nominal = self.global_target = 0
+        self.registered = set()
+        self.paused = True
+        self.io_busy = False
+        self.healthy = False
+        self.base_done = False
+        self.base = BaseIndex()
+        self.entries = collections.OrderedDict()
+        self.pending = IndexedHeap(newest=True)
+        self.selected = IndexedHeap()
+        self.needs_open = IndexedHeap(newest=True)
+        self.discardable = IndexedHeap()
+        self.selected_bytes = 0
+        self.locked_bytes = self.reserved_bytes = 0
+        self.metadata_bytes = 0
+        self.unknown = collections.OrderedDict()
+        self.validation_queue = collections.OrderedDict()
+        self.open_fds = {}
+        self.claim_pending = {}
+        self.failed = collections.OrderedDict()
+        self.futures = {}
+        self.future_started = {}
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="hotseat-metadata")
+        self.persistence_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="hotseat-checkpoint")
+        self.wake_read, self.wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.watch = FileWatches()
+        self.lockers = [Locker(directory / "hotseat-lock") for _ in range(2)]
+        self.retired = []
+        self.observer_sock, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.observer_sock.setblocking(False)
+        own_cgroup = cgroup_id()
+        if not own_cgroup or not hello["cgroup"] or own_cgroup == hello["cgroup"]:
+            raise KernelUnavailable("Hot-seat requires separate cgroup-v2 services for reliable self-exclusion")
+        observer_args = [str(directory / "hotseat-observer"), str(directory / "hotseat.bpf.o"), str(state),
+                         str(own_cgroup), str(hello["cgroup"]), str(int(cfg.get("hotseat_event_rate_limit", 500000)))]
+        try:
+            self.observer = subprocess.Popen(observer_args, stdin=child, close_fds=True)
+        finally:
+            child.close()
+        self.observer_ready = False
+        self.observer_commands = collections.deque()
+        self.observer_stats = {}
+        self.history = None
+        self.pressure_release = 0
+        self.pressure_before = 0
+        self.emergency_cap = None
+        self.serial = 0
+        self.dirty_generation = 0
+        self.saved_generation = 0
+        self.save_future = None
+        self.save_generation = 0
+        self.last_checkpoint = time.monotonic()
+        self.store = Store(state / "hotseat.sqlite3")
+        self.restore_future = self.persistence_pool.submit(self.store.load)
+        self.restore = collections.deque()
+        self.restore_pressure = None
+        self.check_cursor = collections.deque()
+        self.next_check = time.monotonic()+3600
+        self.need_policy = True
+        self.last_status = 0.
+        self.urgent_report = False
+        self.last_config = time.monotonic()
+        self.counters = collections.Counter()
+        self.error = ""
+        self.metrics_dirty = True
+        self.metrics = {}
+        self.config_text = json.dumps(cfg, sort_keys=True)
+        self.max_entries = min(65536, max(256, int(cfg.get("hotseat_max_files", 65536))))
+        self.metadata_limit = min(256*MIB, max(8*MIB, int(cfg.get("hotseat_metadata_mib", 64))*MIB))
+
+    def send(self, value):
+        packet = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
+        if len(packet) > MAX_PACKET or self.out_bytes+len(packet) > 2*MIB:
+            raise RuntimeError("bounded supervisor channel backlog exhausted")
+        self.out.append(packet)
+        self.out_bytes += len(packet)
+
+    def flush(self):
+        for _ in range(64):
+            if not self.out:
+                break
+            try:
+                n = self.sock.send(self.out[0])
+            except BlockingIOError:
+                break
+            if n != len(self.out[0]):
+                raise RuntimeError("short supervisor packet")
+            self.out_bytes -= len(self.out.popleft())
+        for _ in range(64):
+            if not self.observer_commands:
+                break
+            try:
+                self.observer_sock.send(self.observer_commands[0])
+            except BlockingIOError:
+                break
+            self.observer_commands.popleft()
+
+    def observer_command(self, op, key):
+        if len(self.observer_commands) >= 131072:
+            raise RuntimeError("observer ownership control backlog exhausted")
+        self.observer_commands.append(f"{op} {os.major(key[0])} {os.minor(key[0])} {key[1]}".encode())
+
+    def update_base(self, item):
+        pid = int(item["pid"])
+        old = self.base.workers.get(pid, {})
+        old_keys = ((dev, ino) for dev, values in old.items() for ino in values[0])
+        affected = {key for key in old_keys if key in self.entries}
+        if item["type"] == "base_add":
+            self.base.add(pid, item["devices"], item.get("reset", True))
+            affected.update((dev, ino) for dev, values in self.base.workers[pid].items()
+                            for ino in values[0] if (dev, ino) in self.entries)
+        else:
+            self.base.remove(pid)
+        for key in affected:
+            entry = self.entries[key]
+            entry.in_base = self.base.contains(key)
+            if entry.in_base:
+                self.selected_bytes -= entry.target
+                entry.target = 0
+                self.selected.remove(key)
+                self.pending.remove(key)
+            elif not entry.target:
+                self.pending.set(key, entry.seen)
+            self.mark_entry(entry)
+        self.urgent_report = True
+        self.need_policy = True
+
+    def receive_control(self):
+        for _ in range(32):
+            try:
+                packet, _, flags, _ = self.sock.recvmsg(MAX_PACKET)
+            except BlockingIOError:
+                break
+            if not packet or flags & socket.MSG_TRUNC:
+                raise RuntimeError("supervisor disconnected")
+            value = json.loads(packet)
+            kind = value.get("type")
+            if kind in ("base_add", "base_del"):
+                self.update_base(value)
+            elif kind == "base_done":
+                self.base_done = True
+            elif kind == "lease":
+                self.last_budget = time.monotonic()
+                self.paused = True
+            elif kind == "claim":
+                key = int(value["dev"]), int(value["ino"])
+                token = int(value["token"])
+                entry = self.entries.get(key)
+                expected = self.claim_pending.pop(key, None)
+                valid = entry is not None and expected == token and entry.token == token
+                if value["granted"]:
+                    if valid:
+                        entry.claimed = True
+                        self.mark_entry(entry)
+                    else:
+                        self.send({"type": "unclaim", "dev": key[0], "ino": key[1], "token": token})
+                elif valid:
+                    entry.retry = time.monotonic()+1
+                    if value.get("base"):
+                        entry.in_base = True
+                        self.selected_bytes -= entry.target
+                        entry.target = 0
+                        self.selected.remove(key)
+                        self.pending.remove(key)
+                    self.mark_entry(entry)
+                    self.need_policy = True
+            elif kind == "budget":
+                now = time.monotonic()
+                previous = self.cap, self.paused, self.io_busy
+                self.cap = max(0, int(value["cap"]))
+                self.revision = int(value["revision"])
+                self.registered = set(map(int, value.get("registered", [])))
+                self.nominal = int(value["nominal"])
+                self.global_target = int(value.get("global_target", self.nominal))
+                self.paused, self.io_busy, self.healthy = value["paused"], value["io_busy"], value["healthy"]
+                self.last_budget = now
+                if self.history is None:
+                    self.history = PressureHistory(self.nominal, now)
+                    if self.restore_pressure:
+                        self.history.restore(self.restore_pressure, now)
+                self.history.nominal = self.nominal
+                self.history.record(released=int(value.get("pressure_released", 0)),
+                                    regrown=int(value.get("regrown", 0)),
+                                    before=int(value.get("pressure_before", 0)), now=now,
+                                    ordinary=int(value.get("ordinary_released", 0)))
+                old_target = int(self.history.target)
+                self.history.tick(self.healthy and not self.paused, now)
+                if old_target != int(self.history.target) or value.get("pressure_released") or self.history.debts:
+                    self.dirty_generation += 1
+                if not self.paused:
+                    self.emergency_cap = None
+                self.need_policy |= previous != (self.cap, self.paused, self.io_busy) or old_target != int(self.history.target)
+            elif kind == "release":
+                amount = max(0, int(value["bytes"]))
+                locked, _ = self.accounting()
+                self.pressure_before = max(self.pressure_before, locked, int(value.get("before", 0)))
+                target = max(0, locked-amount)
+                self.emergency_cap = min(self.emergency_cap, target) if self.emergency_cap is not None else target
+                self.pressure_release = max(self.pressure_release, locked-target)
+                self.paused = True
+                self.need_policy = True
+            else:
+                raise RuntimeError("invalid supervisor command")
+
+    def observed(self, key, seen, pid, birth, start, end, path):
+        entry = self.entries.get(key)
+        if entry:
+            if seen > entry.seen:
+                entry.seen = seen
+                entry.locator = (key, seen, pid, birth, start, end, path)
+                self.entries.move_to_end(key)
+                if not entry.in_base:
+                    (self.selected if entry.target else self.pending).set(key, seen)
+                self.mark_entry(entry, metrics=False)
+                self.dirty_generation += 1
+                self.need_policy = True
+            return
+        if self.failed.get(key, 0) > time.monotonic():
+            return
+        self.unknown[key] = (key, seen, pid, birth, start, end, path)
+        self.unknown.move_to_end(key)
+        if len(self.unknown) > 8192:
+            self.unknown.popitem(last=False)
+            self.counters["candidate_backlog_replacements"] += 1
+
+    def receive_observer(self):
+        for _ in range(128):
+            try:
+                packet, _, flags, _ = self.observer_sock.recvmsg(8192)
+            except BlockingIOError:
+                break
+            if not packet or flags & socket.MSG_TRUNC:
+                if not self.observer_ready:
+                    raise KernelUnavailable("Kernel observer startup failed; see journalctl -u ramcache-hotseat.service")
+                raise RuntimeError("kernel observer exited or sent a truncated event")
+            kind, = struct.unpack_from("=I", packet)
+            if kind == 1:
+                if len(packet) < EVENT.size+1:
+                    raise RuntimeError("invalid kernel observer event")
+                _, flags, major, minor, ino, seen, birth, start, end, pid, _ = EVENT.unpack_from(packet)
+                if flags & 8 and not flags & (2 | 4):
+                    self.counters["direct_io_candidates_skipped"] += 1
+                    continue
+                path = os.fsdecode(packet[EVENT.size:].split(b"\0", 1)[0])
+                self.observed((os.makedev(major, minor), ino), seen, pid, birth, start, end, path)
+            elif kind == 2:
+                self.observer_stats = json.loads(packet[4:])
+            elif kind == 3:
+                self.observer_ready = True
+                self.send({"type": "ready"})
+            elif kind == 4:
+                raise KernelUnavailable(packet[4:].decode("utf-8", "replace"))
+
+    def submit(self, kind, key, function, *args):
+        if len(self.futures) >= 2 or any(k == key for _, k in self.futures.values()):
+            return False
+        future = self.pool.submit(function, *args)
+        self.futures[future] = kind, key
+        self.future_started[future] = time.monotonic()
+        def done(_):
+            with contextlib.suppress(OSError):
+                os.write(self.wake_write, b"x")
+        future.add_done_callback(done)
+        return True
+
+    def forget(self, entry):
+        self.selected_bytes -= entry.target
+        entry.target = 0
+        self.selected.remove(entry.key)
+        if entry.worker or entry.reserved:
+            entry.dropping = True
+            self.mark_entry(entry)
+            return False
+        self.unclaim(entry)
+        self.pending.remove(entry.key)
+        self.selected.remove(entry.key)
+        self.discardable.remove(entry.key)
+        self.needs_open.remove(entry.key)
+        self.validation_queue.pop(entry.key, None)
+        if entry.key in self.open_fds:
+            os.close(self.open_fds.pop(entry.key))
+        self.watch.remove(entry.watch)
+        self.entries.pop(entry.key, None)
+        self.metadata_bytes -= 512+len(os.fsencode(entry.path))
+        self.observer_command("U", entry.key)
+        self.dirty_generation += 1
+        self.metrics_dirty = True
+        return True
+
+    def mark_entry(self, entry, metrics=True):
+        key = entry.key
+        if entry.in_base or entry.dropping:
+            self.pending.remove(key)
+        elif 0 < entry.target < page_bytes(entry.size):
+            self.pending.set(key, entry.seen)
+        elif entry.target:
+            self.pending.remove(key)
+        if not entry.worker and entry.claimed and (not entry.target or entry.in_base or entry.dropping):
+            self.unclaim(entry)
+        if entry.target and not entry.worker and not entry.in_base and not entry.dropping:
+            self.needs_open.set(key, entry.seen)
+        else:
+            self.needs_open.remove(key)
+            if key in self.open_fds:
+                os.close(self.open_fds.pop(key))
+        if not entry.target and not entry.worker:
+            self.discardable.set(key, entry.seen)
+        else:
+            self.discardable.remove(key)
+        if entry.dirty and not entry.worker and (entry.target or entry.in_base):
+            self.validation_queue[key] = True
+        if entry.worker:
+            worker = entry.worker
+            if entry.locked:
+                worker.oldest.set(key, entry.seen)
+            else:
+                worker.oldest.remove(key)
+            if entry.target > entry.locked and not entry.in_base and not entry.dropping:
+                worker.loading.set(key, entry.seen)
+            else:
+                worker.loading.remove(key)
+            if entry.dropping or not entry.target or entry.in_base or entry.dirty or entry.locked > entry.target:
+                worker.actions[key] = True
+        self.metrics_dirty |= metrics
+
+    def unclaim(self, entry):
+        if entry.claimed:
+            self.send({"type": "unclaim", "dev": entry.key[0], "ino": entry.key[1], "token": entry.token})
+            entry.claimed = False
+
+    def make_room(self, extra):
+        examined = 0
+        while len(self.entries) >= self.max_entries or self.metadata_bytes+extra > self.metadata_limit:
+            victim = self.entries.get(self.discardable.peek())
+            if victim is None or examined >= 64:
+                return False
+            self.forget(victim)
+            self.counters["metadata_candidate_replacements"] += 1
+            examined += 1
+        return True
+
+    def finish_metadata(self):
+        for future in list(self.futures):
+            if not future.done():
+                continue
+            kind, key = self.futures.pop(future)
+            self.future_started.pop(future, None)
+            try:
+                fd, path, st, seen, locator = future.result()
+            except Exception as error:
+                self.failed[key] = time.monotonic()+30
+                self.failed.move_to_end(key)
+                if len(self.failed) > 65536:
+                    self.failed.popitem(last=False)
+                self.counters["unresolved_or_changed"] += 1
+                self.error = str(error)[:240]
+                if isinstance(key, tuple):
+                    self.observer_command("N", key)
+                entry = self.entries.get(key)
+                if entry:
+                    if entry.target:
+                        self.selected_bytes -= entry.target
+                        entry.target = 0
+                    self.forget(entry)
+                continue
+            try:
+                actual_key = (st.st_dev, st.st_ino)
+                if kind in ("open", "check") and actual_key != key:
+                    old = self.entries.get(key)
+                    if old:
+                        self.selected_bytes -= old.target
+                        old.target = 0
+                        self.forget(old)
+                entry = self.entries.get(actual_key)
+                if entry is None:
+                    cost = 512+len(os.fsencode(path))
+                    if not self.make_room(cost):
+                        self.counters["metadata_limit"] += 1
+                        continue
+                    entry = Entry(actual_key, path, st.st_size, st.st_mtime_ns, st.st_ctime_ns, seen)
+                    entry.in_base = self.base.contains(actual_key)
+                    self.entries[actual_key] = entry
+                    self.metadata_bytes += cost
+                    if not entry.in_base:
+                        self.pending.set(actual_key, seen)
+                else:
+                    extra = self.unknown.pop(actual_key, None)
+                    entry.seen = max(entry.seen, seen, extra[1] if extra else 0)
+                    if not entry.worker:
+                        old_size = entry.size
+                        self.metadata_bytes += len(os.fsencode(path))-len(os.fsencode(entry.path))
+                        entry.path, entry.size, entry.mtime, entry.ctime = path, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+                        entry.in_base = self.base.contains(actual_key)
+                        if entry.target and entry.size != old_size:
+                            self.selected_bytes -= entry.target
+                            entry.target = 0
+                            self.selected.remove(actual_key)
+                        entry.dirty = False
+                    if not entry.in_base:
+                        (self.selected if entry.target else self.pending).set(actual_key, entry.seen)
+                if entry.watch not in self.watch.keys:
+                    entry.watch = self.watch.add(fd, actual_key)
+                    if entry.watch < 0:
+                        self.counters["watch_failures"] += 1
+                entry.retry = 0
+                if locator is not None:
+                    entry.locator = locator
+                if kind == "open" and entry.target and not entry.worker and not entry.in_base:
+                    if actual_key in self.open_fds:
+                        os.close(self.open_fds.pop(actual_key))
+                    self.open_fds[actual_key] = fd
+                    fd = -1
+                self.mark_entry(entry)
+                self.need_policy = True
+                self.dirty_generation += 1
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+
+    def select_recent(self):
+        if not self.history or not self.base_done or not self.observer_ready or not self.need_policy:
+            return
+        self.need_policy = False
+        previous_selected = self.selected_bytes
+        limit = min(int(self.history.target), self.global_target)//PAGE*PAGE
+        # Gradual downsizing can retain a partially pinned file; it need not
+        # discard a multi-GiB file to release a 64-MiB amount.
+        while self.selected_bytes > limit and self.selected:
+            entry = self.entries[self.selected.peek()]
+            amount = min(entry.target, self.selected_bytes-limit)
+            entry.target -= amount
+            self.selected_bytes -= amount
+            if not entry.target:
+                self.selected.remove(entry.key)
+                self.pending.set(entry.key, entry.seen)
+            self.mark_entry(entry)
+        if self.paused:
+            self.urgent_report |= previous_selected != self.selected_bytes
+            return
+        deferred = []
+        for _ in range(64):
+            key = self.pending.pop()
+            if key is None:
+                break
+            entry = self.entries.get(key)
+            if entry is None or entry.dropping or entry.in_base:
+                continue
+            complete = page_bytes(entry.size)
+            cost = complete-entry.target
+            if cost <= 0:
+                continue
+            if complete > limit or entry.retry > time.monotonic():
+                deferred.append(entry)
+                continue
+            # Displace only older observations, never a newer file because a
+            # delayed/coalesced notification arrived out of order.
+            victims = []
+            room = limit-self.selected_bytes
+            while room < cost and self.selected:
+                victim = self.entries[self.selected.peek()]
+                if victim.seen >= entry.seen:
+                    break
+                self.selected.pop()
+                victims.append(victim)
+                room += victim.target
+            if room < cost:
+                for victim in victims:
+                    self.selected.set(victim.key, victim.seen)
+                deferred.append(entry)
+                continue
+            for victim in victims:
+                self.selected_bytes -= victim.target
+                victim.target = 0
+                deferred.append(victim)
+                self.mark_entry(victim)
+            entry.target = complete
+            self.selected_bytes += cost
+            self.selected.set(entry.key, entry.seen)
+            self.mark_entry(entry)
+            self.dirty_generation += 1
+        for entry in deferred:
+            self.pending.set(entry.key, entry.seen)
+        self.urgent_report |= previous_selected != self.selected_bytes or self.metrics_dirty
+
+    def accounting(self):
+        return self.locked_bytes, max(0, self.reserved_bytes-self.locked_bytes)
+
+    def check_lockers(self):
+        for locker in list(self.lockers):
+            if locker.proc.poll() is not None or (locker.pending and time.monotonic()-locker.started > 120):
+                self.retire_locker(locker, "lock helper exited or timed out")
+                continue
+            try:
+                result = locker.reply()
+            except OSError as error:
+                self.retire_locker(locker, str(error))
+                continue
+            if result is None:
+                continue
+            entry, op, value, locked, size, mtime, ctime, error, remote_fd, reason = result
+            previous = entry.locked
+            if locked > entry.reserved or locked % PAGE:
+                raise RuntimeError("invalid confirmed locker accounting")
+            pending_io = locker.pending if locker.pending and locker.pending[0] is entry else None
+            pending_bytes = pending_io[2] if pending_io and pending_io[1] == LOCK else 0
+            reserved = locked + pending_bytes
+            self.locked_bytes += locked-entry.locked
+            self.reserved_bytes += reserved-entry.reserved
+            entry.locked, entry.reserved = locked, reserved
+            entry.remote_fd = remote_fd
+            if locked > previous and self.history:
+                self.history.record(regrown=locked-previous)
+            if previous > locked and self.history:
+                if reason == "pressure":
+                    released = min(previous-locked, self.pressure_release)
+                    self.pressure_release -= released
+                    self.history.record(released=released, before=self.pressure_before,
+                                        ordinary=previous-locked-released)
+                else:
+                    self.history.record(ordinary=previous-locked)
+                self.dirty_generation += 1
+            if error and error != errno.ECANCELED:
+                self.counters["lock_errors"] += 1
+                self.error = os.strerror(error)
+                entry.retry = time.monotonic()+30
+                if error in (errno.ESTALE, errno.ENOENT) or op == OPEN:
+                    if not pending_io and entry.token not in locker.control_pending:
+                        self.disown(entry)
+                    else:
+                        entry.dropping = True
+                        # ENOENT during an OPEN does not cancel the later mapping.
+                        entry.drop_ack = not (pending_io and pending_io[1] == OPEN)
+                    entry.dirty = True
+                else:
+                    entry.dropping = True
+            elif op == DROP:
+                entry.drop_ack = True
+                entry.dropping = True
+                if not pending_io:
+                    self.disown(entry)
+            elif op == OPEN:
+                locker.entries.add(entry.key)
+            else:
+                entry.mtime, entry.ctime = mtime, ctime
+                if op == CHECK:
+                    entry.dirty = False
+                    entry.check_at = time.monotonic()+1
+                    try:
+                        path = os.readlink(f"/proc/{locker.proc.pid}/fd/{remote_fd}")
+                        if path_allowed(path, self.excludes, self.state, self.runtime):
+                            self.metadata_bytes += len(os.fsencode(path))-len(os.fsencode(entry.path))
+                            entry.path = path
+                        else:
+                            self.selected_bytes -= entry.target
+                            entry.target = 0
+                            self.selected.remove(entry.key)
+                            entry.dropping = True
+                    except OSError:
+                        pass
+            if entry.drop_ack and not pending_io and entry.token not in locker.control_pending:
+                self.disown(entry)
+            self.mark_entry(entry)
+            self.need_policy = True
+
+    def disown(self, entry):
+        if entry.worker:
+            entry.worker.entries.discard(entry.key)
+            entry.worker.loading.remove(entry.key)
+            entry.worker.oldest.remove(entry.key)
+            entry.worker.actions.pop(entry.key, None)
+        self.locked_bytes -= entry.locked
+        self.reserved_bytes -= entry.reserved
+        entry.worker = None
+        entry.locked = entry.reserved = 0
+        entry.remote_fd = -1
+        entry.dropping = False
+        entry.drop_ack = False
+        self.unclaim(entry)
+        self.observer_command("U", entry.key)
+        self.mark_entry(entry)
+
+    def retire_locker(self, locker, error):
+        owned = [e for e in self.entries.values() if e.worker is locker]
+        locker.stop()
+        self.lockers.remove(locker)
+        self.retired.append((locker, owned))
+        self.error = error
+        self.counters["helper_failures"] += 1
+
+    def reap_lockers(self):
+        for locker, entries in list(self.retired):
+            if locker.proc.poll() is None:
+                continue
+            for entry in entries:
+                self.disown(entry)
+                entry.retry = time.monotonic()+30
+            self.retired.remove((locker, entries))
+        # Do not replace a stuck process indefinitely or pretend its locks are gone.
+        if not self.retired and len(self.lockers) < 2:
+            self.lockers.append(Locker(self.directory / "hotseat-lock"))
+            self.report()
+
+    def work_lockers(self):
+        locked, inflight = self.accounting()
+        limit = min(self.cap, self.emergency_cap) if self.emergency_cap is not None else self.cap
+        excess = max(0, locked+inflight-limit)
+        for locker in self.lockers:
+            if excess and locker.oldest:
+                if locker.control_pending:
+                    continue
+                values, deferred = [], []
+                remaining = excess
+                while remaining > 0 and locker.oldest and len(values) < 2048:
+                    entry = self.entries[locker.oldest.pop()]
+                    deferred.append(entry)
+                    amount = min(entry.locked, page_bytes(remaining))
+                    values.append((entry, entry.locked-amount))
+                    remaining -= amount
+                if locker.trim_many(values, "pressure" if self.emergency_cap is not None else "ordinary"):
+                    excess = max(0, remaining)
+                for entry in deferred:
+                    locker.oldest.set(entry.key, entry.seen)
+                continue
+            handled = False
+            for _ in range(32):
+                if not locker.actions:
+                    break
+                key, _ = locker.actions.popitem(last=False)
+                entry = self.entries.get(key)
+                if not entry or entry.worker is not locker:
+                    continue
+                if entry.token in locker.control_pending:
+                    continue
+                if entry.dropping or not entry.target or entry.in_base:
+                    handled = locker.command(entry, DROP)
+                elif entry.locked > entry.target:
+                    keep = max(entry.target, entry.locked-RELEASE_QUANTUM)
+                    handled = locker.command(entry, TRIM, keep)
+                elif entry.dirty:
+                    if entry.check_at > time.monotonic():
+                        locker.actions[key] = True
+                        continue
+                    if not locker.pending:
+                        handled = locker.command(entry, CHECK)
+                    else:
+                        locker.actions[key] = True
+                        break
+                if handled:
+                    break
+                if entry.dropping or not entry.target or entry.in_base or entry.locked > entry.target or entry.dirty:
+                    # Socket backpressure must not discard a required release.
+                    locker.actions[key] = True
+                    break
+            if handled:
+                continue
+            if locker.pending or locker.control_pending:
+                continue
+            if self.paused or self.io_busy or not self.observer_ready or not self.base_done or locker.proc.pid not in self.registered:
+                continue
+            free = max(0, limit-locked-inflight)
+            if not free:
+                continue
+            if locker.loading:
+                entry = self.entries[locker.loading.peek()]
+                if entry.retry <= time.monotonic():
+                    amount = min(QUANTUM, entry.target-entry.locked, free)//PAGE*PAGE
+                    if amount and locker.command(entry, LOCK, amount):
+                        entry.reserved += amount
+                        self.reserved_bytes += amount
+                        inflight += amount
+                continue
+            ready = next((self.entries[k] for k in self.open_fds
+                          if k in self.entries and self.entries[k].target and not self.entries[k].worker
+                          and not self.entries[k].in_base and self.entries[k].retry <= time.monotonic()), None)
+            if ready:
+                if not ready.claimed:
+                    if ready.key not in self.claim_pending:
+                        self.serial += 1
+                        ready.token = self.serial
+                        self.claim_pending[ready.key] = ready.token
+                        self.send({"type": "claim", "dev": ready.key[0], "ino": ready.key[1], "token": ready.token})
+                    continue
+                fd = self.open_fds.pop(ready.key)
+                try:
+                    if locker.command(ready, OPEN, fd=fd):
+                        ready.worker = locker
+                        locker.entries.add(ready.key)
+                        self.observer_command("P", ready.key)
+                        self.mark_entry(ready)
+                finally:
+                    os.close(fd)
+
+    def metadata_work(self):
+        if not self.observer_ready:
+            return
+        for _ in range(2):
+            if len(self.futures) >= 2 or not self.validation_queue:
+                break
+            key, _ = self.validation_queue.popitem(last=False)
+            entry = self.entries.get(key)
+            if entry and not entry.worker and (entry.target or entry.in_base):
+                if not self.submit("check", key, resolve_path, entry.path, entry.seen, self.excludes, self.state, self.runtime):
+                    self.validation_queue[key] = True
+                    break
+        # Reserve metadata opportunities for selected-file loading, so a stream
+        # of new observations cannot starve admission behind path resolution.
+        deferred = []
+        if not self.paused and not self.io_busy and len(self.open_fds) < 2 and self.cap:
+            for _ in range(4):
+                key = self.needs_open.pop()
+                if key is None:
+                    break
+                entry = self.entries.get(key)
+                if not entry or not entry.target or entry.worker or entry.in_base:
+                    continue
+                deferred.append(entry)
+                if key not in self.open_fds and entry.retry <= time.monotonic():
+                    if entry.locator and not entry.dirty:
+                        self.submit("open", key, resolve_event, entry.locator, self.excludes, self.state, self.runtime, entry.path)
+                    else:
+                        self.submit("open", key, resolve_path, entry.path, entry.seen,
+                                    self.excludes, self.state, self.runtime)
+                if len(self.futures) >= 2:
+                    break
+        for entry in deferred:
+            self.needs_open.set(entry.key, entry.seen)
+        while len(self.futures) < 2 and self.unknown:
+            key, event = self.unknown.popitem(last=True)
+            if key in self.entries or self.failed.get(key, 0) > time.monotonic():
+                continue
+            if not self.submit("discover", key, resolve_event, event, self.excludes, self.state, self.runtime):
+                self.unknown[key] = event
+                break
+        if len(self.futures) < 2 and self.restore:
+            path, seen = self.restore.popleft()
+            self.submit("restore", path, resolve_path, path, seen, self.excludes, self.state, self.runtime)
+
+    def periodic(self):
+        now = time.monotonic()
+        if self.restore_future and self.restore_future.done():
+            rows, self.restore_pressure = self.restore_future.result()
+            self.restore_future = None
+            if self.history and self.restore_pressure:
+                self.history.restore(self.restore_pressure, now)
+            stamp = time.monotonic_ns()-len(rows)-1
+            for row in reversed(rows):
+                path = os.fsdecode(row[0])
+                self.restore.append((path, stamp+int(row[6])))
+        if now >= self.next_check:
+            self.check_cursor = collections.deque(e.key for e in self.entries.values() if e.target or e.worker or e.in_base)
+            self.next_check = now+3600
+        for _ in range(min(32, len(self.check_cursor))):
+            key = self.check_cursor.popleft()
+            entry = self.entries.get(key)
+            if entry:
+                if entry.worker:
+                    entry.dirty = True
+                    self.mark_entry(entry)
+                elif entry.target or entry.in_base:
+                    self.validation_queue[key] = True
+        if self.save_future and self.save_future.done():
+            try:
+                self.save_future.result()
+                self.saved_generation = self.save_generation
+            except Exception as error:
+                self.error = "hot-seat checkpoint: "+str(error)
+                self.counters["checkpoint_failures"] += 1
+            self.save_future = None
+        if now-self.last_checkpoint >= 3600:
+            self.checkpoint()
+        if now-self.last_status >= 1 or (self.urgent_report and now-self.last_status >= .1):
+            self.report()
+            self.last_status = now
+            self.urgent_report = False
+        # Config changes restart only this sidecar; the main program retains
+        # its original independent config-reload semantics.
+        if now-self.last_config >= 5:
+            self.last_config = now
+            try:
+                current = json.loads((Path("/etc/ramcache-controller/config.json")).read_text())
+                if json.dumps(current, sort_keys=True) != self.config_text:
+                    raise RuntimeError("hot-seat configuration changed; restarting sidecar")
+            except (OSError, ValueError):
+                pass
+
+    def checkpoint(self, force=False):
+        if self.save_future or not self.history or (not force and self.saved_generation == self.dirty_generation):
+            return
+        self.last_checkpoint = time.monotonic()
+        entries = sorted(self.entries.values(), key=lambda e: e.seen)
+        rows = [(os.fsencode(e.path), hex(e.key[0]), hex(e.key[1]), e.size, e.mtime, e.ctime, rank)
+                for rank, e in enumerate(entries)]
+        self.save_generation = self.dirty_generation
+        self.save_future = self.persistence_pool.submit(self.store.save, rows, self.history.export(time.monotonic()))
+
+    def report(self):
+        locked, inflight = self.accounting()
+        if self.metrics_dirty:
+            self.metrics = {
+                "want": sum(e.target for e in self.entries.values() if not e.in_base),
+                "partial_files": sum(0 < e.locked < page_bytes(e.size) for e in self.entries.values()),
+                "oversized_files": sum(page_bytes(e.size) > self.nominal for e in self.entries.values()) if self.nominal else 0,
+                "base_files_skipped": sum(bool(e.in_base) for e in self.entries.values()),
+            }
+            self.metrics_dirty = False
+        want = self.metrics.get("want", 0)
+        pids = [self.observer.pid] + [w.proc.pid for w in self.lockers] + [w.proc.pid for w, _ in self.retired]
+        anon = 0
+        for pid in [os.getpid()]+pids:
+            try:
+                with open(f"/proc/{pid}/status") as source:
+                    for line in source:
+                        if line.startswith("RssAnon:"):
+                            anon += int(line.split()[1])*1024
+                            break
+            except OSError:
+                pass
+        status = {"state": "observing" if self.observer_ready else "kernel self-test",
+                  "nominal_bytes": self.nominal, "target_bytes": int(self.history.target) if self.history else 0,
+                  "grant_bytes": self.cap, "locked_bytes": locked, "inflight_bytes": inflight,
+                  "selected_files": len(self.selected), "known_files": len(self.entries),
+                  "partial_files": self.metrics.get("partial_files", 0),
+                  "oversized_files": self.metrics.get("oversized_files", 0),
+                  "base_files_skipped": self.metrics.get("base_files_skipped", 0),
+                  "pending_metadata": len(self.unknown)+len(self.futures), "checkpoint_pending": self.save_future is not None,
+                  "last_error": self.error, "counters": dict(self.counters), "observer": self.observer_stats}
+        self.send({"type": "status", "revision": self.revision, "want": want, "locked": locked,
+                   "inflight": inflight, "anon": anon, "pids": pids, "monotonic": time.monotonic(), "status": status})
+
+    def run(self):
+        self.report()
+        while RUNNING:
+            self.flush()
+            reads = [self.sock, self.observer_sock, self.watch.fd, self.wake_read] + [w.sock for w in self.lockers]
+            active = bool(self.futures or self.unknown or self.restore or any(w.pending for w in self.lockers))
+            buffered = any(w.buffered_replies for w in self.lockers)
+            readable, _, _ = select.select(reads, [], [], 0 if buffered else (.1 if active else 1.))
+            if self.sock in readable:
+                self.receive_control()
+            if self.observer_sock in readable:
+                self.receive_observer()
+            if self.wake_read in readable:
+                with contextlib.suppress(BlockingIOError):
+                    os.read(self.wake_read, 4096)
+            if self.watch.fd in readable:
+                keys, overflow = self.watch.read()
+                if overflow:
+                    self.counters["change_queue_overflows"] += 1
+                    self.check_cursor = collections.deque(e.key for e in self.entries.values() if e.target or e.worker or e.in_base)
+                for key in keys:
+                    entry = self.entries.get(key)
+                    if entry:
+                        if entry.watch not in self.watch.keys:
+                            entry.watch = -1
+                        entry.dirty = True
+                        self.mark_entry(entry)
+            self.finish_metadata()
+            self.check_lockers()
+            self.reap_lockers()
+            self.select_recent()
+            self.work_lockers()
+            self.metadata_work()
+            self.periodic()
+            if any(time.monotonic()-started > 120 for started in self.future_started.values()):
+                raise RuntimeError("known-file metadata I/O exceeded its deadline; restarting optional hot-seat")
+            if time.monotonic()-self.last_budget > 10:
+                raise RuntimeError("supervisor admission lease expired")
+            if self.observer.poll() is not None:
+                if not self.observer_ready:
+                    raise KernelUnavailable("kernel capability/self-test failed; original cache remains active")
+                raise RuntimeError("kernel observer failed; original cache remains active")
+
+    def close(self):
+        # Releasing mappings does not depend on a checkpoint completing.
+        for locker in self.lockers:
+            locker.stop()
+        for locker, _ in self.retired:
+            locker.stop()
+        with contextlib.suppress(ProcessLookupError):
+            self.observer.kill()
+        self.observer_sock.close()
+        self.watch.close()
+        for fd in self.open_fds.values():
+            os.close(fd)
+        if self.save_future:
+            with contextlib.suppress(Exception):
+                self.save_future.result(timeout=10)
+            self.save_future = None
+        self.checkpoint(force=True)
+        if self.save_future:
+            with contextlib.suppress(Exception):
+                self.save_future.result(timeout=30)
+        self.sock.close()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.persistence_pool.shutdown(wait=False, cancel_futures=True)
+
+
+def main():
+    global RUNNING
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s hotseat %(levelname)s %(message)s")
+    def stop(*_):
+        global RUNNING
+        RUNNING = False
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    config = Path("/etc/ramcache-controller/config.json")
+    cfg = json.loads(config.read_text())
+    if not cfg.get("hotseat_enabled", True):
+        return 0
+    directory = Path(__file__).resolve().parent
+    from hotseat_probe import can_start
+    usable, reason = can_start(directory)
+    if not usable:
+        logging.error("Hot-seat unavailable: %s; original cache continues.", reason)
+        return 78
+    sidecar = None
+    try:
+        sidecar = Sidecar(directory, Path("/var/lib/ramcache-controller"), Path("/run/ramcache-controller"), cfg)
+        sidecar.run()
+        return 0
+    except KernelUnavailable as error:
+        logging.exception("Required kernel observation is unavailable; hot-seat disabled until restart")
+        if sidecar:
+            with contextlib.suppress(Exception):
+                sidecar.send({"type": "unavailable", "reason": str(error)})
+                sidecar.flush()
+        return 78
+    except Exception:
+        logging.exception("Hot-seat stopped; original cache remains active")
+        return 1
+    finally:
+        if sidecar:
+            sidecar.close()
+
+
+if __name__ == "__main__":
+    result = main()
+    # A filesystem stuck in uninterruptible I/O must not hold shutdown hostage.
+    # Child PDEATHSIG plus systemd KillMode=control-group handle every helper.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(result)
+RAMCACHE_HOTSEAT_SOURCE_1
+  cat > "$stage/hotseat_lock.c" <<'RAMCACHE_HOTSEAT_SOURCE_2'
+/* RAMCache range locker, protocol v1. File I/O runs on one background thread;
+ * the command thread can release established locks while a fault is blocked.
+ * One I/O job and bounded release commands; no mapped bytes are dereferenced.
+ */
+#define _GNU_SOURCE
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
+#include <sys/types.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <pthread.h>
+
+#define MAGIC 0x52434c31U
+#define QUANTUM (4ULL * 1024 * 1024)
+#define MAX_FILES 65536U
+enum { OPEN_FILE=1, LOCK_RANGE=2, TRIM_FILE=3, DROP_FILE=4, CHECK_FILE=5, STOP=6, BULK_TRIM=7 };
+#define MAX_TRIMS 2048U
+struct trim { uint64_t id, keep; };
+struct command { uint32_t magic, op; uint64_t id, value, dev, ino, size, mtime, ctime; };
+struct reply { uint32_t magic, op; uint64_t id, locked, size, mtime, ctime; int32_t error; uint32_t descriptor; };
+_Static_assert(sizeof(struct command)==64, "command ABI");
+_Static_assert(sizeof(struct reply)==56, "reply ABI");
+struct entry {
+    uint64_t id, size, span, locked, mtime, ctime;
+    int fd, in_use, cancelled;
+    void *map;
+    struct entry *next;
+};
+static struct entry *table[4096];
+static unsigned count;
+static uint64_t pagesize;
+static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER, output=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wake=PTHREAD_COND_INITIALIZER;
+static struct command job;
+static int job_fd=-1, queued, busy, stopping;
+static void terminate(int sig) { (void)sig; shutdown(STDIN_FILENO,SHUT_RDWR); }
+static uint64_t ns(struct timespec t) { return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
+static unsigned bucket(uint64_t id) { return (unsigned)((id ^ (id>>32))*11400714819323198485ULL)>>20 & 4095U; }
+static struct entry **lookup(uint64_t id) {
+    struct entry **p=&table[bucket(id)];
+    while (*p && (*p)->id!=id) p=&(*p)->next;
+    return p;
+}
+static void destroy(struct entry **p) {
+    struct entry *e=*p;
+    if(!e || e->in_use) return;
+    munmap(e->map,e->span); close(e->fd); *p=e->next; free(e); count--;
+}
+static int release_prefix(struct entry *e, uint64_t keep) {
+    if(keep>e->locked) return EINVAL;
+    if(keep<e->locked && munlock((char *)e->map+keep,e->locked-keep)<0) return errno;
+    e->locked=keep; return 0;
+}
+static void describe(struct reply *r, struct entry *e) {
+    if(e) { r->locked=e->locked; r->size=e->size; r->mtime=e->mtime; r->ctime=e->ctime; r->descriptor=(uint32_t)e->fd; }
+}
+static int send_packet(const void *data, size_t size) {
+    pthread_mutex_lock(&output);
+    ssize_t n; do n=send(STDIN_FILENO,data,size,MSG_NOSIGNAL); while(n<0 && errno==EINTR);
+    pthread_mutex_unlock(&output);
+    return n==(ssize_t)size?0:-1;
+}
+static int send_reply(struct reply *r) { return send_packet(r,sizeof(*r)); }
+static int receive(struct command *c, struct trim *trims, int *passed_fd) {
+    char control[CMSG_SPACE(sizeof(int)*8)];
+    struct iovec io[2]={{c,sizeof(*c)},{trims,sizeof(*trims)*MAX_TRIMS}};
+    struct msghdr m={.msg_iov=io,.msg_iovlen=2,.msg_control=control,.msg_controllen=sizeof(control)};
+    ssize_t n; do n=recvmsg(STDIN_FILENO,&m,MSG_CMSG_CLOEXEC); while(n<0 && errno==EINTR);
+    *passed_fd=-1; unsigned nfd=0;
+    for(struct cmsghdr *h=CMSG_FIRSTHDR(&m); n>=0 && h; h=CMSG_NXTHDR(&m,h)) {
+        if(h->cmsg_level!=SOL_SOCKET || h->cmsg_type!=SCM_RIGHTS || h->cmsg_len<CMSG_LEN(0)) continue;
+        size_t bytes=h->cmsg_len-CMSG_LEN(0);
+        for(size_t i=0;i+sizeof(int)<=bytes;i+=sizeof(int)) {
+            int fd; memcpy(&fd,(char *)CMSG_DATA(h)+i,sizeof(fd));
+            if(nfd++==0) *passed_fd=fd; else close(fd);
+        }
+    }
+    if(n==0) return 0;
+    size_t expected=sizeof(*c);
+    if(n>=(ssize_t)sizeof(*c) && c->op==BULK_TRIM && c->value<=MAX_TRIMS) expected+=sizeof(*trims)*c->value;
+    if(n!=(ssize_t)expected || (m.msg_flags&(MSG_TRUNC|MSG_CTRUNC)) || nfd>1 || c->magic!=MAGIC) {
+        if(*passed_fd>=0) close(*passed_fd);
+        *passed_fd=-1; errno=EPROTO; return -1;
+    }
+    return 1;
+}
+static void *io_thread(void *unused) {
+    (void)unused;
+    for(;;) {
+        pthread_mutex_lock(&mutex);
+        while(!queued && !stopping) pthread_cond_wait(&wake,&mutex);
+        if(stopping) { pthread_mutex_unlock(&mutex); break; }
+        struct command c=job; int fd=job_fd; queued=0; job_fd=-1;
+        struct entry *e=*lookup(c.id);
+        if(e) e->in_use=1;
+        uint64_t offset=e?e->locked:0;
+        pthread_mutex_unlock(&mutex);
+        struct reply r={.magic=MAGIC,.op=c.op,.id=c.id};
+        struct stat st;
+        struct entry *created=NULL;
+        int locked_new=0;
+        if(c.op==OPEN_FILE) {
+            if(fd<0 || e) r.error=e?EEXIST:EBADF;
+            else if(fstat(fd,&st)<0) r.error=errno;
+            else if(!S_ISREG(st.st_mode) || st.st_size<=0 || (uint64_t)st.st_size>SIZE_MAX-pagesize ||
+                    (uint64_t)st.st_dev!=c.dev || (uint64_t)st.st_ino!=c.ino || (uint64_t)st.st_size!=c.size ||
+                    ns(st.st_mtim)!=c.mtime || ns(st.st_ctim)!=c.ctime || !st.st_nlink) r.error=ESTALE;
+            else {
+                struct statfs fs;
+                if(fstatfs(fd,&fs)<0) r.error=errno;
+                else if(fs.f_type==0x9fa0 || fs.f_type==0x62656572 || fs.f_type==0x01021994 || fs.f_type==0x858458f6) r.error=ENOTSUP;
+                else {
+                    uint64_t span=(c.size+pagesize-1)/pagesize*pagesize;
+                    void *map=mmap(NULL,span,PROT_READ,MAP_SHARED,fd,0);
+                    if(map==MAP_FAILED) r.error=errno;
+                    else if(!(created=calloc(1,sizeof(*created)))) { r.error=ENOMEM; munmap(map,span); }
+                    else {
+                        created->id=c.id; created->fd=fd; fd=-1; created->map=map;
+                        created->span=span; created->size=c.size; created->mtime=c.mtime; created->ctime=c.ctime;
+                    }
+                }
+            }
+        } else if(!e) r.error=ENOENT;
+        else if(fstat(e->fd,&st)<0) r.error=errno;
+        else if((uint64_t)st.st_size!=e->size || !st.st_nlink) r.error=ESTALE;
+        else if(c.op==LOCK_RANGE) {
+            if(!c.value || c.value>QUANTUM || c.value%pagesize || c.value>e->span-offset) r.error=EINVAL;
+            else {
+#ifdef RAMCACHE_TEST_DELAY_US
+                usleep(RAMCACHE_TEST_DELAY_US);
+#endif
+                if(mlock((char *)e->map+offset,c.value)<0) {
+                    r.error=errno;
+                    /* Never acknowledge freed bytes if rollback itself fails. */
+                    if(munlock((char *)e->map+offset,c.value)<0) _exit(1);
+                }
+                else locked_new=1;
+            }
+        }
+        if(e && !r.error && fstat(e->fd,&st)<0) r.error=errno;
+        if(e && !r.error && ((uint64_t)st.st_size!=e->size || !st.st_nlink)) r.error=ESTALE;
+        if(fd>=0) close(fd);
+        pthread_mutex_lock(&mutex);
+        if(created) {
+            if(stopping || count>=MAX_FILES) {
+                r.error=stopping?ECANCELED:ENOSPC;
+                munmap(created->map,created->span); close(created->fd); free(created);
+            } else {
+                struct entry **slot=lookup(c.id); created->next=*slot; *slot=created; count++; e=created;
+            }
+        }
+        if(e) {
+            if(locked_new) {
+                if(r.error || e->cancelled || e->locked!=offset || stopping) {
+                    if(munlock((char *)e->map+offset,c.value)<0) _exit(1);
+                    if(!r.error) r.error=ECANCELED;
+                } else e->locked+=c.value;
+            }
+            if(r.error==ESTALE || stopping) {
+                e->cancelled=1;
+                if(release_prefix(e,0)) _exit(1);
+            }
+            if(!r.error && c.op!=OPEN_FILE) { e->mtime=ns(st.st_mtim); e->ctime=ns(st.st_ctim); }
+            e->in_use=0;
+            describe(&r,e);
+            if(e->cancelled) destroy(lookup(c.id));
+        }
+        busy=0;
+        int sent=send_reply(&r);
+        pthread_mutex_unlock(&mutex);
+        if(sent<0) break;
+    }
+    return NULL;
+}
+int main(void) {
+    pid_t parent=getppid();
+    struct sigaction action={.sa_handler=terminate}; sigemptyset(&action.sa_mask);
+    sigaction(SIGTERM,&action,NULL); sigaction(SIGINT,&action,NULL);
+    if(prctl(PR_SET_PDEATHSIG,SIGTERM)<0 || getppid()!=parent) return 1;
+    signal(SIGPIPE,SIG_IGN);
+    long p=sysconf(_SC_PAGESIZE); if(p<=0) return 1; pagesize=(uint64_t)p;
+    pthread_t worker; if(pthread_create(&worker,NULL,io_thread,NULL)) return 1;
+    for(;;) {
+        struct command c; struct trim trims[MAX_TRIMS]; int fd=-1;
+        if(receive(&c,trims,&fd)<=0) break;
+        if(c.op==STOP) { if(fd>=0) close(fd); break; }
+        struct reply r={.magic=MAGIC,.op=c.op,.id=c.id};
+        pthread_mutex_lock(&mutex);
+        if(c.op==BULK_TRIM && c.value<=MAX_TRIMS) {
+            struct reply replies[MAX_TRIMS+1];
+            replies[0]=(struct reply){.magic=MAGIC,.op=BULK_TRIM,.size=c.value};
+            for(unsigned i=0;i<c.value;i++) {
+                struct entry *e=*lookup(trims[i].id);
+                replies[i+1]=(struct reply){.magic=MAGIC,.op=TRIM_FILE,.id=trims[i].id};
+                replies[i+1].error=e?release_prefix(e,trims[i].keep/pagesize*pagesize):ENOENT;
+                describe(&replies[i+1],e);
+            }
+            if(fd>=0) close(fd);
+            int sent=send_packet(replies,(c.value+1)*sizeof(*replies));
+            pthread_mutex_unlock(&mutex);
+            if(sent<0) break;
+            continue;
+        }
+        if(c.op==OPEN_FILE || c.op==LOCK_RANGE || c.op==CHECK_FILE) {
+            if(busy) r.error=EBUSY;
+            else {
+                job=c; job_fd=fd; fd=-1; queued=busy=1;
+                pthread_cond_signal(&wake); pthread_mutex_unlock(&mutex); continue;
+            }
+        } else {
+            struct entry **slot=lookup(c.id), *e=*slot;
+            if(!e) r.error=ENOENT;
+            else if(c.op==DROP_FILE) {
+                r.error=release_prefix(e,0);
+                if(!r.error) e->cancelled=1;
+            } else if(c.op==TRIM_FILE) r.error=release_prefix(e,c.value/pagesize*pagesize);
+            else r.error=EINVAL;
+            describe(&r,e);
+            if(e && e->cancelled) destroy(slot);
+        }
+        if(fd>=0) close(fd);
+        int sent=send_reply(&r);
+        pthread_mutex_unlock(&mutex);
+        if(sent<0) break;
+    }
+    pthread_mutex_lock(&mutex); stopping=1;
+    if(job_fd>=0) { close(job_fd); job_fd=-1; }
+    for(unsigned i=0;i<4096;i++) {
+        struct entry **slot=&table[i];
+        while(*slot) {
+            struct entry *e=*slot;
+            if(release_prefix(e,0)) _exit(1);
+            e->cancelled=1;
+            if(e->in_use) slot=&e->next; else destroy(slot);
+        }
+    }
+    pthread_cond_signal(&wake); pthread_mutex_unlock(&mutex);
+    /* Any still blocked fault holds at most one 4-MiB increment, not the cache.
+     * The supervisor retains its reservation until this process really exits. */
+    pthread_join(worker,NULL);
+    return 0;
+}
+RAMCACHE_HOTSEAT_SOURCE_2
+  cat > "$stage/hotseat_observer.c" <<'RAMCACHE_HOTSEAT_SOURCE_3'
+#define _GNU_SOURCE
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include <linux/bpf.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <poll.h>
+#include <time.h>
+#include "hotseat_bpf.h"
+
+#define HEAP_MAX 131072U
+#define COALESCE_NS 100000000ULL
+struct pending { struct rc_key key; uint64_t due; };
+static struct pending heap[HEAP_MAX];
+static unsigned heap_count, callback_count;
+static int candidates, residents, names, acks, counters, config_fd;
+static int cpus;
+static struct rc_counts *percpu;
+static struct rc_config cfg;
+static uint64_t retry_overflow, sent, unresolved, recoveries, transport_full;
+static bool recover;
+static struct bpf_object *object;
+static struct bpf_link *links[8];
+static unsigned link_count;
+static uint64_t monotonic_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
+static int log_bpf(enum libbpf_print_level level, const char *format, va_list args) {
+    if(level==LIBBPF_DEBUG) return 0;
+    return vfprintf(stderr,format,args);
+}
+static void detach(void) { while(link_count) { bpf_link__destroy(links[--link_count]); links[link_count]=NULL; } }
+static int attach(void) {
+    struct bpf_program *program;
+    bpf_object__for_each_program(program,object) {
+        if(link_count>=8) { detach(); return -1; }
+        struct bpf_link *link=bpf_program__attach(program);
+        if(!link || libbpf_get_error(link)) { detach(); return -1; }
+        links[link_count++]=link;
+    }
+    return link_count==3?0:-1;
+}
+static struct rc_counts totals(void) {
+    unsigned zero=0; struct rc_counts out={0};
+    if(bpf_map_lookup_elem(counters,&zero,percpu)) { out.errors=1; return out; }
+    for(int i=0;i<cpus;i++) {
+        out.events+=percpu[i].events; out.lost+=percpu[i].lost; out.inserts+=percpu[i].inserts;
+        out.errors+=percpu[i].errors; out.path_errors+=percpu[i].path_errors;
+    }
+    return out;
+}
+static int update_config(void) { unsigned zero=0; return bpf_map_update_elem(config_fd,&zero,&cfg,BPF_ANY); }
+static int activity(const struct rc_key *key, struct rc_activity *out) {
+    struct rc_activity other={0};
+    int a=bpf_map_lookup_elem(residents,key,out), b=bpf_map_lookup_elem(candidates,key,&other);
+    if(a && b) return -1;
+    if(a || (!b && other.seen>out->seen)) *out=other;
+    return 0;
+}
+static void schedule(struct rc_key key, uint64_t due) {
+    if(heap_count==HEAP_MAX) { retry_overflow++; recover=true; return; }
+    unsigned i=heap_count++;
+    while(i) { unsigned parent=(i-1)/2; if(heap[parent].due<=due) break; heap[i]=heap[parent]; i=parent; }
+    heap[i]=(struct pending){key,due};
+}
+static struct pending pop(void) {
+    struct pending result=heap[0], last=heap[--heap_count]; unsigned i=0;
+    while(i*2+1<heap_count) {
+        unsigned child=i*2+1;
+        if(child+1<heap_count && heap[child+1].due<heap[child].due) child++;
+        if(last.due<=heap[child].due) break;
+        heap[i]=heap[child]; i=child;
+    }
+    if(heap_count) heap[i]=last;
+    return result;
+}
+static int deliver(const struct rc_key *key, bool tail) {
+    struct rc_ack ack={0};
+    (void)bpf_map_lookup_elem(acks,key,&ack);
+    if(tail) {
+        /* Re-enable notifications BEFORE checking for an unreported final update. */
+        ack.after=0;
+        if(bpf_map_update_elem(acks,key,&ack,BPF_ANY)) { recover=true; return -1; }
+    }
+    struct rc_activity a;
+    if(activity(key,&a) || !a.seen || a.seen<=ack.seen) return 0;
+    struct rc_event event={.type=1,.flags=a.flags,.key=*key,.seen=a.seen,.birth=a.birth,
+                           .start=a.start,.end=a.end,.pid=a.pid};
+    struct rc_name name;
+    if(!bpf_map_lookup_elem(names,key,&name)) {
+        memcpy(event.path,name.path,RC_PATH); event.path[RC_PATH-1]=0;
+    }
+    size_t len=offsetof(struct rc_event,path)+strnlen(event.path,RC_PATH-1)+1;
+    if(send(STDIN_FILENO,&event,len,MSG_DONTWAIT|MSG_NOSIGNAL)!=(ssize_t)len) {
+        if(errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=ENOBUFS) return -2;
+        transport_full++; schedule(*key,monotonic_ns()+COALESCE_NS); return -1;
+    }
+    sent++; if(!event.path[0]) unresolved++;
+    ack.seen=a.seen; ack.after=monotonic_ns()+COALESCE_NS;
+    if(bpf_map_update_elem(acks,key,&ack,BPF_ANY)) recover=true;
+    schedule(*key,ack.after);
+    return 0;
+}
+static int ring_event(void *ctx, void *data, size_t size) {
+    (void)ctx;
+    if(size==sizeof(struct rc_notice)) {
+        struct rc_notice notice; memcpy(&notice,data,sizeof(notice));
+        if(deliver(&notice.key,false)==-2) return -EPIPE;
+    }
+    return ++callback_count>=128?1:0;
+}
+static int message(unsigned type, const char *text) {
+    char buf[2048]; size_t n=strlen(text); if(n>sizeof(buf)-4) n=sizeof(buf)-4;
+    memcpy(buf,&type,4); memcpy(buf+4,text,n);
+    return send(STDIN_FILENO,buf,n+4,MSG_DONTWAIT|MSG_NOSIGNAL)<0?-1:0;
+}
+static int batch_supported(int fd) {
+    struct rc_key keys[128], cursor={0};
+    struct rc_activity values[128]; unsigned count=128;
+    int rc=bpf_map_lookup_batch(fd,NULL,&cursor,keys,values,&count,NULL);
+    return !rc || errno==ENOENT;
+}
+static int probe(const char *directory) {
+    char path[4096]; if(snprintf(path,sizeof(path),"%s/.hotseat-probe-XXXXXX",directory)>=(int)sizeof(path)) return -1;
+    int fd=mkstemp(path); if(fd<0) return -1;
+    int result=-1; struct stat st; long page=sysconf(_SC_PAGESIZE); char byte=0;
+    if(page<=0 || ftruncate(fd,page) || fstat(fd,&st)) goto done;
+    cfg.testing=1; cfg.force_loss=0;
+    cfg.test=(struct rc_key){major(st.st_dev),minor(st.st_dev),st.st_ino};
+    if(update_config()) goto done;
+    if(pread(fd,&byte,1,0)!=1) goto done;
+    void *map=mmap(NULL,(size_t)page,PROT_READ,MAP_SHARED,fd,0);
+    if(map==MAP_FAILED) goto done;
+    byte^=*(volatile char *)map; munmap(map,(size_t)page);
+    struct rc_activity a;
+    if(activity(&cfg.test,&a) || (a.flags&(RC_READ|RC_FAULT))!=(RC_READ|RC_FAULT)) goto done;
+    struct rc_name name;
+    if(bpf_map_lookup_elem(names,&cfg.test,&name) || strcmp(name.path,path)) goto done;
+    bpf_map_delete_elem(candidates,&cfg.test); bpf_map_delete_elem(acks,&cfg.test);
+    struct rc_counts before=totals();
+    cfg.force_loss=1; if(update_config() || pread(fd,&byte,1,0)!=1) goto done;
+    if(activity(&cfg.test,&a) || totals().lost<=before.lost) goto done;
+    if(bpf_map_update_elem(residents,&cfg.test,&a,BPF_ANY)) goto done;
+    struct rc_ack ack={.seen=a.seen}; bpf_map_update_elem(acks,&cfg.test,&ack,BPF_ANY);
+    if(pread(fd,&byte,1,0)!=1 || bpf_map_lookup_elem(residents,&cfg.test,&a) || a.seen<=ack.seen) goto done;
+    if(!batch_supported(candidates) || !batch_supported(residents)) goto done;
+    result=0;
+done:
+    bpf_map_delete_elem(candidates,&cfg.test); bpf_map_delete_elem(residents,&cfg.test);
+    bpf_map_delete_elem(acks,&cfg.test); bpf_map_delete_elem(names,&cfg.test);
+    cfg.testing=cfg.force_loss=0; memset(&cfg.test,0,sizeof(cfg.test)); update_config();
+    close(fd); unlink(path); (void)byte; return result;
+}
+static void controls(void) {
+    char text[128]; ssize_t len=-1;
+    for(unsigned n=0;n<128 && (len=recv(STDIN_FILENO,text,sizeof(text)-1,MSG_DONTWAIT))>0;n++) {
+        text[len]=0; char op; struct rc_key key;
+        if(text[0]=='Q') exit(0);
+        if(sscanf(text,"%c %u %u %llu",&op,&key.major,&key.minor,&key.ino)!=4) continue;
+        struct rc_activity a;
+        if(op=='P') {
+            if(activity(&key,&a)) memset(&a,0,sizeof(a));
+            if(bpf_map_update_elem(residents,&key,&a,BPF_ANY)) recover=true;
+        } else if(op=='U') {
+            if(!activity(&key,&a)) bpf_map_update_elem(candidates,&key,&a,BPF_ANY);
+            bpf_map_delete_elem(residents,&key);
+        } else if(op=='N') bpf_map_delete_elem(names,&key);
+    }
+    if(len==0) exit(0);
+}
+int main(int argc, char **argv) {
+    /* object, state-directory, own-cgroup-id, base-cgroup-id, max-events/s [--selftest] */
+    if(argc<6) return 2;
+    pid_t parent=getppid(); if(prctl(PR_SET_PDEATHSIG,SIGKILL)<0 || getppid()!=parent) return 1;
+    signal(SIGPIPE,SIG_IGN); libbpf_set_print(log_bpf);
+    struct rlimit unlimited={RLIM_INFINITY,RLIM_INFINITY}; (void)setrlimit(RLIMIT_MEMLOCK,&unlimited);
+    cfg.exclude_a=strtoull(argv[3],NULL,10); cfg.exclude_b=strtoull(argv[4],NULL,10);
+    uint64_t max_rate=strtoull(argv[5],NULL,10);
+    object=bpf_object__open_file(argv[1],NULL);
+    if(!object || libbpf_get_error(object)) return 1;
+    if(bpf_object__load(object)) { bpf_object__close(object); return 1; }
+#define FD(var,name) do { var=bpf_object__find_map_fd_by_name(object,name); if(var<0) return 1; } while(0)
+    FD(candidates,"candidates"); FD(residents,"residents"); FD(names,"names");
+    FD(acks,"acknowledgments"); FD(counters,"counters"); FD(config_fd,"config");
+    cpus=libbpf_num_possible_cpus(); if(cpus<=0) return 1;
+    percpu=calloc((size_t)cpus,sizeof(*percpu)); if(!percpu) return 1;
+    if(update_config() || attach() || probe(argv[2])) {
+        fprintf(stderr,"Hot-seat BPF self-test failed; ordinary cache remains available.\n");
+        detach(); bpf_object__close(object); free(percpu); return 1;
+    }
+    if(argc>6 && !strcmp(argv[6],"--selftest")) {
+        fprintf(stderr,"Hot-seat read, mmap-fault, protected-state and overflow probes passed.\n");
+        detach(); bpf_object__close(object); free(percpu); return 0;
+    }
+    struct ring_buffer *ring=ring_buffer__new(bpf_object__find_map_fd_by_name(object,"notices"),ring_event,NULL,NULL);
+    if(!ring) return 1;
+    /* Own service cgroup is excluded before READY and any cache loading. */
+    message(3,"{\"mode\":\"ebpf\",\"selftest\":true}");
+    uint64_t next_stats=monotonic_ns(), last_events=totals().events, last_lost=totals().lost;
+    uint64_t last_stats=next_stats-1000000000ULL, scan_lost=0, scan_retry=0, pause_count=0;
+    uint64_t resume_at=0, backoff=5, healthy_since=monotonic_ns(); unsigned excessive=0;
+    struct rc_key cursor={0}; bool have_cursor=false; int scan_map=0;
+    for(;;) {
+        uint64_t now=monotonic_ns();
+        if(resume_at && now>=resume_at) {
+            if(attach()) { message(4,"unable to reattach kernel observer"); break; }
+            resume_at=0; excessive=0; recover=true; healthy_since=now;
+        }
+        if(now>=next_stats) {
+            struct rc_counts stats=totals();
+            if(stats.lost!=last_lost) { recover=true; last_lost=stats.lost; }
+            if(!resume_at && max_rate && (double)(stats.events-last_events)*1e9/(now-last_stats)>max_rate) excessive++;
+            else excessive=0;
+            if(excessive>=2) {
+                detach(); resume_at=now+backoff*1000000000ULL; backoff=backoff<30?backoff*2:60; pause_count++;
+            } else if(!resume_at && now-healthy_since>60000000000ULL) backoff=5;
+            last_events=stats.events; last_stats=now;
+            char status[1024];
+            snprintf(status,sizeof(status),"{\"events\":%llu,\"notification_overflows\":%llu,\"map_errors\":%llu,\"path_errors\":%llu,\"candidate_churn\":%s,\"delivered\":%llu,\"locator_events\":%llu,\"recoveries\":%llu,\"transport_backpressure\":%llu,\"recovery_queue_overflows\":%llu,\"observation_pause_count\":%llu,\"observation_paused\":%s}",
+                     stats.events,stats.lost,stats.errors,stats.path_errors,stats.inserts>=RC_CANDIDATES?"true":"false",
+                     (unsigned long long)sent,(unsigned long long)unresolved,(unsigned long long)recoveries,
+                     (unsigned long long)transport_full,(unsigned long long)retry_overflow,(unsigned long long)pause_count,resume_at?"true":"false");
+            message(2,status); next_stats=now+1000000000ULL;
+        }
+        for(unsigned n=0;n<128 && heap_count && heap[0].due<=now;n++) {
+            struct pending item=pop(); if(deliver(&item.key,true)==-2) goto finish;
+        }
+        if(recover) {
+            if(!have_cursor && !scan_map) { scan_lost=totals().lost; scan_retry=retry_overflow; }
+            /* Batch cursors tolerate concurrent updates; never delete scanned state. */
+            struct rc_key keys[128], out={0};
+            struct rc_activity values[128]; unsigned amount=128;
+            int fd=scan_map?residents:candidates;
+            int rc=bpf_map_lookup_batch(fd,have_cursor?&cursor:NULL,&out,keys,values,&amount,NULL);
+            int error=rc?errno:0;
+            if(rc && error!=ENOENT) { amount=0; message(4,"kernel BPF batch lookup failed"); goto finish; }
+            for(unsigned i=0;i<amount;i++) if(deliver(&keys[i],true)==-2) goto finish;
+            if(!rc) { cursor=out; have_cursor=true; }
+            else {
+                have_cursor=false;
+                if(!scan_map) scan_map=1;
+                else { scan_map=0; recover=(totals().lost!=scan_lost || retry_overflow!=scan_retry); recoveries++; }
+            }
+        }
+        now=monotonic_ns(); uint64_t due=next_stats;
+        if(heap_count && heap[0].due<due) due=heap[0].due;
+        if(resume_at && resume_at<due) due=resume_at;
+        int timeout=recover?0:(due<=now?0:(int)((due-now+999999)/1000000));
+        struct pollfd fds[2]={{STDIN_FILENO,POLLIN,0},{ring_buffer__epoll_fd(ring),POLLIN,0}};
+        int ready=poll(fds,2,timeout);
+        if(ready<0) { if(errno==EINTR) continue; break; }
+        if(fds[0].revents&(POLLHUP|POLLERR|POLLNVAL)) break;
+        if(fds[0].revents&POLLIN) controls();
+        if(fds[1].revents&POLLIN) {
+            callback_count=0; int rc=ring_buffer__poll(ring,0);
+            if(rc<0 && rc!=-EINTR) break;
+        }
+    }
+finish:
+    ring_buffer__free(ring); detach(); bpf_object__close(object); free(percpu); return 0;
+}
+RAMCACHE_HOTSEAT_SOURCE_3
+  cat > "$stage/hotseat.bpf.c" <<'RAMCACHE_HOTSEAT_SOURCE_4'
+/* Passive CO-RE tracing. No kernel module, permission decisions, or file I/O. */
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
+#include "hotseat_bpf.h"
+
+typedef unsigned short umode_t;
+typedef unsigned int dev_t;
+typedef long long loff_t;
+/* Deliberately minimal CO-RE types. Offsets come from the running kernel BTF. */
+struct super_block { dev_t s_dev; unsigned long s_magic; } __attribute__((preserve_access_index));
+struct inode { unsigned long i_ino; unsigned int i_generation; umode_t i_mode; struct super_block *i_sb; } __attribute__((preserve_access_index));
+struct path { void *mnt; void *dentry; } __attribute__((preserve_access_index));
+struct file { struct path f_path; struct inode *f_inode; unsigned int f_flags; unsigned int f_mode; } __attribute__((preserve_access_index));
+struct vm_area_struct { unsigned long vm_start, vm_end; struct file *vm_file; } __attribute__((preserve_access_index));
+struct task_struct { unsigned long long start_boottime; struct task_struct *group_leader; } __attribute__((preserve_access_index));
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, RC_CANDIDATES);
+    __type(key, struct rc_key); __type(value, struct rc_activity);
+} candidates SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, RC_RESIDENTS);
+    __type(key, struct rc_key); __type(value, struct rc_activity);
+} residents SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, RC_CANDIDATES+RC_RESIDENTS);
+    __type(key, struct rc_key); __type(value, struct rc_ack);
+} acknowledgments SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, RC_NAMES);
+    __type(key, struct rc_key); __type(value, struct rc_name);
+} names SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1);
+    __type(key, unsigned int); __type(value, struct rc_name);
+} scratch SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1);
+    __type(key, unsigned int); __type(value, struct rc_counts);
+} counters SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
+    __type(key, unsigned int); __type(value, struct rc_config);
+} config SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 4*1024*1024); } notices SEC(".maps");
+
+static __always_inline int identify(struct file *f, struct rc_key *key, struct rc_config **cfg) {
+    unsigned int zero=0;
+    *cfg=bpf_map_lookup_elem(&config,&zero);
+    if(!*cfg || (*cfg)->paused || !f) return 0;
+    unsigned long long cg=bpf_get_current_cgroup_id();
+    if(!(*cfg)->testing && (cg==(*cfg)->exclude_a || cg==(*cfg)->exclude_b)) return 0;
+    struct inode *ino=BPF_CORE_READ(f,f_inode);
+    if(!ino || (BPF_CORE_READ(ino,i_mode)&0170000)!=0100000) return 0;
+    struct super_block *sb=BPF_CORE_READ(ino,i_sb);
+    unsigned long magic=BPF_CORE_READ(sb,s_magic);
+    /* Virtual, RAM-backed, and kernel-internal objects cannot benefit. */
+    if(magic==0x9fa0 || magic==0x62656572 || magic==0x01021994 || magic==0x858458f6 || magic==0x63677270) return 0;
+    unsigned int dev=BPF_CORE_READ(sb,s_dev);
+    key->major=dev>>20; key->minor=dev&0xfffff; key->ino=BPF_CORE_READ(ino,i_ino);
+    if((*cfg)->testing && (key->major!=(*cfg)->test.major || key->minor!=(*cfg)->test.minor || key->ino!=(*cfg)->test.ino)) return 0;
+    return 1;
+}
+static __always_inline struct rc_activity *observe(struct rc_key *key, struct rc_config *cfg, unsigned int flags,
+                                                    unsigned long long start, unsigned long long end) {
+    unsigned int zero=0;
+    struct rc_counts *stats=bpf_map_lookup_elem(&counters,&zero);
+    if(stats) stats->events++;
+    struct rc_activity *a=bpf_map_lookup_elem(&residents,key);
+    if(!a) a=bpf_map_lookup_elem(&candidates,key);
+    if(!a) {
+        struct rc_activity empty={};
+        int rc=bpf_map_update_elem(&candidates,key,&empty,BPF_NOEXIST);
+        if(rc==0 && stats) stats->inserts++;
+        a=bpf_map_lookup_elem(&candidates,key);
+        if(!a) { if(stats) stats->errors++; return 0; }
+    }
+    unsigned long long now=bpf_ktime_get_ns();
+    a->pid=bpf_get_current_pid_tgid()>>32;
+    struct task_struct *task=(void *)bpf_get_current_task_btf();
+    a->birth=BPF_CORE_READ(task,group_leader,start_boottime);
+    if(start) { a->start=start; a->end=end; }
+    __sync_fetch_and_or(&a->flags,flags);
+    /* CAS prevents an older CPU from moving the latest timestamp backwards. */
+    for(int n=0;n<8;n++) {
+        unsigned long long old=a->seen;
+        if(old>=now || __sync_val_compare_and_swap(&a->seen,old,now)==old) break;
+    }
+    struct rc_ack *ack=bpf_map_lookup_elem(&acknowledgments,key);
+    unsigned long long old=a->notified;
+    if(ack && (now<ack->after || old>ack->seen)) return a;
+    if(!ack && old) return a;
+    if(__sync_val_compare_and_swap(&a->notified,old,now)!=old) return a;
+    struct rc_notice *notice=cfg->force_loss?0:bpf_ringbuf_reserve(&notices,sizeof(*notice),0);
+    if(!notice) { if(stats) stats->lost++; }
+    else { notice->key=*key; bpf_ringbuf_submit(notice,0); }
+    return a;
+}
+static __always_inline void remember_name(struct file *f, struct rc_key *key) {
+    unsigned int generation=BPF_CORE_READ(f,f_inode,i_generation);
+    struct rc_name *old=bpf_map_lookup_elem(&names,key);
+    if(old && old->pad==generation) return;
+    unsigned int zero=0;
+    struct rc_name *name=bpf_map_lookup_elem(&scratch,&zero);
+    if(!name) return;
+    long len=bpf_d_path(&f->f_path,name->path,sizeof(name->path));
+    if(len>0) {
+        name->pad=generation; name->pid=bpf_get_current_pid_tgid()>>32;
+        struct task_struct *task=(void *)bpf_get_current_task_btf();
+        name->birth=BPF_CORE_READ(task,group_leader,start_boottime);
+        bpf_map_update_elem(&names,key,name,BPF_ANY);
+    } else {
+        struct rc_counts *stats=bpf_map_lookup_elem(&counters,&zero);
+        if(stats) stats->path_errors++;
+    }
+}
+SEC("fexit/security_file_permission")
+int BPF_PROG(read_permission, struct file *file, int mask, int ret) {
+    if(ret || !(mask&4)) return 0; /* MAY_READ; an accepted intent, not a disk-byte counter. */
+    struct rc_key key={}; struct rc_config *cfg;
+    if(!identify(file,&key,&cfg)) return 0;
+    if(BPF_CORE_READ(file,f_flags)&040000) return 0; /* O_DIRECT bypasses this cache. */
+    unsigned int flags=RC_READ;
+    remember_name(file,&key);
+    observe(&key,cfg,flags,0,0);
+    return 0;
+}
+SEC("fexit/security_file_open")
+int BPF_PROG(executable_open, struct file *file, int ret) {
+    if(ret) return 0;
+    unsigned int f_flags=BPF_CORE_READ(file,f_flags);
+    if(!(BPF_CORE_READ(file,f_mode)&1) && !(f_flags&0x20)) return 0; /* FMODE_READ / __FMODE_EXEC */
+    struct rc_key key={}; struct rc_config *cfg;
+    if(!identify(file,&key,&cfg)) return 0;
+    /* An inexpensive inode path cache also locates later mmap-only readers.
+     * Opening an ordinary file alone never admits it to the hot-seat. */
+    remember_name(file,&key);
+    if(f_flags&0x20) observe(&key,cfg,RC_EXEC,0,0);
+    else {
+        unsigned int zero=0;
+        struct rc_counts *stats=bpf_map_lookup_elem(&counters,&zero);
+        if(stats) stats->events++; /* Include path-capture hooks in the overload guard. */
+    }
+    return 0;
+}
+SEC("fentry/handle_mm_fault")
+int BPF_PROG(file_fault, struct vm_area_struct *vma, unsigned long address, unsigned int flags, void *regs) {
+    (void)address; (void)flags; (void)regs;
+    struct file *file=BPF_CORE_READ(vma,vm_file);
+    struct rc_key key={}; struct rc_config *cfg;
+    if(!identify(file,&key,&cfg)) return 0;
+    observe(&key,cfg,RC_FAULT,BPF_CORE_READ(vma,vm_start),BPF_CORE_READ(vma,vm_end));
+    return 0;
+}
+char LICENSE[] SEC("license")="GPL";
+RAMCACHE_HOTSEAT_SOURCE_4
+  cat > "$stage/hotseat_bpf.h" <<'RAMCACHE_HOTSEAT_SOURCE_5'
+#ifndef RAMCACHE_HOTSEAT_BPF_H
+#define RAMCACHE_HOTSEAT_BPF_H
+#define RC_CANDIDATES 65536
+#define RC_RESIDENTS 65536
+#define RC_NAMES 8192
+#define RC_PATH 4096
+#define RC_READ 1U
+#define RC_FAULT 2U
+#define RC_EXEC 4U
+#define RC_DIRECT 8U
+struct rc_key { unsigned int major, minor; unsigned long long ino; };
+struct rc_activity {
+    unsigned long long seen, notified, birth, start, end;
+    unsigned int pid, flags;
+};
+struct rc_ack { unsigned long long seen, after; };
+struct rc_notice { struct rc_key key; };
+struct rc_name { char path[RC_PATH]; unsigned int pid, pad; unsigned long long birth; };
+struct rc_counts { unsigned long long events, lost, inserts, errors, path_errors; };
+struct rc_config { unsigned long long exclude_a, exclude_b; struct rc_key test; unsigned int testing, force_loss, paused, pad; };
+/* Socket packet types: 1 event; 2 counters; 3 ready; 4 fatal. Commands P/U/Q. */
+struct rc_event {
+    unsigned int type, flags;
+    struct rc_key key;
+    unsigned long long seen, birth, start, end;
+    unsigned int pid, pad;
+    char path[RC_PATH];
+};
+#endif
+RAMCACHE_HOTSEAT_SOURCE_5
+  cat > "$stage/hotseat_probe.py" <<'RAMCACHE_HOTSEAT_SOURCE_6'
+#!/usr/bin/env python3
+"""Install-time verification only; no periodic/background work."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def read_status(directory):
+    try:
+        value = json.loads((directory / "build-status.json").read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def can_start(directory):
+    status = read_status(directory)
+    missing = [name for name in ("hotseat-lock", "hotseat-observer", "hotseat.bpf.o")
+               if not (directory / name).is_file()]
+    if missing:
+        return False, status.get("reason") or "Native component missing: "+missing[0]
+    if status.get("available"):
+        return True, ""
+    # A new kernel gets its own startup test; a failure recorded for a previous
+    # kernel must not permanently disable a now-supported installation.
+    probe = status.get("kernel_preflight", {})
+    if probe.get("kernel") and probe["kernel"] != os.uname().release:
+        return True, ""
+    return False, status.get("reason") or "Native build was not verified"
+
+
+def save_status(directory, value):
+    fd, name = tempfile.mkstemp(prefix=".build-status-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(value, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, directory / "build-status.json")
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def preflight(directory, timeout=20):
+    status = read_status(directory)
+    log = directory / "kernel-probe.log"
+    reason = ""
+    try:
+        with log.open("w") as output:
+            # This mode tests one temporary, local regular file, closes every
+            # BPF link/map on exit, and never starts the cache or reads its DB.
+            result = subprocess.run(
+                [str(directory / "hotseat-observer"), str(directory / "hotseat.bpf.o"),
+                 str(directory), "0", "0", "500000", "--selftest"],
+                stdout=output, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        if result.returncode:
+            reason = f"Kernel preflight failed (exit {result.returncode}); see {log}"
+    except subprocess.TimeoutExpired:
+        reason = f"Kernel preflight exceeded {timeout:g} seconds; see {log}"
+    except OSError as error:
+        reason = f"Kernel preflight could not run: {error}"
+    status.update(available=not bool(reason), reason=reason,
+                  kernel_preflight={"passed": not bool(reason), "kernel": os.uname().release,
+                                    "timestamp": int(time.time())})
+    save_status(directory, status)
+    if reason:
+        print("Hot-seat unavailable: "+reason, file=sys.stderr)
+        return 1
+    print("Hot-seat kernel preflight passed: read, mmap, protected state and overflow recovery support.")
+    return 0
+
+
+def activation(directory, config=Path("/etc/ramcache-controller/config.json"),
+               status_path=Path("/run/ramcache-controller/status.json"), timeout=10):
+    try:
+        cfg = json.loads(config.read_text())
+        if not cfg.get("hotseat_enabled", True):
+            print("Hot-seat disabled in configuration; the original cache remains enabled.")
+            return 0
+        usable, reason = can_start(directory)
+        if not usable:
+            print("Hot-seat NOT ACTIVE: "+reason, file=sys.stderr)
+            return 1
+        result = subprocess.run(
+            ["systemctl", "show", "ramcache-controller.service", "--property=MainPID", "--value"],
+            capture_output=True, text=True, timeout=2, check=True)
+        pid = int(result.stdout.strip())
+        if pid <= 1:
+            raise ValueError("main controller has no running PID")
+        deadline = time.monotonic()+timeout
+        while True:
+            try:
+                status = json.loads(status_path.read_text())
+            except (OSError, ValueError):
+                status = {}
+            # An old status file from before the restart cannot report success.
+            if status.get("supervisor_pid") == pid:
+                hot = status.get("hotseat", {})
+                if hot.get("state") == "observing":
+                    print("Hot-seat ACTIVE: the running service passed its kernel self-tests.")
+                    return 0
+                if hot.get("state") == "unavailable":
+                    print("Hot-seat NOT ACTIVE: "+hot.get("reason", "see service journal"), file=sys.stderr)
+                    return 1
+            if time.monotonic() >= deadline:
+                print("Hot-seat activation was not confirmed within 10 seconds; check the service journal.", file=sys.stderr)
+                return 1
+            time.sleep(min(.25, max(0, deadline-time.monotonic())))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print("Hot-seat activation could not be verified: "+str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    directory = Path(__file__).resolve().parent
+    if len(sys.argv) != 2 or sys.argv[1] not in ("preflight", "activation"):
+        raise SystemExit("usage: hotseat_probe.py preflight|activation")
+    raise SystemExit(preflight(directory) if sys.argv[1] == "preflight" else activation(directory))
+RAMCACHE_HOTSEAT_SOURCE_6
+
+  if ! "$PYTHON_BIN" -m py_compile "$stage/hotseat_bridge.py" "$stage/ramcache_hotseat.py" "$stage/hotseat_probe.py"; then
+    rm -rf -- "$stage"
+    return 1
+  fi
+  chmod 755 "$stage/ramcache_hotseat.py"
+  if ! "$PYTHON_BIN" - <<'HOTSEAT_ENABLED'
+import json
+from pathlib import Path
+p = Path('/etc/ramcache-controller/config.json')
+raise SystemExit(0 if not p.exists() or json.loads(p.read_text()).get('hotseat_enabled', True) else 1)
+HOTSEAT_ENABLED
+  then
+    requested=0
+    native_ok=0
+    reason="Disabled in configuration. Re-run the installer after enabling hotseat_enabled."
+  elif [[ "$(getconf LONG_BIT)" != 64 ]]; then
+    native_ok=0
+    reason="The hot-seat requires a supported 64-bit Linux kernel."
+  elif [[ ! -r /sys/kernel/btf/vmlinux ]]; then
+    native_ok=0
+    reason="Running kernel BTF is unavailable; the original cache remains enabled."
+  fi
+  if [[ "$native_ok" == 1 ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      dependencies=(gcc libc6-dev clang libbpf-dev libelf-dev zlib1g-dev pkg-config)
+    elif command -v dnf >/dev/null 2>&1; then
+      dependencies=(gcc glibc-devel clang libbpf-devel elfutils-libelf-devel zlib-devel pkgconf-pkg-config)
+    elif command -v pacman >/dev/null 2>&1; then
+      dependencies=(gcc glibc clang libbpf libelf zlib pkgconf)
+    elif command -v zypper >/dev/null 2>&1; then
+      dependencies=(gcc glibc-devel clang libbpf-devel libelf-devel zlib-devel pkg-config)
+    else
+      dependencies=()
+    fi
+    # Standard distribution packages; never download or execute an external installer.
+    if ! command -v clang >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1 ||
+       ! pkg-config --exists libbpf; then
+      if ((${#dependencies[@]} == 0)) || ! install_packages "${dependencies[@]}"; then
+        native_ok=0
+        reason="Hot-seat build dependencies could not be installed."
+      fi
+    fi
+  fi
+  if [[ "$native_ok" == 1 ]]; then
+    compiler=$(command -v cc || command -v gcc || command -v clang || true)
+    arch=$(uname -m)
+    case "$arch" in
+      x86_64) arch=x86 ;;
+      aarch64) arch=arm64 ;;
+      ppc64|ppc64le) arch=powerpc ;;
+      s390x) arch=s390 ;;
+      riscv64) arch=riscv ;;
+      *) native_ok=0; reason="Unsupported hot-seat build architecture: $arch" ;;
+    esac
+    if [[ -z "$compiler" ]]; then native_ok=0; reason="No C compiler is available for the hot-seat helpers."; fi
+  fi
+  if [[ "$native_ok" == 1 ]]; then
+    read -r -a cflags <<<"$(pkg-config --cflags libbpf)"
+    read -r -a libs <<<"$(pkg-config --libs libbpf)"
+    extra_includes=()
+    multiarch=$("$compiler" -dumpmachine)
+    if [[ -d "/usr/include/$multiarch" ]]; then extra_includes+=("-I/usr/include/$multiarch"); fi
+    local bpf_target
+    bpf_target=$("$PYTHON_BIN" -c 'import sys; print("bpfel" if sys.byteorder == "little" else "bpfeb")')
+    if ! (
+      set -e
+      "$compiler" -std=gnu11 -O2 -Wall -Wextra -Werror -pthread "$stage/hotseat_lock.c" -o "$stage/hotseat-lock" || exit 1
+      "$compiler" -std=gnu11 -O2 -Wall -Wextra -Werror "${cflags[@]}" "$stage/hotseat_observer.c" -o "$stage/hotseat-observer" "${libs[@]}" || exit 1
+      clang -O2 -g -target "$bpf_target" -mcpu=v3 -D"__TARGET_ARCH_$arch" \
+        -I"$stage" "${extra_includes[@]}" "${cflags[@]}" -c "$stage/hotseat.bpf.c" -o "$stage/hotseat.bpf.o" || exit 1
+    ) >"$stage/build.log" 2>&1; then
+      native_ok=0
+      reason="Hot-seat native compilation failed; details are in $target/build.log."
+      rm -f -- "$stage/hotseat-lock" "$stage/hotseat-observer" "$stage/hotseat.bpf.o"
+    fi
+  fi
+  "$PYTHON_BIN" - "$stage/build-status.json" "$native_ok" "$reason" <<'HOTSEAT_BUILD_STATUS'
+import json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({'available': sys.argv[2] == '1', 'reason': sys.argv[3]}, indent=2) + '\n')
+HOTSEAT_BUILD_STATUS
+  if [[ ! -s "$stage/build-status.json" ]]; then rm -rf -- "$stage"; return 1; fi
+  if [[ -d "$target" ]]; then
+    # Identical content-addressed program files are safe to reuse. Replace the
+    # directory only after a previous unavailable build or a completed stop.
+    if [[ "$native_ok" == 1 ]] && { [[ ! -f "$target/hotseat.bpf.o" ]] ||
+       ! "$PYTHON_BIN" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("available") else 1)' "$target/build-status.json"; }; then
+      local previous="${target}.previous.$(date +%s).$$"
+      mv -- "$target" "$previous" || { rm -rf -- "$stage"; return 1; }
+      if ! mv -- "$stage" "$target"; then mv -- "$previous" "$target"; return 1; fi
+      rm -rf -- "$previous"
+    else
+      rm -rf -- "$stage"
+    fi
+  else
+    mv -- "$stage" "$target" || { rm -rf -- "$stage"; return 1; }
+  fi
+  # Report the effective retained build if this installation reused an already
+  # working content-addressed directory.
+  native_ok=$("$PYTHON_BIN" -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("available", False)))' "$target/build-status.json")
+  if [[ "$native_ok" == 1 && "$requested" == 1 ]]; then
+    if ! "$PYTHON_BIN" "$target/hotseat_probe.py" preflight; then
+      native_ok=0
+    fi
+  fi
+  if [[ "$native_ok" != 1 ]]; then
+    reason=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reason", "Native build unavailable"))' "$target/build-status.json")
+  fi
+  if [[ "$native_ok" != 1 ]]; then
+    echo "Hot-seat unavailable: $reason" >&2
+    echo "The existing RAMCache controller will still be installed and run normally." >&2
+  else
+    echo "Hot-seat helpers ready. Kernel read/mmap/overflow self-tests run before activation."
+  fi
+}
+
+report_hotseat_activation() {
+  if ! "$PYTHON_BIN" /opt/ramcache-controller/hotseat-1.5.0-94bdfa6c6289/hotseat_probe.py activation; then
+    echo "RAMCache installation is retained. Inspect the hot-seat result with:" >&2
+    echo "  journalctl -u ramcache-hotseat.service -b --no-pager -n 60" >&2
+  fi
+}
+
+write_hotseat_service() {
+  cat > /etc/systemd/system/ramcache-hotseat.service <<UNIT
+[Unit]
+Description=RAMCache recent-file hot-seat
+After=ramcache-controller.service
+BindsTo=ramcache-controller.service
+PartOf=ramcache-controller.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=$PYTHON_BIN /opt/ramcache-controller/hotseat-1.5.0-94bdfa6c6289/ramcache_hotseat.py
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=55
+TasksMax=32
+CPUAccounting=true
+CPUQuota=10%
+CPUQuotaPeriodSec=20ms
+CPUWeight=10
+Nice=10
+IOAccounting=true
+IOWeight=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+LimitNOFILE=262144
+LimitMEMLOCK=infinity
+UMask=0077
+UNIT
+}
+
 install_all() {
   need_root
   export DEBIAN_FRONTEND=noninteractive
@@ -8807,6 +11819,10 @@ install_all() {
   ensure_fs_watch_tools
   # Stage and validate both program and settings before replacing either.
   write_controller
+  if ! write_hotseat; then
+    rm -f "$STAGED_CONTROLLER"
+    return 1
+  fi
   if ! write_config; then
     rm -f "$STAGED_CONTROLLER"
     return 1
@@ -8815,15 +11831,17 @@ install_all() {
   install -d -m 700 /var/lib/ramcache-controller
   "$PYTHON_BIN" /opt/ramcache-controller/ramcache_controller.py --seed-existing
   write_service
+  write_hotseat_service
   write_sysctls
   systemctl daemon-reload
   systemctl enable ramcache-controller.service
   systemctl restart ramcache-controller.service
   echo
-  echo "Installed RAMCache v1.4.5. Existing configuration and learned state are retained on updates."
+  echo "Installed RAMCache v1.5.0. Existing configuration and learned state are retained on updates."
   echo "Status: sudo bash ramcache.sh diagnose"
   echo "        systemctl status ramcache-controller.service --no-pager"
   echo "        python3 -m json.tool /run/ramcache-controller/status.json"
+  report_hotseat_activation
 }
 
 uninstall_all() {
@@ -8864,6 +11882,7 @@ uninstall_all() {
     fi
   fi
 
+  rm -f /etc/systemd/system/ramcache-hotseat.service
   rm -f /etc/systemd/system/ramcache-controller.service
   rm -f /etc/systemd/system/multi-user.target.wants/ramcache-controller.service
   rm -rf /opt/ramcache-controller
@@ -8896,13 +11915,14 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.4.5"
+  echo "RAM cache controller installer: v1.5.0"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
   fi
   echo "Kernel: $(uname -r)"
   systemctl status ramcache-controller.service --no-pager || true
+  systemctl status ramcache-hotseat.service --no-pager || true
   echo
   if [[ -f /run/ramcache-controller/status.json ]]; then
     python3 -m json.tool /run/ramcache-controller/status.json || cat /run/ramcache-controller/status.json
