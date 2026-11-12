@@ -6658,14 +6658,14 @@ def run_supervisor() -> int:
         logging.error("another RAMCache supervisor already owns this runtime directory")
         return 1
     config_text, cfg = load_config()
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "hotseat-1.5.0-94bdfa6c6289"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "hotseat-1.5.0-6da5e199c25c"))
     from hotseat_bridge import HotseatBridge
     hotseat = HotseatBridge(RUNTIME_PATH, enabled=True)
     hotseat.enabled = bool(cfg.get("hotseat_enabled", True))
     if not hotseat.enabled:
         hotseat.status = {"state": "disabled"}
     else:
-        native_build = read_json(Path(__file__).resolve().parent / "hotseat-1.5.0-94bdfa6c6289" / "build-status.json", {})
+        native_build = read_json(Path(__file__).resolve().parent / "hotseat-1.5.0-6da5e199c25c" / "build-status.json", {})
         if not native_build.get("available", False):
             hotseat.status = {"state": "unavailable", "reason": native_build.get("reason", "native components not built")}
     cfg["_hotseat_owned"] = hotseat.owned
@@ -7454,7 +7454,7 @@ write_config() {
 import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 path = Path('/etc/ramcache-controller/config.json')
-defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":null,"vrchat_content_cache_budget_bytes":null,"target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":7,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null,"hotseat_enabled":true,"hotseat_max_files":65536,"hotseat_metadata_mib":64,"hotseat_event_rate_limit":500000,"hotseat_exclude_prefixes":[]}''')
+defaults = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":1,"incremental_rescan_interval_seconds":30,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":12,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":1.0,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":10,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"2G","target_shrink_to_available_bytes":"3G","target_grow_above_available_bytes":"4G","target_grow_to_available_bytes":"3G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"4G","vmtouch_chunk_target_bytes":"256M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":null,"firefox_webcache_budget_bytes":null,"chromium_webcache_budget_bytes":"4G","electron_webcache_budget_bytes":"2G","desktop_shader_cache_budget_bytes":"1G","desktop_compiled_cache_budget_bytes":"256M","app_catalog_budget_bytes":"256M","hytale_world_budget_bytes":null,"vrchat_content_cache_budget_bytes":null,"target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{},"config_version":7,"adaptive_memory_reserve":true,"learning_enabled":true,"learn_file_opens":true,"process_learning_interval_seconds":2,"learning_pending_max":32768,"classification_worker_max":4,"metadata_worker_cap":12,"warming_worker_max":4,"worker_progress_timeout_seconds":120,"worker_retry_seconds":30,"persistence_interval_seconds":1800,"discord_startup_budget_bytes":null,"vrchat_startup_budget_bytes":null,"warrobots_startup_budget_bytes":null,"hotseat_enabled":true,"hotseat_max_files":65536,"hotseat_metadata_mib":64,"hotseat_event_rate_limit":500000,"hotseat_exclude_prefixes":[],"hotseat_refresh_interval_seconds":3600}''')
 legacy = json.loads(r'''{"include_paths":["/","/home"],"exclude_prefixes":["/proc","/sys","/dev","/run","/tmp","/var/tmp","/var/cache/apt/archives","/var/lib/systemd/coredump","/lost+found","/swapfile"],"stay_on_filesystem":true,"auto_include_common_app_paths":true,"cross_filesystem_include_roots":["/snap"],"check_interval_seconds":10,"incremental_rescan_interval_seconds":300,"full_rescan_interval_seconds":86400,"prefer_fanotify_filesystem_watch":true,"watch_attribute_events":false,"max_pending_fs_events":350000,"scan_worker_max":96,"scan_io_worker_multiplier_nonrotational":6.0,"scan_io_worker_multiplier_mixed":2,"scan_io_worker_multiplier_unknown":3.0,"scan_rotational_worker_max":4,"scan_cooldown_every":0,"scan_cooldown_seconds":0.0,"select_cooldown_every":0,"select_cooldown_seconds":0.0,"selection_small_update_threshold":32,"memory_monitor_interval_seconds":0.5,"fast_memory_growth_window_seconds":10,"fast_memory_growth_threshold_bytes":"1G","fast_memory_growth_min_unacked_bytes":"512M","rapid_memory_window_seconds":60,"rapid_memory_growth_threshold_bytes":"2G","rapid_memory_release_multiplier":1.0,"rapid_memory_release_margin_bytes":"512M","rapid_memory_prediction_seconds":5,"rapid_memory_max_release_bytes":"6G","memory_pressure_regrow_cooldown_seconds":30,"psi_memory_some_stall_threshold_us":100000,"psi_memory_full_stall_threshold_us":20000,"psi_memory_release_bytes":"2G","memory_pressure_abort_check_every":64,"target_available_bytes":"4G","target_shrink_to_available_bytes":"6G","target_grow_above_available_bytes":"7G","target_grow_to_available_bytes":"6G","target_initial_max_bytes":"8G","target_max_grow_step_bytes":"8G","target_max_inflight_bytes":"8G","vmtouch_chunk_target_bytes":"1024M","vmtouch_chunk_max_paths":8192,"max_selection_budget_total_ratio":4.0,"steam_htmlcache_budget_bytes":"1G","steam_htmlcache_max_files":65536,"firefox_webcache_budget_bytes":"4G","firefox_webcache_max_files":131072,"chromium_webcache_budget_bytes":"4G","chromium_webcache_max_files":131072,"electron_webcache_budget_bytes":"2G","electron_webcache_max_files":65536,"desktop_shader_cache_budget_bytes":"1G","desktop_shader_cache_max_files":32768,"desktop_compiled_cache_budget_bytes":"256M","desktop_compiled_cache_max_files":32768,"app_catalog_budget_bytes":"256M","app_catalog_max_files":16384,"hytale_world_budget_bytes":"2G","vrchat_content_cache_budget_bytes":"2G","target_relock_min_delta":"1G","target_relock_min_delta_ratio":0.07,"fd_limit_reserve":65536,"fd_limit_auto_max":8388608,"memlock_limit_reserve":"1G","memlock_limit_min":"1G","vmtouch_max_file_size":"128G","vmtouch_feed_pause_seconds":0.002,"vmtouch_feed_target_extra_seconds":1,"vmtouch_start_stagger_seconds":0.05,"vmtouch_stop_stagger_seconds":0.02,"low_ram_profile_enabled":true,"low_ram_total_threshold_bytes":"20G","low_ram_profile_overrides":{}}''')
 current = {}
 if path.exists():
@@ -8904,7 +8904,7 @@ ensure_fs_watch_tools() {
 }
 
 write_hotseat() {
-  local target="/opt/ramcache-controller/hotseat-1.5.0-94bdfa6c6289"
+  local target="/opt/ramcache-controller/hotseat-1.5.0-6da5e199c25c"
   local stage reason="" native_ok=1 requested=1 arch multiarch compiler
   local -a dependencies cflags libs extra_includes
   stage=$(mktemp -d /opt/ramcache-controller/.hotseat.XXXXXX) || return 1
@@ -9927,6 +9927,16 @@ class Sidecar:
         self.config_text = json.dumps(cfg, sort_keys=True)
         self.max_entries = min(65536, max(256, int(cfg.get("hotseat_max_files", 65536))))
         self.metadata_limit = min(256*MIB, max(8*MIB, int(cfg.get("hotseat_metadata_mib", 64))*MIB))
+        self.refresh_interval = max(1., float(cfg.get("hotseat_refresh_interval_seconds", 3600)))
+        self.next_refresh = time.monotonic()
+        self.selection_active = self.selection_replace = False
+        self.selection_topup = False
+        self.selection_candidates = collections.deque()
+        self.selection_discovery = collections.deque()
+        self.selection_restore = 0
+        self.settled_limit = self.settled_selected = 0
+        self.observation_generation = 0
+        self.settled_observations = -1
 
     def send(self, value):
         packet = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
@@ -10077,6 +10087,8 @@ class Sidecar:
             return
         if self.failed.get(key, 0) > time.monotonic():
             return
+        if key not in self.unknown:
+            self.observation_generation += 1
         self.unknown[key] = (key, seen, pid, birth, start, end, path)
         self.unknown.move_to_end(key)
         if len(self.unknown) > 8192:
@@ -10273,14 +10285,16 @@ class Sidecar:
                 self.mark_entry(entry)
                 self.need_policy = True
                 self.dirty_generation += 1
+                if self.selection_active and kind in ("discover", "restore"):
+                    self.selection_candidates.append(actual_key)
             finally:
                 if fd >= 0:
                     os.close(fd)
 
     def select_recent(self):
-        if not self.history or not self.base_done or not self.observer_ready or not self.need_policy:
+        if not self.history or not self.base_done or not self.observer_ready:
             return
-        self.need_policy = False
+        now = time.monotonic()
         previous_selected = self.selected_bytes
         limit = min(int(self.history.target), self.global_target)//PAGE*PAGE
         # Gradual downsizing can retain a partially pinned file; it need not
@@ -10297,11 +10311,34 @@ class Sidecar:
         if self.paused:
             self.urgent_report |= previous_selected != self.selected_bytes
             return
+        # Content replacement is hourly. A smaller selection or a rising
+        # memory allowance can refill sooner without evicting healthy files.
+        # Remember an exhausted pool so whole-file tails cannot cause polling
+        # and reselection of the same candidates on every control heartbeat.
+        if limit < self.settled_limit:
+            self.settled_limit = limit
+            self.settled_selected = min(self.settled_selected, self.selected_bytes)
+        if not self.selection_active:
+            periodic = now >= self.next_refresh
+            refill = (self.selected_bytes < self.settled_selected or limit > self.settled_limit or
+                      (self.selected_bytes + RELEASE_QUANTUM < limit and
+                       self.observation_generation != self.settled_observations))
+            if not periodic and not refill:
+                return
+            self.selection_active = True
+            self.selection_replace = periodic
+            self.selection_topup = False
+            self.selection_candidates = collections.deque(key for _, key in sorted(self.pending.data))
+            self.selection_discovery = collections.deque(reversed(self.unknown))
+            self.selection_restore = len(self.restore)
+            self.counters["hourly_refreshes" if periodic else "refill_passes"] += 1
+        self.need_policy = False
         deferred = []
         for _ in range(64):
-            key = self.pending.pop()
-            if key is None:
+            if not self.selection_candidates:
                 break
+            key = self.selection_candidates.popleft()
+            self.pending.remove(key)
             entry = self.entries.get(key)
             if entry is None or entry.dropping or entry.in_base:
                 continue
@@ -10316,7 +10353,7 @@ class Sidecar:
             # delayed/coalesced notification arrived out of order.
             victims = []
             room = limit-self.selected_bytes
-            while room < cost and self.selected:
+            while self.selection_replace and not self.selection_topup and room < cost and self.selected:
                 victim = self.entries[self.selected.peek()]
                 if victim.seen >= entry.seen:
                     break
@@ -10341,6 +10378,24 @@ class Sidecar:
         for entry in deferred:
             self.pending.set(entry.key, entry.seen)
         self.urgent_report |= previous_selected != self.selected_bytes or self.metrics_dirty
+        if (not self.selection_candidates and not self.selection_discovery and not self.selection_restore
+                and self.restore_future is None
+                and not any(kind in ("discover", "restore") for kind, _ in self.futures.values())):
+            if self.selection_replace and not self.selection_topup:
+                # Late metadata may admit a newer file and free a gap after
+                # an older fitting candidate was considered. Fill that gap
+                # once without another round of replacement.
+                self.selection_topup = True
+                self.selection_candidates = collections.deque(key for _, key in sorted(self.pending.data))
+                if self.selection_candidates:
+                    return
+            # Each refresh consumes a finite snapshot. New access events stay
+            # recorded for the next pass instead of extending this one forever.
+            self.selection_active = False
+            self.settled_limit, self.settled_selected = limit, self.selected_bytes
+            self.settled_observations = self.observation_generation
+            if self.selection_replace:
+                self.next_refresh = now + self.refresh_interval
 
     def accounting(self):
         return self.locked_bytes, max(0, self.reserved_bytes-self.locked_bytes)
@@ -10584,15 +10639,22 @@ class Sidecar:
                     break
         for entry in deferred:
             self.needs_open.set(entry.key, entry.seen)
-        while len(self.futures) < 2 and self.unknown:
-            key, event = self.unknown.popitem(last=True)
+        while (self.selection_active and not self.paused and not self.io_busy
+               and len(self.futures) < 2 and self.selection_discovery):
+            key = self.selection_discovery.popleft()
+            event = self.unknown.pop(key, None)
+            if event is None:
+                continue
             if key in self.entries or self.failed.get(key, 0) > time.monotonic():
                 continue
             if not self.submit("discover", key, resolve_event, event, self.excludes, self.state, self.runtime):
                 self.unknown[key] = event
+                self.selection_discovery.appendleft(key)
                 break
-        if len(self.futures) < 2 and self.restore:
+        if (self.selection_active and not self.paused and not self.io_busy
+                and len(self.futures) < 2 and self.selection_restore and self.restore):
             path, seen = self.restore.popleft()
+            self.selection_restore -= 1
             self.submit("restore", path, resolve_path, path, seen, self.excludes, self.state, self.runtime)
 
     def periodic(self):
@@ -10606,6 +10668,8 @@ class Sidecar:
             for row in reversed(rows):
                 path = os.fsdecode(row[0])
                 self.restore.append((path, stamp+int(row[6])))
+            if self.selection_active:
+                self.selection_restore += len(rows)
         if now >= self.next_check:
             self.check_cursor = collections.deque(e.key for e in self.entries.values() if e.target or e.worker or e.in_base)
             self.next_check = now+3600
@@ -10676,6 +10740,11 @@ class Sidecar:
             except OSError:
                 pass
         status = {"state": "observing" if self.observer_ready else "kernel self-test",
+                  "selection_state": ("pressure paused" if self.paused else
+                      "hourly refresh" if self.selection_active and self.selection_replace else
+                      "refilling" if self.selection_active else "holding until hourly refresh"),
+                  "refresh_interval_seconds": self.refresh_interval,
+                  "next_refresh_in_seconds": round(max(0., self.next_refresh-time.monotonic()), 1),
                   "nominal_bytes": self.nominal, "target_bytes": int(self.history.target) if self.history else 0,
                   "grant_bytes": self.cap, "locked_bytes": locked, "inflight_bytes": inflight,
                   "selected_files": len(self.selected), "known_files": len(self.entries),
@@ -10692,7 +10761,9 @@ class Sidecar:
         while RUNNING:
             self.flush()
             reads = [self.sock, self.observer_sock, self.watch.fd, self.wake_read] + [w.sock for w in self.lockers]
-            active = bool(self.futures or self.unknown or self.restore or any(w.pending for w in self.lockers))
+            active = bool(self.futures or (self.selection_active and
+                          (self.selection_candidates or self.selection_discovery or self.selection_restore))
+                          or any(w.pending for w in self.lockers))
             buffered = any(w.buffered_replies for w in self.lockers)
             readable, _, _ = select.select(reads, [], [], 0 if buffered else (.1 if active else 1.))
             if self.sock in readable:
@@ -11770,7 +11841,7 @@ HOTSEAT_BUILD_STATUS
 }
 
 report_hotseat_activation() {
-  if ! "$PYTHON_BIN" /opt/ramcache-controller/hotseat-1.5.0-94bdfa6c6289/hotseat_probe.py activation; then
+  if ! "$PYTHON_BIN" /opt/ramcache-controller/hotseat-1.5.0-6da5e199c25c/hotseat_probe.py activation; then
     echo "RAMCache installation is retained. Inspect the hot-seat result with:" >&2
     echo "  journalctl -u ramcache-hotseat.service -b --no-pager -n 60" >&2
   fi
@@ -11790,7 +11861,7 @@ StartLimitBurst=5
 Type=exec
 User=root
 Group=root
-ExecStart=$PYTHON_BIN /opt/ramcache-controller/hotseat-1.5.0-94bdfa6c6289/ramcache_hotseat.py
+ExecStart=$PYTHON_BIN /opt/ramcache-controller/hotseat-1.5.0-6da5e199c25c/ramcache_hotseat.py
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=30
