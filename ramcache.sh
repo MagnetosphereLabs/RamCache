@@ -3989,6 +3989,7 @@ class CacheWorker:
     stopped: bool = False
     acknowledged_at: float = 0.0
     last_sample: float = 0.0
+    compaction_alias: bool = False
 
 
 def start_cache_worker(records: list[FileRec], cfg: dict) -> CacheWorker:
@@ -4098,6 +4099,193 @@ def reap_workers(retired: list[tuple[float, CacheWorker]]) -> None:
                 worker.proc.kill()
             except ProcessLookupError:
                 pass
+
+
+def worker_task_headroom():
+    """Respect this service's PID limit and any tighter parent limit."""
+    root = Path('/sys/fs/cgroup')
+    try:
+        group = next(line.split('::', 1)[1].strip() for line in
+                     Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
+        current = root / group.lstrip('/')
+        available = []
+        while current == root or root in current.parents:
+            try:
+                maximum = (current / 'pids.max').read_text().strip()
+                if maximum != 'max':
+                    used = int((current / 'pids.current').read_text())
+                    available.append(max(0, int(maximum) - used))
+            except (OSError, ValueError):
+                pass
+            if current == root:
+                break
+            current = current.parent
+        return min(available) if available else None
+    except (OSError, StopIteration):
+        return None
+
+
+def compactable_workers(workers, cfg):
+    """Pack small, complete batches without changing file or tier selection."""
+    stable = min(parse_size(cfg.get('vmtouch_chunk_target_bytes', '128M')) or 128*MIB, 256*MIB)
+    maximum_paths = min(8192, int(cfg.get('vmtouch_chunk_max_paths', 8192)))
+    groups = {}
+    for worker in sorted(workers, key=lambda w: w.requested):
+        if (not worker.ready.is_set() or worker.failed.is_set() or worker.stopped
+                or not worker.records or worker.reported_pages*PAGE_SIZE != worker.requested):
+            continue
+        first = worker.records[0]
+        mutable = bool(first.budget) or any(marker in first.path.lower() for marker in (
+            '/.config/', '/.cache/', '/.mozilla/', '/.var/app/', '/config/', '/pfx/'))
+        limit = min(stable, 64*MIB) if mutable else stable
+        if worker.requested > limit//2:
+            continue
+        key = first.priority[:1], mutable
+        selected, size, paths = groups.get(key, ([], 0, 0))
+        if len(selected) < 64 and size + worker.requested <= limit and paths + len(worker.records) <= maximum_paths:
+            selected.append(worker)
+            groups[key] = selected, size + worker.requested, paths + len(worker.records)
+    for selected, _, _ in sorted(groups.values(), key=lambda item: -len(item[0])):
+        if len(selected) < 2:
+            break
+        records = sorted((r for w in selected for r in w.records), key=lambda r: (r.priority, r.path))
+        chunks = list(worker_chunks(records, cfg))
+        if len(chunks) == 1:
+            return selected, chunks[0]
+    return [], []
+
+
+def worker_mappings_match(worker):
+    # Check the mappings themselves: a path may have been replaced between
+    # the original lock and the consolidation. Never retire the old inode's
+    # holder merely because a replacement path has the same byte count.
+    try:
+        mapped = set()
+        with open('/proc/%d/maps' % worker.proc.pid) as source:
+            for line in source:
+                fields = line.split(None, 5)
+                if len(fields) >= 5 and fields[4] != '0':
+                    major, minor = fields[3].split(':')
+                    mapped.add((os.makedev(int(major, 16), int(minor, 16)), int(fields[4])))
+        return all((r.dev, r.ino) in mapped for r in worker.records)
+    except (OSError, ValueError):
+        return False
+
+
+def transfer_worker_samples(hotseat, samples, sources, replacement):
+    # PID replacement is not new memory demand or released cache capacity.
+    # Transfer the old samples, so hot-seat pressure learning stays neutral.
+    hotseat.last_base[replacement.proc.pid] = sum(hotseat.last_base.pop(w.proc.pid, 0) for w in sources)
+    samples[replacement.proc.pid] = sum(samples.pop(w.proc.pid, 0) for w in sources)
+
+
+class WorkerAdmission:
+    """Leave task slots free, consolidate fragmented locks, and time retries."""
+    def __init__(self):
+        self.next_retry = self.next_compaction = 0.0
+        self.streak = self.failures = self.compactions = self.removed = 0
+        self.error = ''
+        self.headroom = None
+        self.copy = None
+        self.sources = []
+        self.copy_timeout = 120
+
+    def can_start(self, now, *, compaction=False):
+        if now < self.next_retry:
+            return False
+        self.headroom = worker_task_headroom()
+        # Popen plus the reader and feeder need three task slots. Keep room
+        # for metadata/control threads, and more for consolidation to recover.
+        reserve = 4 if compaction else 32
+        if self.headroom is not None and self.headroom < reserve + 3:
+            self.next_retry = now + 1
+            self.error = 'waiting for cache-worker task slots'
+            return False
+        return True
+
+    def failed(self, error, now):
+        self.streak = min(5, self.streak + 1)
+        self.failures += 1
+        self.error = str(error)
+        self.next_retry = now + min(30, 2**self.streak)
+
+    def succeeded(self):
+        self.streak = 0
+        self.next_retry = 0.0
+        self.error = ''
+
+    def cancel(self, retired, now):
+        if self.copy is not None:
+            signal_worker(self.copy)
+            retired.append((now, self.copy))
+            self.copy = None
+            self.sources = []
+
+    def poll(self, workers, retired, now):
+        worker = self.copy
+        if worker is None:
+            return
+        live = {id(w) for w in workers}
+        valid = all(id(w) in live and not w.failed.is_set() for w in self.sources)
+        if worker.proc.poll() is not None or worker.failed.is_set() or not valid:
+            self.cancel(retired, now)
+            self.next_compaction = now + 30
+            return
+        locked, _ = process_memory(worker.proc.pid)
+        if locked > worker.locked:
+            worker.last_progress = now
+        worker.locked = locked
+        if worker.ready.is_set():
+            valid = (sorted(record_key(r) for w in self.sources for r in w.records) == sorted(record_key(r) for r in worker.records))
+            if worker.warnings or worker.reported_pages*PAGE_SIZE != worker.requested or not valid or not worker_mappings_match(worker):
+                self.cancel(retired, now)
+                self.next_compaction = now + 30
+                return
+            # The replacement has acknowledged every page before any healthy
+            # source is stopped. Both processes map the same page-cache pages.
+            sources = {id(w) for w in self.sources}
+            latest = {record_key(r): r for w in self.sources for r in w.records}
+            worker.records = [latest[record_key(r)] for r in worker.records]
+            worker.priority = min(r.priority for r in worker.records)
+            workers[:] = [w for w in workers if id(w) not in sources]
+            for old in self.sources:
+                old.compaction_alias = True
+                signal_worker(old)
+                retired.append((now, old))
+            worker.compaction_alias = False
+            workers.append(worker)
+            self.compactions += 1
+            self.removed += len(self.sources) - 1
+            previous = self.sources
+            self.copy = None
+            self.sources = []
+            self.next_compaction = now
+            self.succeeded()
+            return previous, worker
+        elif now - worker.last_progress > self.copy_timeout:
+            self.cancel(retired, now)
+            self.next_compaction = now + 30
+
+    def consolidate(self, workers, cfg, now):
+        if self.copy is not None or now < max(self.next_compaction, self.next_retry):
+            return
+        self.next_compaction = now + 1
+        self.headroom = worker_task_headroom()
+        crowded = self.headroom is not None and self.headroom < 96
+        fragmented = len(workers) >= 128 and sum(w.requested for w in workers) < len(workers)*32*MIB
+        if not (crowded or fragmented):
+            return
+        selected, records = compactable_workers(workers, cfg)
+        if not selected or not self.can_start(now, compaction=True):
+            return
+        try:
+            self.copy = start_cache_worker(records, cfg)
+            self.copy.compaction_alias = True
+            self.sources = selected
+            self.copy_timeout = max(30, float(cfg.get('worker_progress_timeout_seconds', 120)))
+        except (OSError, RuntimeError) as error:
+            self.failed(error, now)
+            logging.warning('cache-worker consolidation delayed: %s', error)
 
 
 def worker_chunks(records: list[FileRec], cfg: dict):
@@ -6686,6 +6874,7 @@ def run_supervisor() -> int:
     io_busy = False
     workers = []
     retired = []
+    admission = WorkerAdmission()
     records = []
     incoming = None
     plan_generation = ""
@@ -6737,6 +6926,9 @@ def run_supervisor() -> int:
                 io_activity.extra_groups = (hotseat.io_group,) if hotseat.io_group else ()
                 io_busy = io_activity.busy(now)
             reap_workers(retired)
+            handoff = admission.poll(workers, retired, now)
+            if handoff:
+                transfer_worker_samples(hotseat, sampled_locked, *handoff)
             owned_locked = 0
             inflight = 0
             for worker in list(workers):
@@ -6793,7 +6985,7 @@ def run_supervisor() -> int:
             hotseat.sync_workers(workers, retired)
             release = 0
             if memory_tick:
-                hotseat.track_base_growth(workers, retired)
+                hotseat.track_base_growth(workers, [(stamp, w) for stamp, w in retired if not w.compaction_alias])
                 supervisor_anon = process_memory(os.getpid())[1]
                 planner_anon = process_memory(planner.pid)[1] if planner.poll() is None else 0
                 own_anon = supervisor_anon + planner_anon + hotseat.measured_anon
@@ -6803,6 +6995,7 @@ def run_supervisor() -> int:
                 sampled_locked = {worker.proc.pid: worker.locked for worker in workers}
                 release, pause = policy.evaluate(meminfo, cfg, owned_locked, own_anon, now=now)
             if release:
+                admission.cancel(retired, now)
                 pressure_before = owned_locked
                 target = max(0, owned_locked - release)
                 # Signal all chosen workers before waiting for any exit. The
@@ -6825,12 +7018,12 @@ def run_supervisor() -> int:
             if memory_tick or hotseat.changed:
                 base_requested = sum(w.requested for w in workers)
                 base_unsampled = sum(max(0, w.requested-sampled_locked.get(w.proc.pid, 0))
-                    for w in workers + [w for _, w in retired if w.proc.poll() is None])
+                    for w in workers + [w for _, w in retired if not w.compaction_alias and w.proc.poll() is None])
                 funding = hotseat.budget(total=meminfo["MemTotal"], available=meminfo["MemAvailable"],
                     reserve=reserve, target=global_budget, base_requested=base_requested,
                     base_unsampled=base_unsampled, paused=pause, io_busy=io_busy,
                     healthy=not pause and meminfo["MemAvailable"] >= above, cfg=cfg, now=now,
-                    retiring=sum(w.requested for _, w in retired if w.proc.poll() is None))
+                    retiring=sum(w.requested for _, w in retired if not w.compaction_alias and w.proc.poll() is None))
                 hotseat.changed = False
                 # Existing priorities determine which base chunks make room.
                 # Retiring pages are never credited to MemAvailable before a new sample.
@@ -6902,7 +7095,7 @@ def run_supervisor() -> int:
                 cache_goal = 0
                 plan_changed = False
             boot_apply = bool(boot_fetch and plan_generation == boot_apply_generation and incoming is None)
-            if (not holding or boot_apply) and not pause and (records or boot_apply) and now - last_reconcile >= 1 and (
+            if (not holding or boot_apply) and not pause and (records or boot_apply) and now >= admission.next_retry and now - last_reconcile >= 1 and (
                     plan_changed or budget != last_budget
                     or any(deadline <= now for deadline in failed_until.values())) and not (grow_existing and retired):
                 failed_until = {key: deadline for key, deadline in failed_until.items() if deadline > now}
@@ -6954,6 +7147,14 @@ def run_supervisor() -> int:
                 loading_limit = min(loading_limit, 2)
             if io_busy:
                 loading_limit = 1
+            if (pending_chunks and not holding and not pause and not io_busy
+                    and active_loading < loading_limit and not retired):
+                admission.consolidate(workers, cfg, now)
+            if admission.copy is not None:
+                active_loading += 1
+                if pause or holding:
+                    admission.cancel(retired, now)
+                    active_loading -= 1
             inflight_limit = min(parse_size(cfg.get("target_max_inflight_bytes", "2G")) or 2 * GIB,
                                  max(256 * MIB, meminfo["MemTotal"] // 8))
             # Never launch dozens of concurrent readers simply because the
@@ -6961,12 +7162,17 @@ def run_supervisor() -> int:
             # workers acknowledge completion, independent of target deadbands.
             launches = 0
             launch_blocked = ""
+            if pending_chunks and now < admission.next_retry:
+                launch_blocked = "waiting for cache worker resources (retry in %.0fs)" % max(1, admission.next_retry-now)
             # A worker can finish between 1-s memory samples. Charge every byte
             # not resident at the last sample EVEN AFTER its ready signal, so
             # fast completion never lets us spend stale MemAvailable twice.
             unsampled = sum(max(0, worker.requested - sampled_locked.get(worker.proc.pid, 0))
                             for worker in workers) + max(0, hotseat.reserved-hotseat.sampled_locked)
-            while pending_chunks and (not holding or boot_apply) and not pause and active_loading < loading_limit and launches < 2:
+            while pending_chunks and (not holding or boot_apply) and not pause and active_loading < loading_limit and launches < 2 and now >= admission.next_retry:
+                if not admission.can_start(now):
+                    launch_blocked = admission.error
+                    break
                 # A hot-seat admission may arrive after this base queue was built.
                 # Drop overlaps before starting VMTouch and enforce the current grant.
                 while pending_chunks:
@@ -6991,6 +7197,10 @@ def run_supervisor() -> int:
                     break
                 try:
                     worker = start_cache_worker(chunk, cfg)
+                    previous_start_error = admission.error
+                    admission.succeeded()
+                    if last_error == previous_start_error:
+                        last_error = ""
                     workers.append(worker)
                     if first_warm is None:
                         first_warm = now - started
@@ -7002,9 +7212,13 @@ def run_supervisor() -> int:
                 except (OSError, RuntimeError) as error:
                     failures += 1
                     last_error = str(error)
-                    for rec in chunk:
-                        failed_until[record_key(rec)] = now + 30
-                    logging.exception("unable to start cache worker")
+                    # A process/thread allocation failure says nothing about
+                    # these files. Keep the exact batch and retry globally,
+                    # rather than churning the full plan and marking it bad.
+                    pending_chunks.appendleft(chunk)
+                    admission.failed(error, now)
+                    launch_blocked = "waiting for cache worker resources (retry in %.0fs)" % (admission.next_retry-now)
+                    logging.warning("cache worker start delayed: %s; retry in %.0fs", error, admission.next_retry-now)
                     break
 
             # A complete, fully budgeted selection is already enough work to
@@ -7119,7 +7333,7 @@ def run_supervisor() -> int:
                 elif holding and not active_loading:
                     fill_state = "holding cache; discovery and selection asleep"
                 elif pending_chunks or active_loading:
-                    fill_state = launch_blocked or "loading selected files"
+                    fill_state = launch_blocked or ("combining completed cache workers" if admission.copy is not None and active_loading == 1 else "loading selected files")
                 elif failed_until:
                     fill_state = "retrying failed files"
                 elif not budget_policy.refilling:
@@ -7161,6 +7375,13 @@ def run_supervisor() -> int:
                     "inflight_gib": bytes_to_gib(inflight), "pending_chunks": len(pending_chunks),
                     "active_loaders": active_loading, "active_lockers": len(workers), "peak_loaders": loading_peak,
                     "worker_failures": failures, "worker_warnings": warning_count,
+                    "worker_start_failures": admission.failures,
+                    "worker_start_retry_seconds": round(max(0, admission.next_retry-now), 2),
+                    "worker_start_error": admission.error,
+                    "worker_task_headroom": admission.headroom,
+                    "worker_compactions": admission.compactions,
+                    "worker_processes_saved": admission.removed,
+                    "worker_consolidation_active": admission.copy is not None,
                     "plan_generation": plan_generation, "plan_validated_files": len(records),
                     "plan_skipped_files": plan_skipped, "first_warm_seconds": first_warm,
                     "memtotal_gib": bytes_to_gib(meminfo["MemTotal"]),
@@ -7224,7 +7445,8 @@ def run_supervisor() -> int:
                     last_error = "invalid configuration; continuing last valid settings: " + str(error)
             # Completion/feeding remains fast; memory telemetry is sampled on
             # its independent >=1-s cadence. Holding ignores deferred plans.
-            busy = active_loading or (not holding and (not validated or incoming is not None or plan_changed))
+            busy = active_loading or (not holding and now >= admission.next_retry and
+                                      (not validated or incoming is not None or plan_changed))
             # Publish newly launched ownership BEFORE accepting hot-seat claims.
             hotseat.sync_workers(workers, retired)
             hotseat.poll(now)
@@ -7232,6 +7454,7 @@ def run_supervisor() -> int:
             descriptors = ([hotseat.peer] if hotseat.peer else [hotseat.server]) if hotseat.enabled else []
             select.select(descriptors, [], [], wait)
     finally:
+        admission.cancel(retired, time.monotonic())
         hotseat.close()
         reader.stop.set()
         for worker in workers:
