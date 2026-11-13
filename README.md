@@ -8,7 +8,7 @@
 
 <img src="https://img.shields.io/badge/LINUX-PAGE_CACHE-5D8CFF?style=for-the-badge&labelColor=090D18" alt="Linux Page Cache">
 <img src="https://img.shields.io/badge/SYSTEMD-MANAGED-70B5FF?style=for-the-badge&labelColor=090D18" alt="systemd">
-<img src="https://img.shields.io/badge/VERSION-1.4.5-9B73FF?style=for-the-badge&labelColor=090D18" alt="Version 1.4.5">
+<img src="https://img.shields.io/badge/VERSION-1.5.1-9B73FF?style=for-the-badge&labelColor=090D18" alt="Version 1.4.5">
 
 <br>
 
