@@ -10,6 +10,30 @@ need_root() {
   fi
 }
 
+installer_failed() {
+  local code="$1"
+  trap - ERR
+  # A failing step may have its stderr redirected into the log. Keep the
+  # original terminal available so failures can never disappear into it.
+  printf '\nCould not complete the %s.\n' "$ACTION" >&4
+  printf 'Details: %s\n' "$INSTALL_LOG" >&4
+  tail -n 8 "$INSTALL_LOG" >&4 || true
+  exit "$code"
+}
+
+prepare_installer_log() {
+  exec 4>&2
+  INSTALL_LOG=/var/log/ramcache-installer.log
+  # Keep the previous run available; a failed update must not erase its log.
+  if [[ -f "$INSTALL_LOG" ]]; then
+    cp -p -- "$INSTALL_LOG" "${INSTALL_LOG}.previous"
+  fi
+  (umask 077; : > "$INSTALL_LOG")
+  chmod 600 "$INSTALL_LOG"
+  set -E
+  trap 'installer_failed "$?"' ERR
+}
+
 write_controller() {
   install -d -m 755 /opt/ramcache-controller
   STAGED_CONTROLLER=$(mktemp /opt/ramcache-controller/.controller.XXXXXX)
@@ -63,7 +87,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.5.0"
+CONTROLLER_VERSION = "1.5.1"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -239,18 +263,20 @@ def parse_memory_psi_totals() -> tuple[int, int]:
     return some_total, full_total
 
 LOW_RAM_PROFILE_DEFAULTS = {
-    "target_available_bytes": "4G",
-    "target_shrink_to_available_bytes": "6G",
-    "target_grow_to_available_bytes": "6G",
-    "target_grow_above_available_bytes": "7G",
+    # Also stay usable when an existing configuration disables adaptive
+    # reserves. The old fixed 6-GiB reserve could leave a laptop no fill room.
+    "target_available_bytes": "1280M",
+    "target_shrink_to_available_bytes": "2G",
+    "target_grow_to_available_bytes": "2G",
+    "target_grow_above_available_bytes": "3G",
 
     "target_initial_max_bytes": "8G",
     "target_max_grow_step_bytes": "8G",
     "target_max_inflight_bytes": "8G",
 
-    # Keep chunks small so pressure release is still surgical.
-    "vmtouch_chunk_target_bytes": "128M",
-    "vmtouch_chunk_max_paths": 4096,
+    # Match the normal fill pipeline; mutable files still use 64-MiB chunks.
+    "vmtouch_chunk_target_bytes": "256M",
+    "vmtouch_chunk_max_paths": 8192,
 
     # React quickly to smaller changes.
     "target_relock_min_delta": "256M",
@@ -268,14 +294,14 @@ LOW_RAM_PROFILE_DEFAULTS = {
     "vmtouch_feed_pause_seconds": 0.005,
     "vmtouch_feed_target_extra_seconds": 5,
 
-    "scan_worker_max": 4,
-    "classification_worker_max": 2,
-    "scan_io_worker_multiplier_nonrotational": 1.5,
-    "scan_io_worker_multiplier_unknown": 1.25,
-    "scan_cooldown_every": 512,
-    "scan_cooldown_seconds": 0.003,
-    "select_cooldown_every": 512,
-    "select_cooldown_seconds": 0.002,
+    "scan_worker_max": 12,
+    "classification_worker_max": 4,
+    "scan_io_worker_multiplier_nonrotational": 6.0,
+    "scan_io_worker_multiplier_unknown": 3.0,
+    "scan_cooldown_every": 0,
+    "scan_cooldown_seconds": 0.0,
+    "select_cooldown_every": 0,
+    "select_cooldown_seconds": 0.0,
 }
 
 
@@ -3951,15 +3977,21 @@ class IOActivity:
 def process_memory(pid: int) -> tuple[int, int]:
     locked = anon = 0
     resident_file = None
+    found = 0
     try:
         with open(f"/proc/{pid}/status", encoding="ascii") as source:
             for line in source:
                 if line.startswith("VmLck:"):
                     locked = int(line.split()[1]) * KIB
+                    found |= 1
                 elif line.startswith("RssAnon:"):
                     anon = int(line.split()[1]) * KIB
+                    found |= 2
                 elif line.startswith("RssFile:"):
                     resident_file = int(line.split()[1]) * KIB
+                    found |= 4
+                if found == 7:
+                    break
     except (OSError, ValueError):
         pass
     # VmLck can account an mlock range before all its I/O completes. Bound the
@@ -4950,15 +4982,22 @@ class InventoryDB:
 
     def prepare(self, records, generation, *, force=False, dir_token=0):
         changed = []
-        for rec in records:
-            raw = os.fsencode(rec.path)
-            row = self.connection.execute(
-                "SELECT size,dev,ino,mtime_ns,ctime_ns FROM files WHERE path=?", (raw,)).fetchone()
-            if not force and row == (rec.size, rec.dev, rec.ino, rec.mtime_ns, rec.ctime_ns):
-                self.mark_seen(raw, generation, dir_token)
-                continue
-            use = self.connection.execute("SELECT hits,last_use FROM usage WHERE path=?", (raw,)).fetchone()
-            changed.append((rec, *(use or (0, 0))))
+        iterator = iter(records)
+        while batch := list(itertools.islice(iterator, 256)):
+            paths = [os.fsencode(rec.path) for rec in batch]
+            slots = ",".join("?" for _ in paths)
+            # The scanner already sends bounded batches. Fetch the same exact
+            # metadata/learning rows together instead of 1-2 SQL lookups per
+            # file; small CPUs spend much less time feeding classifiers.
+            known = {} if force else {row[0]: tuple(row[1:]) for row in self.connection.execute(
+                "SELECT path,size,dev,ino,mtime_ns,ctime_ns FROM files WHERE path IN ("+slots+")", paths)}
+            usage = {row[0]: tuple(row[1:]) for row in self.connection.execute(
+                "SELECT path,hits,last_use FROM usage WHERE path IN ("+slots+")", paths)}
+            for rec, raw in zip(batch, paths):
+                if not force and known.get(raw) == (rec.size, rec.dev, rec.ino, rec.mtime_ns, rec.ctime_ns):
+                    self.mark_seen(raw, generation, dir_token)
+                    continue
+                changed.append((rec, *usage.get(raw, (0, 0))))
         return changed
 
     def mark_seen(self, raw, generation, token):
@@ -5562,6 +5601,7 @@ def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
     last_status = last_events = 0.0
     checkpoint_error = ""
     inventory_count = db.count()
+    reported_state = None
     try:
         if watcher.proc is None:
             try:
@@ -5654,7 +5694,7 @@ def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
                 except (OSError, sqlite3.Error) as error:
                     checkpoint_error = str(error)
                     checkpoint_due = now + 60
-            if now-last_status >= 1:
+            if state != reported_state or now-last_status >= (5 if completed else 1):
                 stats = refresh.stats if refresh is not None else db.meta("boot_refresh_stats", {})
                 atomic_json(RUNTIME_PATH / "planner-status.json", {
                     "timestamp": time.time(), "pid": os.getpid(),
@@ -5673,6 +5713,7 @@ def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
                     "last_checkpoint_seconds": round(db.last_checkpoint_seconds, 3),
                 })
                 last_status = now
+                reported_state = state
             time.sleep(0.05 if requested and not completed and not paused else 1)
     finally:
         if refresh is not None:
@@ -5706,9 +5747,10 @@ class DirectoryScanner:
                 pass
 
     def run(self):
+        maximum = parse_size(self.cfg.get("vmtouch_max_file_size", "128G"))
         while not self.stop.is_set():
             try:
-                directory, device, stay = self.tasks.get(timeout=0.25)
+                directory, device, stay = self.tasks.get(timeout=1)
             except queue.Empty:
                 continue
             records, children = [], []
@@ -5735,7 +5777,6 @@ class DirectoryScanner:
                                 children.append((path, device, stay))
                             elif entry.is_file(follow_symlinks=False):
                                 st = entry.stat(follow_symlinks=False)
-                                maximum = parse_size(self.cfg.get("vmtouch_max_file_size", "128G"))
                                 if (stay and st.st_dev != device) or (maximum and st.st_size > maximum):
                                     continue
                                 rec = stat_record(path, st)
@@ -5862,7 +5903,10 @@ def run_planner() -> int:
         cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         cpus = os.cpu_count() or 1
-    classifier_count = min(max(1, cpus // 4), max(1, int(cfg.get("classification_worker_max", 4))))
+    # Use the same CPU-aware discovery pipeline on every RAM size. A four-
+    # thread laptop gets two classifiers; the service CPU quota still bounds
+    # total compute to half the machine, independent of pool concurrency.
+    classifier_count = min(max(1, cpus // 2), max(1, int(cfg.get("classification_worker_max", 4))))
     pool = concurrent.futures.ProcessPoolExecutor(
         max_workers=classifier_count, mp_context=multiprocessing.get_context("spawn"))
     futures = {}  # bounded to a few batches, never millions of Python objects
@@ -5934,18 +5978,20 @@ def run_planner() -> int:
                         checkpoint_error = str(error)
                         checkpoint_due = time.monotonic() + 60
                         logging.exception("held metadata checkpoint failed; retaining live state")
+                if not was_holding or now-last_status >= 5:
+                    status = read_json(RUNTIME_PATH / "planner-status.json", {}) or {}
+                    status.update(timestamp=time.time(), pid=os.getpid(),
+                                  phase="holding" if control.get("cache_holding") else "waiting for cached-plan refill",
+                                  scanned_files=scanned, inventory_files=inventory_count,
+                                  checkpoint_error=checkpoint_error,
+                                  last_checkpoint_epoch=db.last_checkpoint,
+                                  last_checkpoint_reason=db.last_checkpoint_reason,
+                                  last_checkpoint_rows=db.last_checkpoint_rows,
+                                  last_checkpoint_seconds=round(db.last_checkpoint_seconds, 3),
+                                  persistence_interval_seconds=checkpoint_interval)
+                    atomic_json(RUNTIME_PATH / "planner-status.json", status)
+                    last_status = now
                 was_holding = True
-                status = read_json(RUNTIME_PATH / "planner-status.json", {}) or {}
-                status.update(timestamp=time.time(), pid=os.getpid(),
-                              phase="holding" if control.get("cache_holding") else "waiting for cached-plan refill",
-                              scanned_files=scanned, inventory_files=inventory_count,
-                              checkpoint_error=checkpoint_error,
-                              last_checkpoint_epoch=db.last_checkpoint,
-                              last_checkpoint_reason=db.last_checkpoint_reason,
-                              last_checkpoint_rows=db.last_checkpoint_rows,
-                              last_checkpoint_seconds=round(db.last_checkpoint_seconds, 3),
-                              persistence_interval_seconds=checkpoint_interval)
-                atomic_json(RUNTIME_PATH / "planner-status.json", status)
                 time.sleep(1)
                 continue
             was_holding = False
@@ -6846,14 +6892,14 @@ def run_supervisor() -> int:
         logging.error("another RAMCache supervisor already owns this runtime directory")
         return 1
     config_text, cfg = load_config()
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "hotseat-1.5.0-6da5e199c25c"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "hotseat-1.5.1-2f21cbae110b"))
     from hotseat_bridge import HotseatBridge
     hotseat = HotseatBridge(RUNTIME_PATH, enabled=True)
     hotseat.enabled = bool(cfg.get("hotseat_enabled", True))
     if not hotseat.enabled:
         hotseat.status = {"state": "disabled"}
     else:
-        native_build = read_json(Path(__file__).resolve().parent / "hotseat-1.5.0-6da5e199c25c" / "build-status.json", {})
+        native_build = read_json(Path(__file__).resolve().parent / "hotseat-1.5.1-2f21cbae110b" / "build-status.json", {})
         if not native_build.get("available", False):
             hotseat.status = {"state": "unavailable", "reason": native_build.get("reason", "native components not built")}
     cfg["_hotseat_owned"] = hotseat.owned
@@ -6939,7 +6985,12 @@ def run_supervisor() -> int:
                 if locked > worker.locked:
                     worker.last_progress = now
                 worker.locked = locked
-                if worker.proc.poll() is not None or worker.failed.is_set():
+                ready = worker.ready.is_set()
+                # Completed lockers cannot make loading progress. Check their
+                # exits on the unchanged one-second safety tick, rather than
+                # repeating waitpid for every recent-file control packet.
+                exited = (memory_tick or not ready) and worker.proc.poll() is not None
+                if exited or worker.failed.is_set():
                     workers.remove(worker)
                     signal_worker(worker)
                     retired.append((now, worker))
@@ -6951,7 +7002,6 @@ def run_supervisor() -> int:
                         failed_until[record_key(rec)] = retry
                     plan_changed = True
                     continue
-                ready = worker.ready.is_set()
                 if ready and not worker.acknowledged_at:
                     worker.acknowledged_at = now
                 if ready and worker.warnings:
@@ -6982,6 +7032,7 @@ def run_supervisor() -> int:
             # The two cache sections share one safety policy and one byte grant.
             owned_locked += hotseat.measured_locked
             inflight += max(0, hotseat.reserved-hotseat.measured_locked)
+            ownership_sizes = len(workers), len(retired)
             hotseat.sync_workers(workers, retired)
             release = 0
             if memory_tick:
@@ -7448,7 +7499,8 @@ def run_supervisor() -> int:
             busy = active_loading or (not holding and now >= admission.next_retry and
                                       (not validated or incoming is not None or plan_changed))
             # Publish newly launched ownership BEFORE accepting hot-seat claims.
-            hotseat.sync_workers(workers, retired)
+            if ownership_sizes != (len(workers), len(retired)):
+                hotseat.sync_workers(workers, retired)
             hotseat.poll(now)
             wait = .1 if busy else max(.01, monitor_interval-(time.monotonic()-last_memory_sample))
             descriptors = ([hotseat.peer] if hotseat.peer else [hotseat.server]) if hotseat.enabled else []
@@ -7731,7 +7783,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.5.0.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.5.1.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -7924,7 +7976,7 @@ install_packages() {
   elif command -v zypper >/dev/null 2>&1; then
     zypper --non-interactive install "$@"
   else
-    echo "ERROR: Install these dependencies with your package manager: $*" >&2
+    echo "Install these dependencies with your package manager: $*" >&2
     return 1
   fi
 }
@@ -9035,7 +9087,7 @@ RAMCACHE_VMTOUCH_SOURCE
     compiler=$(command -v cc || command -v gcc || true)
     if [[ -z "$compiler" ]] || ! "$compiler" -x c -O2 -Wall -Wextra "$staged_source" -o "$staged_binary" -lm; then
       rm -f "$staged_source" "$staged_binary"
-      echo "ERROR: bundled vmtouch could not be built; the running controller was left in place." >&2
+      echo "Bundled vmtouch could not be built; the running controller was left in place." >&2
       return 1
     fi
   fi
@@ -9051,7 +9103,7 @@ ensure_dependencies() {
   command -v python3 >/dev/null 2>&1 || packages+=(python3)
   command -v inotifywait >/dev/null 2>&1 || packages+=(inotify-tools)
   command -v systemctl >/dev/null 2>&1 || {
-    echo "ERROR: RAMCache requires a Linux system using systemd." >&2
+    echo "RAMCache requires a Linux system using systemd." >&2
     return 1
   }
   if ((${#packages[@]})); then
@@ -9066,11 +9118,11 @@ ensure_dependencies() {
     fi
   done
   if [[ -z "$PYTHON_BIN" ]]; then
-    echo "ERROR: Python 3.10 or newer with sqlite3 is required. Install it and rerun this command." >&2
+    echo "Python 3.10 or newer with sqlite3 is required. Install it and rerun this command." >&2
     return 1
   fi
   command -v inotifywait >/dev/null 2>&1 || {
-    echo "ERROR: inotify-tools could not be installed." >&2
+    echo "Could not install inotify-tools. Installation stopped." >&2
     return 1
   }
   if ! command -v vmtouch >/dev/null 2>&1; then
@@ -9127,7 +9179,7 @@ ensure_fs_watch_tools() {
 }
 
 write_hotseat() {
-  local target="/opt/ramcache-controller/hotseat-1.5.0-6da5e199c25c"
+  local target="/opt/ramcache-controller/hotseat-1.5.1-2f21cbae110b"
   local stage reason="" native_ok=1 requested=1 arch multiarch compiler
   local -a dependencies cflags libs extra_includes
   stage=$(mktemp -d /opt/ramcache-controller/.hotseat.XXXXXX) || return 1
@@ -9544,6 +9596,7 @@ class HotseatBridge:
                       "global_locked": base_requested + self.locked,
                       "pressure_released": self.pressure_ready, "regrown": self.growth_ready,
                       "ordinary_released": self.normal_ready,
+                      "measured_anon": self.measured_anon,
                       "pressure_before": self.pressure_before}):
             return 0
         self.pressure_ready = self.growth_ready = self.pressure_before = self.normal_ready = 0
@@ -10082,6 +10135,7 @@ class Sidecar:
         self.out_bytes = 0
         self.last_budget = time.monotonic()
         self.cap = self.revision = self.nominal = self.global_target = 0
+        self.measured_anon = 0
         self.registered = set()
         self.paused = True
         self.io_busy = False
@@ -10150,7 +10204,7 @@ class Sidecar:
         self.config_text = json.dumps(cfg, sort_keys=True)
         self.max_entries = min(65536, max(256, int(cfg.get("hotseat_max_files", 65536))))
         self.metadata_limit = min(256*MIB, max(8*MIB, int(cfg.get("hotseat_metadata_mib", 64))*MIB))
-        self.refresh_interval = max(1., float(cfg.get("hotseat_refresh_interval_seconds", 3600)))
+        self.refresh_interval = max(3600., float(cfg.get("hotseat_refresh_interval_seconds", 3600)))
         self.next_refresh = time.monotonic()
         self.selection_active = self.selection_replace = False
         self.selection_topup = False
@@ -10261,6 +10315,7 @@ class Sidecar:
                 now = time.monotonic()
                 previous = self.cap, self.paused, self.io_busy
                 self.cap = max(0, int(value["cap"]))
+                self.measured_anon = max(0, int(value.get("measured_anon", 0)))
                 self.revision = int(value["revision"])
                 self.registered = set(map(int, value.get("registered", [])))
                 self.nominal = int(value["nominal"])
@@ -10534,27 +10589,23 @@ class Sidecar:
         if self.paused:
             self.urgent_report |= previous_selected != self.selected_bytes
             return
-        # Content replacement is hourly. A smaller selection or a rising
-        # memory allowance can refill sooner without evicting healthy files.
-        # Remember an exhausted pool so whole-file tails cannot cause polling
-        # and reselection of the same candidates on every control heartbeat.
+        # After initial loading, file selection runs at most once per hour.
+        # Observe accesses cheaply between passes, but neither fresh events
+        # nor small gaps/allowance changes can wake selection early. Pressure
+        # downsizing above and immediate locker release remain independent.
         if limit < self.settled_limit:
             self.settled_limit = limit
             self.settled_selected = min(self.settled_selected, self.selected_bytes)
         if not self.selection_active:
-            periodic = now >= self.next_refresh
-            refill = (self.selected_bytes < self.settled_selected or limit > self.settled_limit or
-                      (self.selected_bytes + RELEASE_QUANTUM < limit and
-                       self.observation_generation != self.settled_observations))
-            if not periodic and not refill:
+            if now < self.next_refresh:
                 return
             self.selection_active = True
-            self.selection_replace = periodic
+            self.selection_replace = True
             self.selection_topup = False
             self.selection_candidates = collections.deque(key for _, key in sorted(self.pending.data))
             self.selection_discovery = collections.deque(reversed(self.unknown))
             self.selection_restore = len(self.restore)
-            self.counters["hourly_refreshes" if periodic else "refill_passes"] += 1
+            self.counters["hourly_refreshes"] += 1
         self.need_policy = False
         deferred = []
         for _ in range(64):
@@ -10952,16 +11003,10 @@ class Sidecar:
             self.metrics_dirty = False
         want = self.metrics.get("want", 0)
         pids = [self.observer.pid] + [w.proc.pid for w in self.lockers] + [w.proc.pid for w, _ in self.retired]
-        anon = 0
-        for pid in [os.getpid()]+pids:
-            try:
-                with open(f"/proc/{pid}/status") as source:
-                    for line in source:
-                        if line.startswith("RssAnon:"):
-                            anon += int(line.split()[1])*1024
-                            break
-            except OSError:
-                pass
+        # The supervisor already samples these exact registered processes for
+        # the shared safety policy every second. Reuse that sample instead of
+        # opening the same /proc status files again for a reporting heartbeat.
+        anon = self.measured_anon
         status = {"state": "observing" if self.observer_ready else "kernel self-test",
                   "selection_state": ("pressure paused" if self.paused else
                       "hourly refresh" if self.selection_active and self.selection_replace else
@@ -11895,7 +11940,7 @@ def preflight(directory, timeout=20):
     if reason:
         print("Hot-seat unavailable: "+reason, file=sys.stderr)
         return 1
-    print("Hot-seat kernel preflight passed: read, mmap, protected state and overflow recovery support.")
+    print("Recent-file cache checks passed.")
     return 0
 
 
@@ -11904,11 +11949,11 @@ def activation(directory, config=Path("/etc/ramcache-controller/config.json"),
     try:
         cfg = json.loads(config.read_text())
         if not cfg.get("hotseat_enabled", True):
-            print("Hot-seat disabled in configuration; the original cache remains enabled.")
+            print("Recent-file cache is disabled in settings.")
             return 0
         usable, reason = can_start(directory)
         if not usable:
-            print("Hot-seat NOT ACTIVE: "+reason, file=sys.stderr)
+            print("Recent-file cache unavailable: "+reason, file=sys.stderr)
             return 1
         result = subprocess.run(
             ["systemctl", "show", "ramcache-controller.service", "--property=MainPID", "--value"],
@@ -11926,17 +11971,17 @@ def activation(directory, config=Path("/etc/ramcache-controller/config.json"),
             if status.get("supervisor_pid") == pid:
                 hot = status.get("hotseat", {})
                 if hot.get("state") == "observing":
-                    print("Hot-seat ACTIVE: the running service passed its kernel self-tests.")
+                    print("Recent-file cache is active.")
                     return 0
                 if hot.get("state") == "unavailable":
-                    print("Hot-seat NOT ACTIVE: "+hot.get("reason", "see service journal"), file=sys.stderr)
+                    print("Recent-file cache unavailable: "+hot.get("reason", "see service journal"), file=sys.stderr)
                     return 1
             if time.monotonic() >= deadline:
-                print("Hot-seat activation was not confirmed within 10 seconds; check the service journal.", file=sys.stderr)
+                print("Recent-file cache is still starting. Check the service log for details.", file=sys.stderr)
                 return 1
             time.sleep(min(.25, max(0, deadline-time.monotonic())))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print("Hot-seat activation could not be verified: "+str(error), file=sys.stderr)
+        print("Could not confirm recent-file cache status: "+str(error), file=sys.stderr)
         return 1
 
 
@@ -12064,9 +12109,8 @@ HOTSEAT_BUILD_STATUS
 }
 
 report_hotseat_activation() {
-  if ! "$PYTHON_BIN" /opt/ramcache-controller/hotseat-1.5.0-6da5e199c25c/hotseat_probe.py activation; then
-    echo "RAMCache installation is retained. Inspect the hot-seat result with:" >&2
-    echo "  journalctl -u ramcache-hotseat.service -b --no-pager -n 60" >&2
+  if ! "$PYTHON_BIN" /opt/ramcache-controller/hotseat-1.5.1-2f21cbae110b/hotseat_probe.py activation; then
+    echo "Details: sudo journalctl -u ramcache-hotseat.service -b -n 60" >&2
   fi
 }
 
@@ -12084,7 +12128,7 @@ StartLimitBurst=5
 Type=exec
 User=root
 Group=root
-ExecStart=$PYTHON_BIN /opt/ramcache-controller/hotseat-1.5.0-6da5e199c25c/ramcache_hotseat.py
+ExecStart=$PYTHON_BIN /opt/ramcache-controller/hotseat-1.5.1-2f21cbae110b/ramcache_hotseat.py
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=30
@@ -12108,51 +12152,62 @@ UNIT
 
 install_all() {
   need_root
+  prepare_installer_log
   export DEBIAN_FRONTEND=noninteractive
-  ensure_dependencies
-  ensure_fs_watch_tools
+  printf 'Checking requirements...\n'
+  ensure_dependencies >>"$INSTALL_LOG" 2>&1
+  ensure_fs_watch_tools >>"$INSTALL_LOG" 2>&1
+  printf 'Preparing ramcache...\n'
   # Stage and validate both program and settings before replacing either.
-  write_controller
-  if ! write_hotseat; then
+  write_controller >>"$INSTALL_LOG" 2>&1
+  if ! write_hotseat >>"$INSTALL_LOG" 2>&1; then
     rm -f "$STAGED_CONTROLLER"
-    return 1
+    installer_failed 1
   fi
-  if ! write_config; then
+  if ! write_config >>"$INSTALL_LOG" 2>&1; then
     rm -f "$STAGED_CONTROLLER"
-    return 1
+    installer_failed 1
   fi
   mv -f "$STAGED_CONTROLLER" /opt/ramcache-controller/ramcache_controller.py
   install -d -m 700 /var/lib/ramcache-controller
-  "$PYTHON_BIN" /opt/ramcache-controller/ramcache_controller.py --seed-existing
+  "$PYTHON_BIN" /opt/ramcache-controller/ramcache_controller.py --seed-existing >>"$INSTALL_LOG" 2>&1
   write_service
   write_hotseat_service
   write_sysctls
-  systemctl daemon-reload
-  systemctl enable ramcache-controller.service
-  systemctl restart ramcache-controller.service
-  echo
-  echo "Installed RAMCache v1.5.0. Existing configuration and learned state are retained on updates."
-  echo "Status: sudo bash ramcache.sh diagnose"
-  echo "        systemctl status ramcache-controller.service --no-pager"
-  echo "        python3 -m json.tool /run/ramcache-controller/status.json"
+  printf 'Starting cache...\n'
+  systemctl daemon-reload >>"$INSTALL_LOG" 2>&1
+  systemctl enable ramcache-controller.service >>"$INSTALL_LOG" 2>&1
+  systemctl restart ramcache-controller.service >>"$INSTALL_LOG" 2>&1
+  if [[ "${RAMCACHE_VERBOSE:-0}" == 1 ]]; then cat "$INSTALL_LOG"; fi
+  if [[ "$ACTION" == update ]]; then
+    printf '\nUpdated ramcache to 1.5.1. Settings and learned state kept.\n'
+  else
+    printf '\nInstalled ramcache 1.5.1. Filling runs in the background.\n'
+  fi
   report_hotseat_activation
+  printf 'Initialization after an install or update can take several minutes.\n'
+  printf 'Future reboots use the saved plan for a much faster start.\n'
+  printf 'Status: sudo bash ramcache.sh diagnose\n'
+  trap - ERR
+  exec 4>&-
 }
 
 uninstall_all() {
   need_root
+  printf 'Removing ramcache...\n'
   local unit="ramcache-controller.service"
   local load_state output legacy legacy_compact
 
   # Distinguish an absent unit from a real systemd/bus failure. Do not delete
   # bookkeeping while an unreachable or un-stoppable service can recreate it.
   if ! systemctl show --property=Version --value >/dev/null; then
-    echo "ERROR: cannot contact systemd; RAMCache files were left in place." >&2
+    echo "Could not contact systemd. Ramcache files were kept." >&2
     return 1
   fi
   load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
   if [[ "${load_state:-not-found}" != "not-found" ]] || systemctl is-active --quiet "$unit"; then
     if ! output="$(systemctl stop "$unit" 2>&1)"; then
-      echo "ERROR: could not stop RAMCache; bookkeeping was left in place." >&2
+      echo "Could not stop ramcache. Its files were kept." >&2
       echo "$output" >&2
       return 1
     fi
@@ -12160,7 +12215,7 @@ uninstall_all() {
     # A subsequent kill on this now-empty unit only produced false errors.
     if [[ -f /etc/systemd/system/ramcache-controller.service ]]; then
       if ! output="$(systemctl disable "$unit" 2>&1)"; then
-        echo "ERROR: could not disable RAMCache." >&2
+        echo "Could not disable ramcache." >&2
         echo "$output" >&2
         return 1
       fi
@@ -12169,7 +12224,7 @@ uninstall_all() {
     # old reset-failed-after-removal "unit not loaded" message.
     if [[ -f /etc/systemd/system/ramcache-controller.service ]] || systemctl is-failed --quiet "$unit"; then
       if ! output="$(systemctl reset-failed "$unit" 2>&1)"; then
-        echo "ERROR: could not clear RAMCache's systemd failure state." >&2
+        echo "Could not clear the service failure state." >&2
         echo "$output" >&2
         return 1
       fi
@@ -12196,20 +12251,11 @@ uninstall_all() {
 
   systemctl daemon-reload
 
-  echo
-  echo "Removed ramcache-controller."
-  echo "Removed program, settings, inventory, saved plans, learned state and runtime bookkeeping:"
-  echo "  /etc/ramcache-controller"
-  echo "  /opt/ramcache-controller"
-  echo "  /run/ramcache-controller"
-  echo "  /var/lib/ramcache-controller"
-  echo "  /etc/systemd/system/ramcache-controller.service"
-  echo "  /etc/sysctl.d/99-ramcache-inotify.conf"
-  echo "  /etc/sysctl.d/99-ramcache-vm.conf"
+  printf 'Removed ramcache, its settings, and saved state.\n'
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.5.0"
+  echo "RAM cache controller installer: v1.5.1"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
