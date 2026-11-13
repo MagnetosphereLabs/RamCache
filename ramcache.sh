@@ -87,7 +87,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.5.1"
+CONTROLLER_VERSION = "1.5.2"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -5602,6 +5602,8 @@ def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
     checkpoint_error = ""
     inventory_count = db.count()
     reported_state = None
+    low_ram_fill_pending = cfg.get("memory_profile") == "low_ram"
+    low_ram_fill_generation = None
     try:
         if watcher.proc is None:
             try:
@@ -5618,7 +5620,39 @@ def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
             control = discovery_control()
             requested = control.get("boot_refresh_request") == boot_id
             paused = bool(control.get("boot_refresh_paused", True))
-            if requested and not completed and not paused:
+            if low_ram_fill_pending and completed and "low_ram_fill_gap_bytes" in control:
+                if control["low_ram_fill_gap_bytes"] > 128 * MIB:
+                    completed = False
+                    state = "waiting for initial fill"
+                else:
+                    low_ram_fill_pending = False
+            if requested and not completed and not paused and low_ram_fill_pending:
+                if low_ram_fill_generation is not None:
+                    if control.get("boot_refresh_applied") == low_ram_fill_generation:
+                        low_ram_fill_pending = False
+                elif "low_ram_fill_gap_bytes" not in control:
+                    pass  # Wait for a fresh, fully validated supervisor plan.
+                elif control["low_ram_fill_gap_bytes"] <= 128 * MIB:
+                    low_ram_fill_pending = False
+                else:
+                    # A partial saved selection is not a full cache. On the
+                    # low-RAM path only, reuse the existing priority index
+                    # before waiting for the entire boot directory refresh.
+                    # The supervisor still validates every candidate and uses
+                    # its unchanged memory/pressure admission checks.
+                    try:
+                        previous_digest = db.meta("plan_digest")
+                        db.publish(cfg, roots, reason="low-RAM initial fill")
+                        if db.meta("plan_digest") != previous_digest:
+                            pending_generation = low_ram_fill_generation = db.meta("saved_plan_header", {}).get("generation")
+                            reuse_safe = False
+                            state = "waiting for cache update"
+                            db.checkpoint(reason="low-RAM initial fill")
+                        else:
+                            low_ram_fill_pending = False
+                    except PlanDeferred:
+                        pass
+            if requested and not completed and not paused and not low_ram_fill_pending:
                 if refresh is None:
                     marker = read_json(RUNTIME_PATH / "boot-watch.json", {}) or {}
                     evidence = BootEvidence(db, boot_id, marker.get("token"))
@@ -7373,6 +7407,9 @@ def run_supervisor() -> int:
                     "boot_refresh_paused": bool(pause or io_busy or active_loading or pending_chunks or retired
                                                 or (not holding and boot_apply_generation is None)),
                     "boot_refresh_applied": boot_applied_generation,
+                    **({"low_ram_fill_gap_bytes": max(0, budget-candidate_bytes)}
+                       if (cfg.get("memory_profile") == "low_ram" and validated and incoming is None
+                           and not active_loading and not pending_chunks and not retired) else {}),
                 })
                 actual = sum(worker.locked for worker in workers)
                 requested = sum(worker.requested for worker in workers)
@@ -7380,7 +7417,9 @@ def run_supervisor() -> int:
                     fill_state = "memory pressure or reserve"
                 elif (boot_requested and not planner_status.get("boot_refresh_completed")
                       and planner_status.get("phase") == "boot-refresh" and not active_loading):
-                    fill_state = "cache filled; completing once-per-boot refresh"
+                    fill_state = ("expanding cache selection; completing once-per-boot refresh"
+                                  if cfg.get("memory_profile") == "low_ram" and candidate_bytes + 128 * MIB < budget
+                                  else "cache filled; completing once-per-boot refresh")
                 elif holding and not active_loading:
                     fill_state = "holding cache; discovery and selection asleep"
                 elif pending_chunks or active_loading:
@@ -7783,7 +7822,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.5.1.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.5.2.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -12180,9 +12219,9 @@ install_all() {
   systemctl restart ramcache-controller.service >>"$INSTALL_LOG" 2>&1
   if [[ "${RAMCACHE_VERBOSE:-0}" == 1 ]]; then cat "$INSTALL_LOG"; fi
   if [[ "$ACTION" == update ]]; then
-    printf '\nUpdated ramcache to 1.5.1. Settings and learned state kept.\n'
+    printf '\nUpdated ramcache to 1.5.2. Settings and learned state kept.\n'
   else
-    printf '\nInstalled ramcache 1.5.1. Filling runs in the background.\n'
+    printf '\nInstalled ramcache 1.5.2. Filling runs in the background.\n'
   fi
   report_hotseat_activation
   printf 'Initialization after an install or update can take several minutes.\n'
@@ -12255,7 +12294,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.5.1"
+  echo "RAM cache controller installer: v1.5.2"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
