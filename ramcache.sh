@@ -10,9 +10,85 @@ need_root() {
   fi
 }
 
+UPGRADE_DIR=/opt/ramcache-controller/.upgrade-1.5.3
+UPGRADE_ACTIVE=0
+upgrade_files=(
+  /opt/ramcache-controller/ramcache_controller.py
+  /etc/ramcache-controller/config.json
+  /etc/systemd/system/ramcache-controller.service
+  /etc/systemd/system/ramcache-hotseat.service
+  /etc/sysctl.d/99-ramcache-inotify.conf
+)
+
+restore_upgrade() {
+  [[ -f "$UPGRADE_DIR/ready" ]] || return 0
+  local path name temp
+  if [[ -f "$UPGRADE_DIR/switching" ]]; then
+    systemctl stop ramcache-controller.service >>"$INSTALL_LOG" 2>&1 || return 1
+  fi
+  for path in "${upgrade_files[@]}"; do
+    name="${path##*/}"
+    if [[ -e "$UPGRADE_DIR/$name" ]]; then
+      temp=$(mktemp "${path}.restore.XXXXXX") || return 1
+      cp -p -- "$UPGRADE_DIR/$name" "$temp" && mv -f -- "$temp" "$path" || return 1
+    else
+      rm -f -- "$path" || return 1
+    fi
+  done
+  systemctl daemon-reload >>"$INSTALL_LOG" 2>&1 || return 1
+  if [[ -f "$UPGRADE_DIR/switching" && -f "$UPGRADE_DIR/running" ]]; then
+    systemctl start ramcache-controller.service >>"$INSTALL_LOG" 2>&1 || return 1
+  fi
+  if [[ -f "$UPGRADE_DIR/disabled" ]]; then
+    systemctl disable ramcache-controller.service >>"$INSTALL_LOG" 2>&1 || return 1
+  fi
+  rm -rf -- "$UPGRADE_DIR"
+}
+
+prepare_upgrade() {
+  local path stage
+  [[ -f "${upgrade_files[0]}" ]] || return 0
+  stage=$(mktemp -d /opt/ramcache-controller/.upgrade-stage.XXXXXX)
+  for path in "${upgrade_files[@]}"; do
+    if [[ -e "$path" ]]; then cp -p -- "$path" "$stage/"; fi
+  done
+  if systemctl is-active --quiet ramcache-controller.service; then touch "$stage/running"; fi
+  if ! systemctl is-enabled --quiet ramcache-controller.service; then touch "$stage/disabled"; fi
+  touch "$stage/ready"
+  mv -T -- "$stage" "$UPGRADE_DIR"
+  UPGRADE_ACTIVE=1
+}
+
+verify_started_controller() {
+  "$PYTHON_BIN" - <<'RAMCACHE_VERIFY'
+import json, subprocess, sys, time
+from pathlib import Path
+path = Path('/run/ramcache-controller/status.json')
+deadline = time.monotonic()+60
+while time.monotonic()<deadline:
+    try:
+        status = json.loads(path.read_text())
+        pid = int(subprocess.check_output(['systemctl','show','-p','MainPID','--value','ramcache-controller.service']))
+        if (pid>0 and status.get('supervisor_pid')==pid and status.get('controller_version')=='1.5.3'
+                and abs(time.time()-status['timestamp'])<10):
+            sys.exit(0)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        pass
+    time.sleep(.25)
+sys.exit("new supervisor did not publish a fresh 1.5.3 status")
+RAMCACHE_VERIFY
+}
+
 installer_failed() {
   local code="$1"
   trap - ERR
+  if [[ "$UPGRADE_ACTIVE" == 1 ]]; then
+    if restore_upgrade; then
+      printf 'Restored the previous controller and its settings.\n' >&4
+    else
+      printf 'Previous release retained at %s. Re-run update to resume rollback.\n' "$UPGRADE_DIR" >&4
+    fi
+  fi
   # A failing step may have its stderr redirected into the log. Keep the
   # original terminal available so failures can never disappear into it.
   printf '\nCould not complete the %s.\n' "$ACTION" >&4
@@ -72,7 +148,7 @@ import stat
 import subprocess
 import threading
 import time
-from collections import deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -87,7 +163,7 @@ GIB = 1024 ** 3
 
 RUNNING = True
 CONTROLLER_WAKE_EVENT = threading.Event()
-CONTROLLER_VERSION = "1.5.2"
+CONTROLLER_VERSION = "1.5.3"
 STATE_PATH = Path("/var/lib/ramcache-controller")
 RUNTIME_PATH = Path("/run/ramcache-controller")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -3772,30 +3848,64 @@ def explicit_plan_file_limit(cfg: dict) -> Optional[int]:
     return value if value > 0 else None
 
 
+class ChunkQueue(deque):
+    searched = 0
+    exhausted = False
+    minimum_deferred = float("inf")
+
+
 def pop_fitting_chunk(pending, free_room, inflight, inflight_limit, excluded=()):
-    # Rotate deferred chunks instead of letting one large file block every
-    # smaller, higher-value read behind it. Bounded work per control tick.
+    # A bounded slice can yield to the memory monitor without exhausting the queue.
+    persistent = isinstance(pending, ChunkQueue)
+    room = min(free_room, inflight_limit-inflight) if inflight else free_room
+    if persistent and room >= pending.minimum_deferred:
+        pending.searched, pending.minimum_deferred = 0, float("inf")
+    checked = min(len(pending),pending.searched) if persistent else 0
+    visited = 0
     oversized = None
-    for _ in range(min(len(pending), 128)):
+    for _ in range(min(len(pending)-checked, 128)):
         chunk = pending.popleft()
         if excluded:
-            chunk = [rec for rec in chunk if (rec.dev, rec.ino) not in excluded]
+            chunk = [r for r in chunk if (r.dev, r.ino) not in excluded]
             if not chunk:
                 continue
-        cost = sum(page_bytes(rec.size) for rec in chunk)
-        if cost <= free_room and (inflight == 0 or inflight + cost <= inflight_limit):
-            if cost > inflight_limit and oversized is None:
-                oversized = (chunk, cost)
-                continue
+        cost = sum(page_bytes(r.size) for r in chunk)
+        minimum = cost
+        if cost > room and len(chunk)>1 and not any(r.budget == "vrchat_content_cache" for r in chunk):
+            fits, later, total = [], [], 0
+            for r in chunk:
+                size = page_bytes(r.size)
+                minimum = min(minimum,size)
+                if total+size <= room:
+                    fits.append(r)
+                    total += size
+                else:
+                    later.append(r)
+            if fits:
+                pending.appendleft(later)
+                chunk, cost = fits, total
+        if cost <= room and (cost <= inflight_limit or oversized is None):
             if cost > inflight_limit:
-                pending.append(chunk)
+                oversized = chunk, cost
                 continue
-            if oversized is not None:
+            if oversized:
                 pending.appendleft(oversized[0])
+            if persistent:
+                pending.searched, pending.exhausted, pending.minimum_deferred = 0, False, float("inf")
             return chunk, cost
+        elif cost > room and persistent:
+            pending.minimum_deferred = min(pending.minimum_deferred, minimum)
         pending.append(chunk)
-    if oversized is not None:
+        visited += 1
+    if oversized:
+        if persistent:
+            pending.searched, pending.exhausted, pending.minimum_deferred = 0, False, float("inf")
         return oversized
+    if persistent:
+        pending.searched = checked + visited
+        pending.exhausted = pending.searched >= len(pending)
+        if pending.exhausted:
+            pending.searched = 0
     return None, 0
 
 
@@ -4022,6 +4132,12 @@ class CacheWorker:
     acknowledged_at: float = 0.0
     last_sample: float = 0.0
     compaction_alias: bool = False
+    short_ack: bool = False
+
+    @property
+    def key(self):
+        return getattr(self.proc, "group_key", self.proc.pid)
+
 
 
 def start_cache_worker(records: list[FileRec], cfg: dict) -> CacheWorker:
@@ -4121,19 +4237,25 @@ def signal_worker(worker: CacheWorker) -> None:
         pass
 
 
-def reap_workers(retired: list[tuple[float, CacheWorker]]) -> None:
+def reap_workers(retired):
     now = time.monotonic()
-    for started, worker in list(retired):
+    keep = []
+    for started, worker in retired:
         if worker.proc.poll() is not None:
-            retired.remove((started, worker))
-        elif now - started > 2:
+            continue
+        keep.append((started,worker))
+        if now-started > 2:
             try:
                 worker.proc.kill()
             except ProcessLookupError:
                 pass
+    changed = len(keep) != len(retired)
+    if changed:
+        retired[:] = keep
+    return changed
 
 
-def worker_task_headroom():
+def worker_task_headroom(*, detail=False):
     """Respect this service's PID limit and any tighter parent limit."""
     root = Path('/sys/fs/cgroup')
     try:
@@ -4146,15 +4268,16 @@ def worker_task_headroom():
                 maximum = (current / 'pids.max').read_text().strip()
                 if maximum != 'max':
                     used = int((current / 'pids.current').read_text())
-                    available.append(max(0, int(maximum) - used))
+                    available.append((max(0, int(maximum) - used), str(current)))
             except (OSError, ValueError):
                 pass
             if current == root:
                 break
             current = current.parent
-        return min(available) if available else None
+        result = min(available) if available else (None, None)
     except (OSError, StopIteration):
-        return None
+        result = (None, None)
+    return result if detail else result[0]
 
 
 def compactable_workers(workers, cfg):
@@ -4172,7 +4295,8 @@ def compactable_workers(workers, cfg):
         limit = min(stable, 64*MIB) if mutable else stable
         if worker.requested > limit//2:
             continue
-        key = first.priority[:1], mutable
+        unit = vrchat_content_cache_unit_root(first.path) if first.budget == "vrchat_content_cache" else None
+        key = first.priority[:1], mutable, unit
         selected, size, paths = groups.get(key, ([], 0, 0))
         if len(selected) < 64 and size + worker.requested <= limit and paths + len(worker.records) <= maximum_paths:
             selected.append(worker)
@@ -4217,20 +4341,22 @@ class WorkerAdmission:
         self.next_retry = self.next_compaction = 0.0
         self.streak = self.failures = self.compactions = self.removed = 0
         self.error = ''
-        self.headroom = None
+        self.headroom = self.limiting_group = None
+        self.merge_retry = {}
         self.copy = None
         self.sources = []
         self.copy_timeout = 120
 
-    def can_start(self, now, *, compaction=False):
-        if now < self.next_retry:
+    def can_start(self, now, *, compaction=False, native=False):
+        if not compaction and now < self.next_retry:
             return False
-        self.headroom = worker_task_headroom()
+        self.headroom, self.limiting_group = worker_task_headroom(detail=True)
         # Popen plus the reader and feeder need three task slots. Keep room
         # for metadata/control threads, and more for consolidation to recover.
-        reserve = 4 if compaction else 32
-        if self.headroom is not None and self.headroom < reserve + 3:
-            self.next_retry = now + 1
+        required = 6 if native else (7 if compaction else 35)
+        if self.headroom is not None and self.headroom < required:
+            if not compaction:
+                self.next_retry = now + 1
             self.error = 'waiting for cache-worker task slots'
             return False
         return True
@@ -4260,8 +4386,9 @@ class WorkerAdmission:
         live = {id(w) for w in workers}
         valid = all(id(w) in live and not w.failed.is_set() for w in self.sources)
         if worker.proc.poll() is not None or worker.failed.is_set() or not valid:
+            self.merge_retry.update((w.key, now+30) for w in self.sources)
             self.cancel(retired, now)
-            self.next_compaction = now + 30
+            self.next_compaction = now + 1
             return
         locked, _ = process_memory(worker.proc.pid)
         if locked > worker.locked:
@@ -4270,8 +4397,9 @@ class WorkerAdmission:
         if worker.ready.is_set():
             valid = (sorted(record_key(r) for w in self.sources for r in w.records) == sorted(record_key(r) for r in worker.records))
             if worker.warnings or worker.reported_pages*PAGE_SIZE != worker.requested or not valid or not worker_mappings_match(worker):
+                self.merge_retry.update((w.key, now+30) for w in self.sources)
                 self.cancel(retired, now)
-                self.next_compaction = now + 30
+                self.next_compaction = now + 1
                 return
             # The replacement has acknowledged every page before any healthy
             # source is stopped. Both processes map the same page-cache pages.
@@ -4295,19 +4423,21 @@ class WorkerAdmission:
             self.succeeded()
             return previous, worker
         elif now - worker.last_progress > self.copy_timeout:
+            self.merge_retry.update((w.key, now+30) for w in self.sources)
             self.cancel(retired, now)
-            self.next_compaction = now + 30
+            self.next_compaction = now + 1
 
     def consolidate(self, workers, cfg, now):
-        if self.copy is not None or now < max(self.next_compaction, self.next_retry):
+        if self.copy is not None or now < self.next_compaction:
             return
         self.next_compaction = now + 1
-        self.headroom = worker_task_headroom()
+        self.headroom, self.limiting_group = worker_task_headroom(detail=True)
         crowded = self.headroom is not None and self.headroom < 96
         fragmented = len(workers) >= 128 and sum(w.requested for w in workers) < len(workers)*32*MIB
         if not (crowded or fragmented):
             return
-        selected, records = compactable_workers(workers, cfg)
+        self.merge_retry = {k:t for k,t in self.merge_retry.items() if t > now}
+        selected, records = compactable_workers((w for w in workers if w.key not in self.merge_retry), cfg)
         if not selected or not self.can_start(now, compaction=True):
             return
         try:
@@ -4325,40 +4455,28 @@ def worker_chunks(records: list[FileRec], cfg: dict):
                        256 * MIB)
     mutable_limit = min(stable_limit, 64 * MIB)
     max_paths = min(8192, int(cfg.get("vmtouch_chunk_max_paths", 8192)))
-    # Keep stable and mutable mappings in separate workers, but do not flush
-    # on every alternation between them. That creates one sleeping process per
-    # tiny file in interleaved plans, exhausting TasksMax and making every
-    # memory-monitor tick poll thousands of otherwise idle processes.
-    buffers = {False: [], True: []}
-    sizes = {False: 0, True: 0}
-    first = {}
-    previous_role = None
-
-    def flush():
-        for kind in sorted(first, key=first.get):
-            yield buffers[kind]
-            buffers[kind] = []
-            sizes[kind] = 0
-        first.clear()
-
-    for position, rec in enumerate(records):
-        # Preserve priority-tier boundaries; per-file learning/recency ranks
-        # can differ for every path and must not fragment the batches again.
-        role = rec.priority[:1]
-        if first and role != previous_role:
-            yield from flush()
+    max_paths = max(1, min(max_paths, cfg.get("_holder_map_limit", max_paths)))
+    file_limit = cfg.get("_holder_lock_limit", -1)
+    if file_limit >= 0:
+        stable_limit, mutable_limit = min(stable_limit, file_limit), min(mutable_limit, file_limit)
+    buffers, packed = {}, []
+    isolation = cfg.get("_legacy_batch_limit", {})
+    for rec in records:
         mutable = bool(rec.budget) or any(marker in rec.path.lower() for marker in (
             "/.config/", "/.cache/", "/.mozilla/", "/.var/app/", "/config/", "/pfx/"))
-        limit = mutable_limit if mutable else stable_limit
+        cap = isolation.get(record_key(rec), max_paths) if isolation else max_paths
+        unit = vrchat_content_cache_unit_root(rec.path) if rec.budget == "vrchat_content_cache" else None
+        key = rec.priority[:1], mutable, cap, unit
+        items, size = buffers.get(key, ([], 0))
         cost = page_bytes(rec.size)
-        if buffers[mutable] and (sizes[mutable] + cost > limit or len(buffers[mutable]) >= max_paths):
-            yield from flush()
-        if not buffers[mutable]:
-            first[mutable] = position
-        buffers[mutable].append(rec)
-        sizes[mutable] += cost
-        previous_role = role
-    yield from flush()
+        if items and (size + cost > (mutable_limit if mutable else stable_limit) or len(items) >= cap):
+            packed.append(items)
+            items, size = [], 0
+        items.append(rec)
+        buffers[key] = items, size + cost
+    packed.extend(items for items, _ in buffers.values())
+    yield from sorted(packed, key=lambda items: (items[0].priority, items[0].path))
+
 
 DB_SCHEMA = 1
 
@@ -4463,6 +4581,8 @@ def discovery_control():
 
 def discovery_is_parked():
     control = discovery_control()
+    if control.get("startup_index_state") in ("needed","paused"):
+        return control["startup_index_state"] == "paused"
     if control.get("boot_refresh_request") and not control.get("boot_refresh_paused", True):
         return False
     return bool(control.get("cache_holding") or control.get("refill_from_plan"))
@@ -5187,6 +5307,7 @@ class InventoryDB:
             self.connection.execute("BEGIN")
         self.connection.execute("SAVEPOINT publish_plan")
         self.connection.execute("DELETE FROM plan_members")
+        rebuild_rows = (RUNTIME_PATH / "plan-invalid.json").exists()
         byte_count = count = 0
         digest = hashlib.sha256()
         try:
@@ -5261,9 +5382,13 @@ class InventoryDB:
                             chosen_units.add(unit)
                     inodes.add(identity)
                     previous_line, changed_path = tail[7], tail[8]
-                    reuse = previous_line is not None and changed_path is None
+                    reuse = previous_line is not None and changed_path is None and not rebuild_rows
                     if reuse:
                         line = previous_line
+                        if not line.endswith("\n"):
+                            # Older/imported SQLite rows can be valid JSON without a JSONL delimiter.
+                            line += "\n"
+                            reuse = False
                     else:
                         rec = FileRec(path_text, size, stamp, mode, dev, ino, mtime_ns, ctime_ns,
                                        priority, budget)
@@ -5602,8 +5727,9 @@ def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
     checkpoint_error = ""
     inventory_count = db.count()
     reported_state = None
-    low_ram_fill_pending = cfg.get("memory_profile") == "low_ram"
-    low_ram_fill_generation = None
+    saved_generation = db.meta("saved_plan_header", {}).get("generation")
+    indexed_fill_pending = db.meta("indexed_fill_receipt") != [boot_id, config_signature, saved_generation]
+    indexed_fill_generation = None
     try:
         if watcher.proc is None:
             try:
@@ -5618,41 +5744,49 @@ def run_boot_planner(db, cfg, roots, boot_id, watcher=None, observer=None):
         while RUNNING:
             now = time.monotonic()
             control = discovery_control()
+            if (control.get("startup_index_state")=="needed" and inventory_count and
+                    (RUNTIME_PATH/"plan-invalid.json").exists()):
+                try:
+                    db.publish(cfg,roots,reason="repair saved plan")
+                    db.checkpoint(reason="repair saved plan")
+                except PlanDeferred:
+                    pass
             requested = control.get("boot_refresh_request") == boot_id
             paused = bool(control.get("boot_refresh_paused", True))
-            if low_ram_fill_pending and completed and "low_ram_fill_gap_bytes" in control:
-                if control["low_ram_fill_gap_bytes"] > 128 * MIB:
+            if indexed_fill_pending and completed and "indexed_fill_gap_bytes" in control:
+                if control["indexed_fill_gap_bytes"] > 128 * MIB:
                     completed = False
                     state = "waiting for initial fill"
                 else:
-                    low_ram_fill_pending = False
-            if requested and not completed and not paused and low_ram_fill_pending:
-                if low_ram_fill_generation is not None:
-                    if control.get("boot_refresh_applied") == low_ram_fill_generation:
-                        low_ram_fill_pending = False
-                elif "low_ram_fill_gap_bytes" not in control:
+                    indexed_fill_pending = False
+            if requested and not completed and not paused and indexed_fill_pending:
+                if indexed_fill_generation is not None:
+                    if control.get("boot_refresh_applied") == indexed_fill_generation:
+                        indexed_fill_pending = False
+                elif "indexed_fill_gap_bytes" not in control:
                     pass  # Wait for a fresh, fully validated supervisor plan.
-                elif control["low_ram_fill_gap_bytes"] <= 128 * MIB:
-                    low_ram_fill_pending = False
+                elif control["indexed_fill_gap_bytes"] <= 128 * MIB:
+                    indexed_fill_pending = False
                 else:
                     # A partial saved selection is not a full cache. On the
-                    # low-RAM path only, reuse the existing priority index
+                    # saved-plan path, reuse the existing priority index
                     # before waiting for the entire boot directory refresh.
                     # The supervisor still validates every candidate and uses
                     # its unchanged memory/pressure admission checks.
                     try:
                         previous_digest = db.meta("plan_digest")
-                        db.publish(cfg, roots, reason="low-RAM initial fill")
+                        db.publish(cfg, roots, reason="indexed initial fill")
+                        db.set_meta("indexed_fill_receipt", [boot_id,config_signature,db.meta("saved_plan_header", {}).get("generation")])
                         if db.meta("plan_digest") != previous_digest:
-                            pending_generation = low_ram_fill_generation = db.meta("saved_plan_header", {}).get("generation")
+                            pending_generation = indexed_fill_generation = db.meta("saved_plan_header", {}).get("generation")
                             reuse_safe = False
                             state = "waiting for cache update"
-                            db.checkpoint(reason="low-RAM initial fill")
+                            db.checkpoint(reason="indexed initial fill")
                         else:
-                            low_ram_fill_pending = False
+                            indexed_fill_pending = False
                     except PlanDeferred:
                         pass
-            if requested and not completed and not paused and not low_ram_fill_pending:
+            if requested and not completed and not paused and not indexed_fill_pending:
                 if refresh is None:
                     marker = read_json(RUNTIME_PATH / "boot-watch.json", {}) or {}
                     evidence = BootEvidence(db, boot_id, marker.get("token"))
@@ -5909,6 +6043,21 @@ def run_planner() -> int:
     policy_upgrade = (db.meta("policy_version", 0) != POLICY_VERSION
                       or db.meta("saved_plan_header", {}).get("startup_context") != startup_policy_context())
     boot_id = current_boot_id()
+    if boot_id is not None and (first_install or policy_upgrade) and db.count():
+        # A changed policy context or lost plan header can be repaired straight
+        # from indexed metadata. Only an empty inventory needs bootstrap discovery.
+        try:
+            db.refresh_startup_policy()
+            while RUNNING:
+                try:
+                    db.publish(cfg,roots,reason="saved policy replay")
+                    db.checkpoint(reason="saved policy replay")
+                    break
+                except PlanDeferred:
+                    time.sleep(.5)
+            return run_boot_planner(db,cfg,roots,boot_id) if RUNNING else 0
+        finally:
+            db.close()
     if boot_id is not None and not first_install and not policy_upgrade:
         try:
             return run_boot_planner(db, cfg, roots, boot_id)
@@ -6607,30 +6756,69 @@ class UsageObserver:
             thread.join(timeout=1)
 
 @contextlib.contextmanager
-def startup_plan_source():
+def startup_plan_source(skipped=()):
     """Prefer live RAM state, then the incremental checkpoint, then v1.4 JSON."""
     live = RUNTIME_PATH / "startup-plan.jsonl"
     legacy = STATE_PATH / "startup-plan.jsonl"
     if live.exists():
         with live.open(encoding="utf-8") as source:
             st = os.fstat(source.fileno())
-            yield (("live", st.st_ino, st.st_mtime_ns, st.st_size), iter(lambda: source.readline(65537), ""))
-        return
+            identity = ("live", st.st_ino, st.st_mtime_ns, st.st_size)
+            if identity not in skipped:
+                yield identity, iter(lambda: source.readline(65537), "")
+                return
     database = STATE_PATH / "inventory.sqlite3"
     if database.exists():
         connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
         try:
             row = connection.execute("SELECT value FROM meta WHERE key='saved_plan_header'").fetchone()
             if row:
-                header = json.loads(row[0])
-                rows = connection.execute("SELECT record FROM saved_plan ORDER BY k0,k1,k2,k3,k4,path")
-                yield (("checkpoint", header["generation"]), itertools.chain([row[0]], (item[0] for item in rows)))
-                return
+                try:
+                    identity = ("checkpoint",json.loads(row[0])["generation"])
+                except (TypeError,ValueError,KeyError):
+                    if not legacy.exists():
+                        raise
+                else:
+                    if identity not in skipped:
+                        rows = connection.execute("SELECT record FROM saved_plan ORDER BY k0,k1,k2,k3,k4,path")
+                        yield identity, itertools.chain([row[0]], (item[0] for item in rows))
+                        return
         finally:
             connection.close()
     with legacy.open(encoding="utf-8") as source:
         st = os.fstat(source.fileno())
-        yield (("legacy", st.st_ino, st.st_mtime_ns, st.st_size), iter(lambda: source.readline(65537), ""))
+        identity = ("legacy", st.st_ino, st.st_mtime_ns, st.st_size)
+        if identity in skipped:
+            raise FileNotFoundError("waiting for a usable saved plan")
+        yield identity, iter(lambda: source.readline(65537), "")
+
+
+def ranked_changes(changes):
+    """Read learning rows only for the bounded set that needs reclassification."""
+    if not changes:
+        return []
+    usage = {}
+    db = STATE_PATH / "inventory.sqlite3"
+    if db.is_file():
+        with contextlib.closing(sqlite3.connect(db.resolve().as_uri()+"?mode=ro", uri=True, timeout=1)) as con:
+            for start in range(0, len(changes), 256):
+                paths = [os.fsencode(r.path) for r in changes[start:start+256]]
+                slots = ",".join("?" for _ in paths)
+                usage.update((path, (hits, stamp)) for path, hits, stamp in con.execute(
+                    "SELECT path,hits,last_use FROM usage WHERE path IN ("+slots+")", paths))
+    return [FileRec(r.path, r.size, r.mtime, r.mode, r.dev, r.ino, r.mtime_ns, r.ctime_ns, rank, family)
+            if rank is not None else None for r, rank, family, _ in
+            classify_batch([(r, *usage.get(os.fsencode(r.path), (0, 0))) for r in changes])]
+
+
+def same_rank_inputs(a, b):
+    return (a.dev, a.ino, a.size, a.mtime_ns, a.mode) == (b.dev, b.ino, b.size, b.mtime_ns, b.mode)
+
+
+def refreshed_record(actual, saved):
+    rank = tuple(-actual.mtime if v == -saved.mtime and i > 1 else v for i,v in enumerate(saved.priority))
+    return FileRec(actual.path, actual.size, actual.mtime, actual.mode, actual.dev, actual.ino,
+                   actual.mtime_ns, actual.ctime_ns, rank, saved.budget)
 
 
 class PlanReader:
@@ -6638,11 +6826,51 @@ class PlanReader:
         self.cfg, self.roots = cfg, roots
         self.messages = queue.Queue(maxsize=8)
         self.stop = threading.Event()
+        self.force_read = threading.Event()
+        self.retry_ready = threading.Event()
+        self.retry_paths = OrderedDict()
+        self.retry_lock = threading.Lock()
+        self.next_retry_check = 0.
+        cfg["_retry_saved_path"] = self.defer_file
         self.paused = threading.Event()
         self.reuse_records = {}
         self.reuse_generation = None
         self.thread = threading.Thread(target=self.run, daemon=True, name="startup-plan-validation")
         self.thread.start()
+
+    def defer_file(self, record):
+        # One representative path per inaccessible directory/device. All names
+        # remain in the durable inventory and a returning mount triggers replay.
+        try:
+            os.lstat(record.path)
+            return
+        except OSError as error:
+            if error.errno in (errno.ENOENT,errno.ENOTDIR) and confirmed_absence(
+                    record.path,self.cfg,self.roots,record.dev):
+                return
+        key = (os.path.dirname(record.path),record.dev)
+        with self.retry_lock:
+            self.retry_paths.setdefault(key,record.path)
+
+    def probe_deferred(self):
+        now = time.monotonic()
+        if now < self.next_retry_check or self.retry_ready.is_set():
+            return
+        self.next_retry_check = now + 30
+        with self.retry_lock:
+            keys = list(itertools.islice(self.retry_paths,16))
+            probes = [(key,self.retry_paths[key]) for key in keys]
+            for key in keys:
+                self.retry_paths.move_to_end(key)
+        for key,path in probes:
+            # A representative file can legitimately have been deleted after
+            # the mount returned. A reachable original directory also suffices.
+            if stat_record(path) is not None or (safe_dev(key[0])==key[1] and os.access(key[0],os.X_OK)
+                    and confirmed_absence(path,self.cfg,self.roots,key[1])):
+                with self.retry_lock:
+                    self.retry_paths.pop(key,None)
+                self.retry_ready.set()
+                break
 
     def put(self, message):
         while not self.stop.is_set():
@@ -6654,13 +6882,20 @@ class PlanReader:
 
     def run(self):
         last_identity = None
+        rejected = {}
         while not self.stop.is_set():
+            self.probe_deferred()
+            if self.force_read.is_set():
+                self.force_read.clear()
+                last_identity = None
             if self.paused.is_set():
                 self.stop.wait(1)
                 continue
-            receipt = None
+            receipt = source_id = None
+            rejected = {k:t for k,t in rejected.items() if t>time.monotonic()}
             try:
-                with startup_plan_source() as (identity, source):
+                with startup_plan_source(rejected) as (identity, source):
+                    source_id = identity
                     header = json.loads(next(source))
                     # Generation also detects updates on filesystems with
                     # coarse/cached stat metadata; never miss a fuller plan.
@@ -6681,7 +6916,8 @@ class PlanReader:
                     receipt = ValidationReceipt(header)
                     batch, skipped, seen = [], 0, set()
                     reused = 0
-                    newly_oversized = []
+                    changed, deferred_rank = [], []
+                    reordered = False
                     index = 0
                     maximum = explicit_plan_file_limit(self.cfg)
                     metadata_limit = selection_metadata_budget(self.cfg, parse_meminfo()["MemTotal"])
@@ -6698,17 +6934,22 @@ class PlanReader:
                         if len(line) > 65536:
                             raise ValueError("oversized startup plan record")
                         saved = record_from_list(json.loads(line))
+                        frontier = (saved.priority,saved.path)
+                        while deferred_rank and deferred_rank[0][:2] <= frontier:
+                            batch.append(heapq.heappop(deferred_rank)[2])
                         if index % 512 == 1:
                             receipt.watch()
                         if receipt.watch_token is None:
                             receipt.note(saved.path, untrusted=True)
-                        defer_large = False
                         metadata_cost = record_metadata_bytes(saved.path, saved.budget)
                         if metadata_used + metadata_cost > metadata_limit:
                             skipped += 1
                             receipt.note(saved.path)
                             continue
                         if not cache_path_allowed(saved.path, self.cfg, self.roots):
+                            if any(path_is_under(saved.path,r) and not os.path.exists(r)
+                                   for r in self.cfg.get("include_paths", ())):
+                                self.defer_file(saved)
                             skipped += 1
                             receipt.note(saved.path)
                             continue
@@ -6720,55 +6961,118 @@ class PlanReader:
                                 saved = memo
                         if actual is None or (actual.dev, actual.ino) in seen or not record_device_allowed(actual, self.cfg, self.roots):
                             skipped += 1
+                            if actual is None:
+                                self.defer_file(saved)
                             receipt.note(saved.path, missing=actual is None and confirmed_absence(
                                 saved.path, self.cfg, self.roots, saved.dev))
                             continue
-                        if record_key(actual) != record_key(saved) or header.get("policy") != POLICY_VERSION:
-                            priority = selection_sort_key(actual)
-                            if priority is None:
-                                skipped += 1
-                                receipt.note(saved.path)
-                                continue
-                            defer_large = (priority[:2] == (1, -9800)
-                                           and saved.priority[:2] != (1, -9800))
-                            saved = FileRec(actual.path, actual.size, actual.mtime, actual.mode,
-                                            actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
-                                            tuple(priority[:5]), cache_budget_key(actual) or "")
-                            receipt.note(saved.path, record=saved, untrusted=receipt.watch_token is None)
                         seen.add((actual.dev, actual.ino))
                         metadata_used += metadata_cost
-                        if defer_large:
-                            # A formerly small site DB/blob may have grown
-                            # since checkpointing. Do not warm it at its old
-                            # early position ahead of the normal working set.
-                            newly_oversized.append(saved)
-                            continue
+                        if record_key(actual) != record_key(saved) or actual.mode != saved.mode:
+                            if same_rank_inputs(actual, saved):
+                                updated = refreshed_record(actual, saved)
+                                reordered |= updated.priority != saved.priority
+                                saved = updated
+                                receipt.note(saved.path, record=saved, untrusted=receipt.watch_token is None)
+                            else:
+                                changed.append(actual)
+                                reordered = True
+                                if len(changed) >= 256:
+                                    for old, updated in zip(changed, ranked_changes(changed)):
+                                        receipt.note(old.path, record=updated, untrusted=receipt.watch_token is None)
+                                        if updated is None:
+                                            skipped += 1
+                                        else:
+                                            heapq.heappush(deferred_rank,(updated.priority,updated.path,updated))
+                                    changed.clear()
+                                    while deferred_rank and deferred_rank[0][:2] <= frontier:
+                                        batch.append(heapq.heappop(deferred_rank)[2])
+                                else:
+                                    continue
+                                if batch:
+                                    for offset in range(0,len(batch),512):
+                                        self.put(("batch", batch[offset:offset+512]))
+                                    batch = []
+                                continue
                         batch.append(saved)
                         if len(batch) >= 512:
-                            self.put(("batch", batch))
+                            for offset in range(0,len(batch),512):
+                                self.put(("batch", batch[offset:offset+512]))
                             batch = []
                     if batch:
-                        self.put(("batch", batch))
-                    for offset in range(0, len(newly_oversized), 512):
-                        self.put(("batch", newly_oversized[offset:offset + 512]))
+                        for offset in range(0,len(batch),512):
+                            self.put(("batch", batch[offset:offset+512]))
+                    for old, updated in zip(changed, ranked_changes(changed)):
+                        receipt.note(old.path, record=updated, untrusted=receipt.watch_token is None)
+                        if updated is None:
+                            skipped += 1
+                        else:
+                            heapq.heappush(deferred_rank,(updated.priority,updated.path,updated))
+                    while deferred_rank:
+                        self.put(("batch",[heapq.heappop(deferred_rank)[2] for _ in range(min(512,len(deferred_rank)))]))
                     receipt.finish()
-                    self.put(("end", {"skipped": skipped, "reused": reused, **header}))
+                    self.put(("end", {"skipped": skipped, "reused": reused, "reordered": reordered, **header}))
                     # Validation's duplicate-inode set is temporary; do not
                     # retain millions of tuples throughout the idle interval.
                     seen.clear()
                     batch = []
-                    newly_oversized.clear()
+                    changed.clear()
                 last_identity = identity
             except FileNotFoundError:
                 pass
             except (OSError, ValueError, TypeError, KeyError, StopIteration, sqlite3.Error) as error:
                 atomic_json(RUNTIME_PATH / "plan-invalid.json", {"timestamp": time.time(), "reason": str(error)})
                 self.put(("error", str(error)))
-                self.stop.wait(5)
+                if source_id is not None and isinstance(error,(ValueError,TypeError,KeyError,StopIteration)):
+                    rejected[source_id] = time.monotonic()+60
+                else:
+                    self.stop.wait(5)
             finally:
                 if receipt is not None:
                     receipt.abort()
             self.stop.wait(0.5)
+
+
+class OwnedSelection:
+    """Incremental index of full-file reservations, including batches retiring."""
+    def __init__(self):
+        self.groups, self.files, self.extra = {}, {}, {}
+        self.content, self.used, self.counts = {}, {}, {}
+        self.total = 0
+
+    def sync(self, workers):
+        groups = {w.key: w.records for w in workers}
+        for key, records in list(self.groups.items()):
+            if groups.get(key) is records:
+                continue
+            for r in records:
+                k = (r.dev, r.ino)
+                if k in self.extra:
+                    self.extra[k] -= 1
+                    if not self.extra[k]:
+                        del self.extra[k]
+                    continue
+                old = self.files.pop(k)
+                size = page_bytes(old.size)
+                self.total -= size
+                charge_budget(old.budget, -size, -1, self.used, self.counts)
+                self.content.pop(k, None)
+            del self.groups[key]
+        for key, records in groups.items():
+            if key in self.groups:
+                continue
+            for r in records:
+                k = (r.dev, r.ino)
+                if k in self.files:
+                    self.extra[k] = self.extra.get(k, 0)+1
+                    continue
+                self.files[k] = r
+                size = page_bytes(r.size)
+                self.total += size
+                charge_budget(r.budget, size, 1, self.used, self.counts)
+                if r.budget == "vrchat_content_cache":
+                    self.content[k] = r
+            self.groups[key] = records
 
 
 def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
@@ -6777,14 +7081,26 @@ def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
     used, counts, present = {}, {}, set()
     caps, file_caps = cache_budget_caps(cfg), cache_budget_file_caps(cfg)
     maximum = parse_size(cfg.get("vmtouch_max_file_size", "128G"))
-    existing_content = []
-    for rec in existing:
-        present.add(id(rec))
-        cost = page_bytes(rec.size)
-        total += cost
-        charge_budget(rec.budget, cost, 1, used, counts)
-        if rec.budget == "vrchat_content_cache":
-            existing_content.append(rec)
+    holder_limit = cfg.get("_holder_lock_limit", -1)
+    if holder_limit >= 0:
+        holder_limit = holder_limit//PAGE_SIZE*PAGE_SIZE
+        maximum = min(maximum,holder_limit) if maximum is not None else holder_limit
+    if isinstance(existing, OwnedSelection):
+        total, present = existing.total, existing.files
+        used, counts = existing.used.copy(), existing.counts.copy()
+        existing_content = existing.content.values()
+    else:
+        existing_content = []
+        for rec in existing:
+            ident = (rec.dev, rec.ino)
+            if ident in present:
+                continue
+            present.add(ident)
+            cost = page_bytes(rec.size)
+            total += cost
+            charge_budget(rec.budget, cost, 1, used, counts)
+            if rec.budget == "vrchat_content_cache":
+                existing_content.append(rec)
 
     # Only the bounded VR content subset needs grouping/sorting; the main
     # selection stays in its saved priority order without a full list sort.
@@ -6794,15 +7110,16 @@ def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
         for rec in records:
             if rec.budget == "vrchat_content_cache":
                 units.setdefault(vrchat_content_cache_unit_root(rec.path), []).append(rec)
-                content_ids.add(id(rec))
+                content_ids.add((rec.dev, rec.ino))
         for rec in existing_content:
-            if id(rec) not in content_ids:
+            if (rec.dev, rec.ino) not in content_ids:
                 units.setdefault(vrchat_content_cache_unit_root(rec.path), []).append(rec)
 
     def unit_time(members):
         payload = [r for r in members if os.path.basename(r.path).lower() == "__data"]
         return max(((r.mtime_ns / 1e9 if r.mtime_ns else r.mtime, r.ctime_ns) for r in payload or members), default=(0, 0))
 
+    added = set()
     content_done = False
     for rec in records:
         if rec.budget == "vrchat_content_cache":
@@ -6814,7 +7131,7 @@ def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
                 names = {os.path.basename(r.path).lower() for r in members}
                 if names & {"__info", "__data"} and not {"__info", "__data"} <= names:
                     continue
-                missing = [r for r in members if id(r) not in present
+                missing = [r for r in members if (r.dev, r.ino) not in present
                            and (r.dev, r.ino) not in cfg.get("_hotseat_owned", ())]
                 if not missing or any((maximum is not None and r.size > maximum) or r.size >= GIB
                                       or (excluded and record_key(r) in excluded) for r in missing):
@@ -6824,10 +7141,11 @@ def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
                         "vrchat_content_cache", cost, len(missing), used, counts, caps, file_caps, budget):
                     continue
                 charge_budget("vrchat_content_cache", cost, len(missing), used, counts)
+                added.update((r.dev, r.ino) for r in missing)
                 selected.extend(missing)
                 total += cost
             continue
-        if id(rec) in present or (excluded and record_key(rec) in excluded) or (rec.dev, rec.ino) in cfg.get("_hotseat_owned", ()):
+        if (rec.dev, rec.ino) in added or (rec.dev, rec.ino) in present or (excluded and record_key(rec) in excluded) or (rec.dev, rec.ino) in cfg.get("_hotseat_owned", ()):
             continue
         if maximum is not None and rec.size > maximum:
             continue
@@ -6835,12 +7153,13 @@ def choose_candidates(records, budget, cfg, *, existing=(), excluded=()):
         if total + cost > budget or not budget_fits(rec.budget, cost, 1, used, counts, caps, file_caps, budget):
             continue
         charge_budget(rec.budget, cost, 1, used, counts)
+        added.add((rec.dev, rec.ino))
         selected.append(rec)
         total += cost
     return selected
 
 
-def refill_candidates(records, budget, cfg, existing, failed_until, *, control_tick=None):
+def refill_candidates(records, budget, cfg, existing, failed_until, *, control_tick=None, preferred=(), published=None, selection_info=None):
     """Reuse the remembered selection, validating only proposed new reads.
 
     Unchanged records retain their objects/priorities; no inventory query,
@@ -6848,8 +7167,17 @@ def refill_candidates(records, budget, cfg, existing, failed_until, *, control_t
     changes update this existing in-memory view. The normal next-start scan
     persists current records through the same SQLite bookkeeping.
     """
-    additions = choose_candidates(records, budget, cfg, existing=existing, excluded=failed_until)
+    source = records
+    if preferred and isinstance(existing, OwnedSelection):
+        restored = choose_candidates(sorted(preferred, key=lambda r: (r.priority, r.path)), budget, cfg,
+                                     existing=existing, excluded=failed_until)
+        if restored:
+            source = restored
+            if selection_info is not None:
+                selection_info["replaying_release"] = True
+    additions = source if source is not records else choose_candidates(records, budget, cfg, existing=existing, excluded=failed_until)
     updates, verified, identities = {}, [], set()
+    rerank = []
     replaced = reclassified = False
     roots = cfg.get("_resolved_roots", cfg.get("include_paths", ["/"]))
     last_control = time.monotonic()
@@ -6861,29 +7189,28 @@ def refill_candidates(records, budget, cfg, existing, failed_until, *, control_t
         actual = stat_record(rec.path)
         if (actual is None or not cache_path_allowed(actual.path, cfg, roots)
                 or not record_device_allowed(actual, cfg, roots)):
-            updates[id(rec)] = None
+            if actual is None and cfg.get("_retry_saved_path"):
+                cfg["_retry_saved_path"](rec)
+            updates[rec.path] = None
             continue
         if (actual.dev, actual.ino) in identities:
-            updates[id(rec)] = None
+            updates[rec.path] = None
             continue
         identities.add((actual.dev, actual.ino))
         if record_key(actual) == record_key(rec):
             verified.append(rec)
             continue
-        if (actual.dev, actual.ino, actual.size, actual.mtime_ns, actual.mode) == (rec.dev, rec.ino, rec.size, rec.mtime_ns, rec.mode):
-            # Creating/removing Steam's hard links can change ctime without
-            # changing contents or ownership of the underlying cached pages.
-            refreshed = FileRec(actual.path, actual.size, actual.mtime, actual.mode,
-                                actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
-                                rec.priority, rec.budget)
+        if same_rank_inputs(actual, rec):
+            refreshed = refreshed_record(actual, rec)
+            reclassified |= refreshed.priority != rec.priority
+            updates[rec.path] = refreshed
+            verified.append(refreshed)
         else:
             reclassified = True
-            replaced = replaced or (actual.dev, actual.ino) != (rec.dev, rec.ino)
-            _, priority, family, _ = classify_batch([(actual, 0, 0)])[0]
-            refreshed = (FileRec(actual.path, actual.size, actual.mtime, actual.mode,
-                                 actual.dev, actual.ino, actual.mtime_ns, actual.ctime_ns,
-                                 priority, family) if priority is not None else None)
-        updates[id(rec)] = refreshed
+            replaced |= (actual.dev, actual.ino) != (rec.dev, rec.ino)
+            rerank.append((rec.path, actual))
+    for (path, _), refreshed in zip(rerank, ranked_changes([r for _,r in rerank])):
+        updates[path] = refreshed
         if refreshed is not None:
             verified.append(refreshed)
     if updates:
@@ -6893,18 +7220,65 @@ def refill_candidates(records, budget, cfg, existing, failed_until, *, control_t
             changed = [value for value in updates.values() if value is not None]
             order = lambda r: (r.priority or (99,), r.path)
             changed.sort(key=order)
-            records[:] = heapq.merge((rec for rec in records if id(rec) not in updates), changed, key=order)
+            revised = list(heapq.merge((rec for rec in records if rec.path not in updates), changed, key=order))
             verified.sort(key=order)
         else:
-            records[:] = [value for rec in records if (value := updates.get(id(rec), rec)) is not None]
+            revised = [value for rec in records if (value := updates.get(rec.path, rec)) is not None]
+        if published is None:
+            records[:] = revised
+        else:
+            published[:] = [revised]
+        if (selection_info is None and source is not records and existing.total + sum(page_bytes(r.size) for r in verified) < budget-128*MIB
+                and not (control_tick and control_tick())):
+            return refill_candidates(revised, budget, cfg, existing, failed_until, control_tick=control_tick, published=published)
     if replaced:
-        healthy = {(r.dev, r.ino) for r in existing}
+        healthy = existing.files if isinstance(existing, OwnedSelection) else {(r.dev, r.ino) for r in existing}
         verified = [r for r in verified if (r.dev, r.ino) not in healthy]
     if not reclassified and len(verified) == len(additions):
         return verified  # Unchanged/ctime-only reads already fit: no second selection.
     # Size/family changes and complete content groups must be re-budgeted from
     # their actual metadata before launching. This list is only new reads.
     return choose_candidates(verified, budget, cfg, existing=existing, excluded=failed_until)
+
+
+def service_cpu_seconds(group=None):
+    try:
+        if group is None:
+            group = next(line.split("::",1)[1] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                         if line.startswith("0::"))
+            group = Path("/sys/fs/cgroup") / group.lstrip("/")
+        for line in (Path(group)/"cpu.stat").read_text().splitlines():
+            key,value = line.split()
+            if key == "usage_usec":
+                return int(value)/1e6
+    except (OSError,ValueError,StopIteration):
+        pass
+    return None
+
+
+class RefillJob(threading.Thread):
+    """A blocked stat on one mount must never block the pressure-control loop."""
+    def __init__(self, token, records, budget, cfg, existing, excluded, released):
+        super().__init__(name="cache-refill-validation", daemon=True)
+        self.token = token
+        self.cancel = threading.Event()
+        self.error = None
+        self.revised = []
+        self.selection_info = {}
+        self.additions = []
+        settings = dict(cfg, _hotseat_owned=frozenset(cfg.get("_hotseat_owned", ())),
+                        _root_devices=dict(cfg.get("_root_devices", {})))
+        self.inputs = (records, budget, settings, existing, dict(excluded))
+        self.released = tuple(released)
+
+    def run(self):
+        try:
+            self.additions = refill_candidates(*self.inputs, preferred=self.released,
+                control_tick=self.cancel.is_set, published=self.revised, selection_info=self.selection_info)
+        except Exception as error:
+            self.error = error
+        finally:
+            self.inputs = self.released = ()
 
 
 def planner_command():
@@ -6926,14 +7300,14 @@ def run_supervisor() -> int:
         logging.error("another RAMCache supervisor already owns this runtime directory")
         return 1
     config_text, cfg = load_config()
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "hotseat-1.5.1-2f21cbae110b"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "hotseat-1.5.3"))
     from hotseat_bridge import HotseatBridge
-    hotseat = HotseatBridge(RUNTIME_PATH, enabled=True)
+    hotseat = HotseatBridge(RUNTIME_PATH, enabled=bool(cfg.get("hotseat_enabled", True)))
     hotseat.enabled = bool(cfg.get("hotseat_enabled", True))
     if not hotseat.enabled:
         hotseat.status = {"state": "disabled"}
     else:
-        native_build = read_json(Path(__file__).resolve().parent / "hotseat-1.5.1-2f21cbae110b" / "build-status.json", {})
+        native_build = read_json(Path(__file__).resolve().parent / "hotseat-1.5.3" / "build-status.json", {})
         if not native_build.get("available", False):
             hotseat.status = {"state": "unavailable", "reason": native_build.get("reason", "native components not built")}
     cfg["_hotseat_owned"] = hotseat.owned
@@ -6943,6 +7317,32 @@ def run_supervisor() -> int:
     storage_profile = resolve_scan_storage_profile(cfg)
     ensure_memlock_limit(parse_meminfo()["MemTotal"], cfg)
     # vmtouch holds mappings, not one supervisor fd per inventory entry.
+    from base_pool import BasePool
+    binary = Path(__file__).resolve().parent / "hotseat-1.5.3" / "base-lock"
+    pool = BasePool(binary) if os.access(binary, os.X_OK) else None
+    def configure_backend(settings):
+        native = pool is not None and not settings.get("vmtouch_binary")
+        if native:
+            settings["_holder_map_limit"] = pool.map_limit
+            settings["_holder_lock_limit"] = pool.lock_limit
+        settings["_legacy_batch_limit"] = legacy_limits
+        return native
+    legacy_limits = {}
+    native = configure_backend(cfg)
+    ledger = OwnedSelection()
+    refill_job = None
+    check_remaining = force_full_refill = False
+    released = {}
+    file_errors = Counter()
+    first_confirmed = last_progress = regrow_started = regrow_first = regrow_done = None
+    previous_actual = legacy_confirmed = 0
+    refill_baseline = None
+    refill_metrics = {}
+    hold_reason = ""
+    last_control = {}
+    last_retirement = float("-inf")
+    recover_holder_at = None
+    replay_recovered = False
     reader = PlanReader(cfg, roots)
     planner = subprocess.Popen(planner_command(), start_new_session=True)
     planner_started = time.monotonic()
@@ -6958,7 +7358,7 @@ def run_supervisor() -> int:
     records = []
     incoming = None
     plan_generation = ""
-    pending_chunks = deque()
+    pending_chunks = ChunkQueue()
     failed_until = {}
     failures = 0
     warning_count = 0
@@ -6986,15 +7386,10 @@ def run_supervisor() -> int:
     boot_applied_generation = None
     boot_validation_reused = 0
 
-    def refill_control_tick():
-        # Keep the existing IPC lease fresh during a long known-path metadata
-        # batch. Never let its 10-s safety expiry accidentally wake discovery.
-        atomic_json(RUNTIME_PATH / "pressure.json", {
-            "timestamp": time.time(), "pause_discovery": True,
-            "cache_holding": False, "refill_from_plan": True,
-        })
-        hotseat.renew_paused_lease()
-        return not RUNNING or parse_meminfo()["MemAvailable"] < reserve
+    def refill_token():
+        return (id(records), plan_generation, budget, id(cfg),
+                tuple((w.key,id(w.records)) for w in workers))
+
     try:
         while RUNNING:
             now = time.monotonic()
@@ -7005,7 +7400,21 @@ def run_supervisor() -> int:
                 hotseat.refresh_memory(process_memory)
                 io_activity.extra_groups = (hotseat.io_group,) if hotseat.io_group else ()
                 io_busy = io_activity.busy(now)
-            reap_workers(retired)
+            failed_units = set()
+            if pool:
+                pool.poll(process_memory if memory_tick else None, now)
+                while pool.errors:
+                    rec, code, operation = pool.errors.popleft()
+                    last_retirement = now
+                    if rec.budget == "vrchat_content_cache":
+                        failed_units.add(vrchat_content_cache_unit_root(rec.path))
+                    file_errors[operation + "/" + errno.errorcode.get(code,str(code))] += 1
+                    last_error = f"{operation}: {os.strerror(code)} ({rec.path})"
+                    failed_until[record_key(rec)] = now + (1 if code in (errno.ESTALE,errno.ENOENT) else 30)
+                    warning_count += 1
+                    plan_changed = True
+            if reap_workers(retired):
+                last_retirement = now
             handoff = admission.poll(workers, retired, now)
             if handoff:
                 transfer_worker_samples(hotseat, sampled_locked, *handoff)
@@ -7013,7 +7422,14 @@ def run_supervisor() -> int:
             inflight = 0
             for worker in list(workers):
                 locked = worker.locked
-                if memory_tick:
+                if failed_units and worker.records and worker.records[0].budget == "vrchat_content_cache":
+                    if vrchat_content_cache_unit_root(worker.records[0].path) in failed_units:
+                        worker.failed.set()
+                        worker.diagnostic = "revalidating changed complete content group"
+                logical = hasattr(worker.proc, "group_key")
+                if logical:
+                    locked = worker.proc.confirmed + worker.proc.partial
+                elif memory_tick:
                     locked, _ = process_memory(worker.proc.pid)
                     worker.last_sample = now
                 if locked > worker.locked:
@@ -7032,12 +7448,33 @@ def run_supervisor() -> int:
                     last_error = worker.diagnostic or f"cache worker exited ({worker.proc.returncode})"
                     logging.warning("%s; retaining healthy cache workers", last_error)
                     retry = now + min(300, max(5, float(cfg.get("worker_retry_seconds", 30))))
-                    for rec in worker.records:
-                        failed_until[record_key(rec)] = retry
+                    lost_holder = logical and worker.proc.returncode not in (None,0)
+                    if lost_holder:
+                        # Locks on other helpers survive. A dead holder does not
+                        # make every file it used to own a failed filesystem path.
+                        released.update(((r.dev,r.ino),r) for r in worker.records)
+                        recover_holder_at = now+2
+                    elif worker.short_ack and len(worker.records)>1:
+                        for rec in worker.records:
+                            legacy_limits[record_key(rec)] = max(1,len(worker.records)//2)
+                            failed_until[record_key(rec)] = now
+                    else:
+                        for rec in worker.records:
+                            failed_until[record_key(rec)] = retry
                     plan_changed = True
                     continue
                 if ready and not worker.acknowledged_at:
                     worker.acknowledged_at = now
+                    if not logical:
+                        legacy_confirmed += worker.reported_pages*PAGE_SIZE
+                    if legacy_limits and worker.reported_pages * PAGE_SIZE == worker.requested:
+                        for r in worker.records:
+                            legacy_limits.pop(record_key(r),None)
+                if ready and not worker.records:
+                    workers.remove(worker)
+                    signal_worker(worker)
+                    retired.append((now,worker))
+                    continue
                 if ready and worker.warnings:
                     warning_count += worker.warnings
                     last_error = worker.diagnostic
@@ -7046,6 +7483,7 @@ def run_supervisor() -> int:
                 if ready and worker.reported_pages * PAGE_SIZE != worker.requested:
                     # The worker acknowledged completion, so missing pages are
                     # failed/skipped work, never phantom outstanding I/O.
+                    worker.short_ack = True
                     worker.requested = worker.reported_pages * PAGE_SIZE
                     worker.failed.set()
                     worker.diagnostic = worker.diagnostic or "cache worker acknowledged fewer pages than requested; retrying this chunk"
@@ -7063,6 +7501,14 @@ def run_supervisor() -> int:
                     worker.failed.set()
                     worker.diagnostic = "a loaded mapping lost locked pages; revalidating this worker"
                 owned_locked += locked
+            if first_confirmed is None and any((w.proc.confirmed if hasattr(w.proc,"group_key") else
+                                                w.reported_pages*PAGE_SIZE if w.ready.is_set() else 0) for w in workers):
+                first_confirmed = now-started
+            if owned_locked > previous_actual:
+                last_progress = now
+                if regrow_started is not None and regrow_first is None:
+                    regrow_first = now-regrow_started
+            previous_actual = owned_locked
             # The two cache sections share one safety policy and one byte grant.
             owned_locked += hotseat.measured_locked
             inflight += max(0, hotseat.reserved-hotseat.measured_locked)
@@ -7073,12 +7519,27 @@ def run_supervisor() -> int:
                 hotseat.track_base_growth(workers, [(stamp, w) for stamp, w in retired if not w.compaction_alias])
                 supervisor_anon = process_memory(os.getpid())[1]
                 planner_anon = process_memory(planner.pid)[1] if planner.poll() is None else 0
-                own_anon = supervisor_anon + planner_anon + hotseat.measured_anon
+                own_anon = supervisor_anon + planner_anon + hotseat.measured_anon + (sum(h.anon for h in pool.holders) if pool else 0)
                 meminfo = parse_meminfo()
                 hotseat.mark_memory_sample(_MEMINFO_SAMPLE[0])
                 last_memory_sample = now
-                sampled_locked = {worker.proc.pid: worker.locked for worker in workers}
+                sampled_locked = {worker.key: worker.locked for worker in workers}
                 release, pause = policy.evaluate(meminfo, cfg, owned_locked, own_anon, now=now)
+            if memory_tick and pause and (release or meminfo["MemAvailable"] < memory_watermarks(meminfo,cfg)[1]):
+                # A disk fault can still be in flight when almost no pages have been
+                # acknowledged. Cancel its remaining reservation before it grows.
+                for w in list(workers):
+                    if w.ready.is_set():
+                        continue
+                    workers.remove(w)
+                    released.update(((r.dev,r.ino),r) for r in w.records)
+                    hotseat.note_pressure(w, owned_locked)
+                    release = max(0, release-w.locked)
+                    owned_locked = max(0, owned_locked-w.locked)
+                    signal_worker(w)
+                    retired.append((now,w))
+                    pending_chunks.clear()
+                    plan_changed = True
             if release:
                 admission.cancel(retired, now)
                 pressure_before = owned_locked
@@ -7088,6 +7549,7 @@ def run_supervisor() -> int:
                 workers.sort(key=lambda item: item.priority)
                 while workers and owned_locked > target:
                     worker = workers.pop()
+                    released.update(((r.dev,r.ino),r) for r in worker.records)
                     hotseat.note_pressure(worker, owned_locked)
                     owned_locked -= worker.locked
                     signal_worker(worker)
@@ -7102,9 +7564,10 @@ def run_supervisor() -> int:
             global_budget = budget_policy.target
             if memory_tick or hotseat.changed:
                 base_requested = sum(w.requested for w in workers)
-                base_unsampled = sum(max(0, w.requested-sampled_locked.get(w.proc.pid, 0))
+                base_unsampled = sum(max(0, w.requested-sampled_locked.get(w.key, 0))
                     for w in workers + [w for _, w in retired if not w.compaction_alias and w.proc.poll() is None])
-                funding = hotseat.budget(total=meminfo["MemTotal"], available=meminfo["MemAvailable"],
+                sampled_after_release = _MEMINFO_SAMPLE[0] >= last_retirement
+                funding = hotseat.budget(total=meminfo["MemTotal"], available=meminfo["MemAvailable"] if sampled_after_release else 0,
                     reserve=reserve, target=global_budget, base_requested=base_requested,
                     base_unsampled=base_unsampled, paused=pause, io_busy=io_busy,
                     healthy=not pause and meminfo["MemAvailable"] >= above, cfg=cfg, now=now,
@@ -7116,6 +7579,7 @@ def run_supervisor() -> int:
                     workers.sort(key=lambda item: item.priority)
                     while workers and funding > 0:
                         worker = workers.pop()
+                        released.update(((r.dev,r.ino),r) for r in worker.records)
                         funding -= worker.requested
                         owned_locked -= worker.locked
                         signal_worker(worker)
@@ -7129,11 +7593,37 @@ def run_supervisor() -> int:
                     plan_changed = True
                     hotseat.reclaimed = False
             budget = max(0, global_budget-hotseat.reserved)
+            if (not budget_policy.refilling and not pause and not retired and not io_busy and
+                    now >= budget_policy.resume_not_before and meminfo["MemAvailable"] >= above and
+                    (any(t <= now for t in failed_until.values()))):
+                # A failed entry can become valid under the same grant; no budget growth is required.
+                budget_policy.refilling = True
+            if (recover_holder_at is not None and now >= recover_holder_at and not retired and not pause
+                    and not io_busy and now >= budget_policy.resume_not_before and meminfo["MemAvailable"]>=above):
+                budget_policy.refilling = True
+                refill_from_plan = plan_changed = True
+                recover_holder_at = None
             holding = not budget_policy.refilling
-            boot_fetch = boot_apply_generation is not None
+            if was_holding and not holding and filled_once:
+                regrow_started, regrow_first, regrow_done = now, None, None
+                refill_metrics = {}
+                refill_baseline = (service_cpu_seconds(),service_cpu_seconds(hotseat.io_group) if hotseat.io_group else None,
+                                  legacy_confirmed + (pool.completed_bytes if pool else 0))
+                hold_reason = ""
+            if (validated and reader.retry_ready.is_set() and not replay_recovered and boot_apply_generation is None
+                    and not pause and not io_busy and (not holding or meminfo["MemAvailable"]>=above)):
+                roots = normalized_roots(cfg)
+                cfg["_resolved_roots"] = roots
+                reader.roots = roots
+                reader.retry_ready.clear()
+                reader.force_read.set()
+                reader.paused.clear()
+                replay_recovered = True
+            boot_fetch = boot_apply_generation is not None or replay_recovered
             if not holding and filled_once:
                 refill_from_plan = True
-            grow_existing = not boot_fetch and (refill_from_plan or (
+            due_retry = validated and any(t <= now for t in failed_until.values())
+            grow_existing = not boot_fetch and (refill_from_plan or due_retry or (
                 not holding and budget > last_budget and validated
                 and not plan_changed and not failed_until and not retired))
             # An interrupted initial saved-plan stream may still finish, but
@@ -7160,13 +7650,21 @@ def run_supervisor() -> int:
                         plan_changed = True
                 elif kind == "end" and incoming is not None:
                     records = incoming
+                    if payload.get("reordered"):
+                        records.sort(key=lambda r: (r.priority, r.path))
                     candidate_bytes = incoming_bytes
                     incoming = None
+                    if plan_generation != payload["generation"]:
+                        released.clear()
+                        hold_reason = ""
                     plan_generation = payload["generation"]
                     plan_skipped = payload["skipped"]
                     boot_validation_reused = payload.get("reused", 0)
                     plan_changed = True
                     validated = True
+                    if replay_recovered:
+                        replay_recovered = False
+                        boot_apply_generation = plan_generation
                 elif kind == "error":
                     incoming = None
                     last_error = "startup-plan validation: " + payload
@@ -7180,21 +7678,37 @@ def run_supervisor() -> int:
                 cache_goal = 0
                 plan_changed = False
             boot_apply = bool(boot_fetch and plan_generation == boot_apply_generation and incoming is None)
-            if (not holding or boot_apply) and not pause and (records or boot_apply) and now >= admission.next_retry and now - last_reconcile >= 1 and (
+            if refill_job and (holding or pause or boot_apply or retired or not grow_existing):
+                refill_job.cancel.set()
+                if not refill_job.is_alive():
+                    refill_job = None
+            if refill_job and not refill_job.is_alive():
+                if not refill_job.cancel.is_set() and refill_job.token == refill_token():
+                    if refill_job.error is not None:
+                        last_error = "retrying known-file validation: " + str(refill_job.error)
+                        logging.warning("%s", last_error)
+                        admission.failed(refill_job.error, now)
+                    else:
+                        if refill_job.revised:
+                            records = refill_job.revised[0]
+                            candidate_bytes = sum(page_bytes(r.size) for r in records)
+                        check_remaining = refill_job.selection_info.get("replaying_release",False)
+                        additions = refill_job.additions
+                        cache_goal = sum(w.requested for w in workers) + sum(page_bytes(r.size) for r in additions)
+                        pending_chunks = ChunkQueue(worker_chunks(additions, cfg))
+                        last_reconcile, last_budget, plan_changed = now, budget, False
+                refill_job = None
+            if refill_job is None and (not holding or boot_apply) and not pause and (records or boot_apply) and now >= admission.next_retry and now - last_reconcile >= 1 and (
                     plan_changed or budget != last_budget
                     or any(deadline <= now for deadline in failed_until.values())) and not (grow_existing and retired):
                 failed_until = {key: deadline for key, deadline in failed_until.items() if deadline > now}
                 if grow_existing:
                     refill_from_plan = True
-                    refill_control_tick()
-                    existing = [rec for worker in workers for rec in worker.records]
-                    additions = refill_candidates(records, budget, cfg, existing, failed_until,
-                                                   control_tick=refill_control_tick)
-                    cache_goal = sum(worker.requested for worker in workers) + sum(
-                        page_bytes(rec.size) for rec in additions)
-                    pending_chunks = deque(worker_chunks(additions, cfg))
-                    del additions, existing
-                    last_reconcile, last_budget, plan_changed = now, budget, False
+                    ledger.sync(workers)
+                    refill_job = RefillJob(refill_token(), records, budget, cfg, ledger, failed_until, () if force_full_refill else released.values())
+                    force_full_refill = False
+                    refill_job.start()
+                    plan_changed = True
                 else:
                     refill_from_plan = False
                     desired = choose_candidates(records, budget, cfg)
@@ -7221,7 +7735,7 @@ def run_supervisor() -> int:
                     present = {record_key(rec) for worker in workers for rec in worker.records}
                     missing = [rec for rec in desired if record_key(rec) not in present
                                and record_key(rec) not in failed_until]
-                    pending_chunks = deque(worker_chunks(missing, cfg))
+                    pending_chunks = ChunkQueue(worker_chunks(missing, cfg))
                     last_reconcile, last_budget, plan_changed = now, budget, replacements_pending
                     # These dictionaries/sets can dwarf the active worker index.
                     # They are scratch space, not persistent cache ownership data.
@@ -7234,7 +7748,8 @@ def run_supervisor() -> int:
                 loading_limit = 1
             if (pending_chunks and not holding and not pause and not io_busy
                     and active_loading < loading_limit and not retired):
-                admission.consolidate(workers, cfg, now)
+                if not native:
+                    admission.consolidate([w for w in workers if not hasattr(w.proc, "group_key")], cfg, now)
             if admission.copy is not None:
                 active_loading += 1
                 if pause or holding:
@@ -7252,10 +7767,10 @@ def run_supervisor() -> int:
             # A worker can finish between 1-s memory samples. Charge every byte
             # not resident at the last sample EVEN AFTER its ready signal, so
             # fast completion never lets us spend stale MemAvailable twice.
-            unsampled = sum(max(0, worker.requested - sampled_locked.get(worker.proc.pid, 0))
+            unsampled = sum(max(0, worker.requested - sampled_locked.get(worker.key, 0))
                             for worker in workers) + max(0, hotseat.reserved-hotseat.sampled_locked)
-            while pending_chunks and (not holding or boot_apply) and not pause and active_loading < loading_limit and launches < 2 and now >= admission.next_retry:
-                if not admission.can_start(now):
+            while pending_chunks and refill_job is None and (not holding or boot_apply) and not pause and not retired and _MEMINFO_SAMPLE[0] >= last_retirement and active_loading < loading_limit and launches < 2 and now >= admission.next_retry:
+                if not native and not admission.can_start(now):
                     launch_blocked = admission.error
                     break
                 # A hot-seat admission may arrive after this base queue was built.
@@ -7273,7 +7788,9 @@ def run_supervisor() -> int:
                 chunk, cost = pop_fitting_chunk(pending_chunks, free_room, inflight, inflight_limit, hotseat.owned)
                 if chunk is None:
                     launch_blocked = "outstanding I/O budget" if inflight else "insufficient headroom for remaining whole-file chunks"
-                    if not active_loading:
+                    if not active_loading and not inflight and not retired and pending_chunks.exhausted:
+                        hold_reason = "remaining eligible files exceed live headroom"
+                        pending_chunks.clear()
                         potential = max(0, owned_locked + meminfo["MemAvailable"] - reserve)
                         if budget_policy.refilling or potential < budget_policy.target:
                             # Rebudget a blocked tail once, then hold. Do not
@@ -7281,7 +7798,16 @@ def run_supervisor() -> int:
                             budget_policy.hold(potential)
                     break
                 try:
-                    worker = start_cache_worker(chunk, cfg)
+                    if native:
+                        worker = pool.start(chunk, CacheWorker, admission.can_start, now)
+                        if worker is None:
+                            pending_chunks.appendleft(chunk)
+                            launch_blocked = admission.error
+                            break
+                    else:
+                        worker = start_cache_worker(chunk, cfg)
+                    for r in chunk:
+                        released.pop((r.dev,r.ino), None)
                     previous_start_error = admission.error
                     admission.succeeded()
                     if last_error == previous_start_error:
@@ -7325,9 +7851,17 @@ def run_supervisor() -> int:
                 reader.reuse_generation = None
                 release_unused_heap()
 
+            if check_remaining and not active_loading and not pending_chunks and not retired and refill_job is None:
+                check_remaining = False
+                if (budget_policy.refilling and not pause and cache_goal+128*MIB < budget and
+                        candidate_bytes>cache_goal and meminfo["MemAvailable"]>reserve+128*MIB):
+                    # The released set has had first use of I/O. Check the rest of
+                    # this generation once if there is still room for known files.
+                    force_full_refill = refill_from_plan = plan_changed = True
+
             # Full means stop expensive work in BOTH processes. The latch also
             # covers a small whole-file tail that cannot fit the reserve.
-            if (budget_policy.refilling and validated and not active_loading
+            if (refill_job is None and budget_policy.refilling and validated and not active_loading
                     and not pending_chunks and not retired
                     and (not refill_from_plan or not plan_changed)
                     and (cache_goal >= budget - 128 * MIB or refill_from_plan)):
@@ -7344,8 +7878,21 @@ def run_supervisor() -> int:
                 # otherwise its unfinished boot discovery must still resume.
                 filled_once = filled_once or (bool(records) and not was_holding and not pause)
                 refill_from_plan = False
-            (reader.paused.set if (holding or (refill_from_plan and validated)) and boot_apply_generation is None else reader.paused.clear)()
+            (reader.paused.set if (holding or (refill_from_plan and validated)) and boot_apply_generation is None and not replay_recovered else reader.paused.clear)()
             if holding and not was_holding:
+                if regrow_started is not None and regrow_done is None:
+                    regrow_done = now-regrow_started
+                    base_cpu, hot_cpu, initial_bytes = refill_baseline
+                    count = legacy_confirmed + (pool.completed_bytes if pool else 0) - initial_bytes
+                    end_cpu = service_cpu_seconds()
+                    end_hot = service_cpu_seconds(hotseat.io_group) if hotseat.io_group else None
+                    spent = max(0,end_cpu-base_cpu) if end_cpu is not None and base_cpu is not None else None
+                    refill_metrics = {"outcome":"interrupted by pressure" if pause else "settled",
+                                      "base_confirmed_bytes": count, "base_service_cpu_seconds": spent,
+                                      "base_cpu_seconds_per_gib": spent*GIB/count if spent is not None and count else None,
+                                      "hotseat_service_cpu_seconds": max(0,end_hot-hot_cpu) if end_hot is not None and hot_cpu is not None else None}
+                if not hold_reason and cache_goal+128*MIB < budget:
+                    hold_reason = "eligible saved plan exhausted"
                 release_unused_heap()
             was_holding = holding
 
@@ -7371,7 +7918,7 @@ def run_supervisor() -> int:
                 planner_status = read_json(RUNTIME_PATH / "planner-status.json", {}) or {}
                 known_pool_done = (planner_status.get("boot_refresh_state") == "waiting for initial fill"
                                    or planner_status.get("phase") == "watching")
-                if (boot_id is not None and validated and incoming is None and (not plan_changed or holding) and not pause
+                if (refill_job is None and boot_id is not None and validated and incoming is None and (not plan_changed or holding) and not pause
                         and not active_loading and not pending_chunks and not retired
                         and (filled_once or known_pool_done)):
                     boot_requested = True
@@ -7400,17 +7947,19 @@ def run_supervisor() -> int:
                     reader = PlanReader(cfg, roots)
                     plan_changed = True
                 storage_profile = planner_status.get("storage_profile", storage_profile)
-                atomic_json(RUNTIME_PATH / "pressure.json", {
+                last_control = {
                     "timestamp": time.time(), "pause_discovery": pause or io_busy or holding or refill_from_plan,
+                    "startup_index_state": ("paused" if pause or io_busy else "needed") if not validated and incoming is None else None,
                     "cache_holding": holding, "refill_from_plan": refill_from_plan,
                     "boot_refresh_request": boot_id if boot_requested and not planner_status.get("boot_refresh_completed") else None,
                     "boot_refresh_paused": bool(pause or io_busy or active_loading or pending_chunks or retired
                                                 or (not holding and boot_apply_generation is None)),
                     "boot_refresh_applied": boot_applied_generation,
-                    **({"low_ram_fill_gap_bytes": max(0, budget-candidate_bytes)}
-                       if (cfg.get("memory_profile") == "low_ram" and validated and incoming is None
+                    **({"indexed_fill_gap_bytes": max(0, budget-min(candidate_bytes,cache_goal))}
+                       if (validated and incoming is None
                            and not active_loading and not pending_chunks and not retired) else {}),
-                })
+                }
+                atomic_json(RUNTIME_PATH / "pressure.json", last_control)
                 actual = sum(worker.locked for worker in workers)
                 requested = sum(worker.requested for worker in workers)
                 if pause:
@@ -7418,10 +7967,12 @@ def run_supervisor() -> int:
                 elif (boot_requested and not planner_status.get("boot_refresh_completed")
                       and planner_status.get("phase") == "boot-refresh" and not active_loading):
                     fill_state = ("expanding cache selection; completing once-per-boot refresh"
-                                  if cfg.get("memory_profile") == "low_ram" and candidate_bytes + 128 * MIB < budget
+                                  if candidate_bytes + 128 * MIB < budget
                                   else "cache filled; completing once-per-boot refresh")
+                elif refill_job and not refill_job.cancel.is_set():
+                    fill_state = "validating remembered files for refill"
                 elif holding and not active_loading:
-                    fill_state = "holding cache; discovery and selection asleep"
+                    fill_state = hold_reason or "holding cache; discovery and selection asleep"
                 elif pending_chunks or active_loading:
                     fill_state = launch_blocked or ("combining completed cache workers" if admission.copy is not None and active_loading == 1 else "loading selected files")
                 elif failed_until:
@@ -7439,7 +7990,30 @@ def run_supervisor() -> int:
                         fill_state = "eligible plan exhausted"
                 else:
                     fill_state = "usable-memory target reached"
+                ceiling = int(meminfo["MemTotal"]*.9)
+                configured_ceiling = parse_size(cfg.get("max_selection_budget_bytes"))
+                if configured_ceiling is not None:
+                    ceiling = min(ceiling, configured_ceiling)
+                admission.headroom, admission.limiting_group = worker_task_headroom(detail=True)
+                physical_holders = len({w.proc.pid for w in workers})
                 payload = {
+                    "base_backend": "persistent" if native else "vmtouch",
+                    "base_holder_failures": pool.crashes if pool else 0,
+                    "base_backend_reason": "reusable holders" if native else ("configured vmtouch binary" if cfg.get("vmtouch_binary") else "native holder unavailable"),
+                    "deferred_file_directories": len(reader.retry_paths),
+                    "base_holder_processes": physical_holders,
+                    "base_holder_pids": [h.proc.pid for h in pool.holders if h.groups] if pool else [],
+                    "base_holder_kernel_locked_gib": bytes_to_gib(sum(h.kernel_locked for h in pool.holders)) if native else None,
+                    "new_holder_task_headroom_required": 6 if native else 35,
+                    "last_refill": refill_metrics,
+                    "base_confirmed_bytes": sum(w.proc.confirmed if hasattr(w.proc,"group_key") else
+                                                w.reported_pages*PAGE_SIZE for w in workers),
+                    "base_lock_batches": len(workers), "base_file_errors": dict(file_errors),
+                    "base_files_waiting_retry": len(failed_until), "base_last_progress_seconds_ago": round(now-last_progress,2) if last_progress else None,
+                    "worker_limiting_cgroup": admission.limiting_group,
+                    "first_confirmed_lock_seconds": first_confirmed, "refill_first_lock_seconds": regrow_first,
+                    "refill_settled_seconds": regrow_done, "combined_ceiling_gib": bytes_to_gib(ceiling),
+                    "spendable_headroom_gib": bytes_to_gib(max(0, meminfo["MemAvailable"]-reserve-unsampled)),
                     "controller_version": CONTROLLER_VERSION, "timestamp": int(time.time()),
                     "hotseat": hotseat.status, "combined_target_gib": bytes_to_gib(global_budget),
                     "combined_locked_gib": bytes_to_gib(actual + hotseat.measured_locked),
@@ -7463,7 +8037,7 @@ def run_supervisor() -> int:
                     "selected_gib": bytes_to_gib(requested), "owned_locked_gib": bytes_to_gib(actual),
                     "acknowledged_locked_gib": bytes_to_gib(sum(worker.locked for worker in workers if worker.ready.is_set())),
                     "inflight_gib": bytes_to_gib(inflight), "pending_chunks": len(pending_chunks),
-                    "active_loaders": active_loading, "active_lockers": len(workers), "peak_loaders": loading_peak,
+                    "active_loaders": active_loading, "active_lockers": physical_holders, "peak_loaders": loading_peak,
                     "worker_failures": failures, "worker_warnings": warning_count,
                     "worker_start_failures": admission.failures,
                     "worker_start_retry_seconds": round(max(0, admission.next_retry-now), 2),
@@ -7500,11 +8074,16 @@ def run_supervisor() -> int:
                     if text != config_text:
                         logging.info("configuration changed; restarting discovery and validating saved priorities")
                         cfg, config_text = new_cfg, text
+                        native = configure_backend(cfg)
+                        released.clear()
+                        hold_reason = ""
                         enabled = bool(cfg.get("hotseat_enabled", True))
                         if hotseat.enabled and not enabled:
                             hotseat.disconnect("disabled by configuration")
                             hotseat.status = {"state": "disabled"}
                         elif enabled and not hotseat.enabled:
+                            if hotseat.server is None:
+                                hotseat.listen()
                             subprocess.Popen(["systemctl", "start", "ramcache-hotseat.service"],
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         hotseat.enabled = enabled
@@ -7522,7 +8101,7 @@ def run_supervisor() -> int:
                                 retired.append((now, worker))
                         reader.stop.set()
                         reader = PlanReader(cfg, roots)
-                        filled_once = refill_from_plan = False
+                        filled_once = refill_from_plan = replay_recovered = False
                         boot_requested = False
                         boot_apply_generation = boot_applied_generation = None
                         plan_changed = True
@@ -7535,7 +8114,7 @@ def run_supervisor() -> int:
                     last_error = "invalid configuration; continuing last valid settings: " + str(error)
             # Completion/feeding remains fast; memory telemetry is sampled on
             # its independent >=1-s cadence. Holding ignores deferred plans.
-            busy = active_loading or (not holding and now >= admission.next_retry and
+            busy = active_loading or refill_job is not None or (not holding and now >= admission.next_retry and
                                       (not validated or incoming is not None or plan_changed))
             # Publish newly launched ownership BEFORE accepting hot-seat claims.
             if ownership_sizes != (len(workers), len(retired)):
@@ -7543,9 +8122,19 @@ def run_supervisor() -> int:
             hotseat.poll(now)
             wait = .1 if busy else max(.01, monitor_interval-(time.monotonic()-last_memory_sample))
             descriptors = ([hotseat.peer] if hotseat.peer else [hotseat.server]) if hotseat.enabled else []
-            select.select(descriptors, [], [], wait)
+            holders = [h for h in pool.holders if not h.stopping] if pool else []
+            descriptors.extend(h.sock for h in holders)
+            writes = [h.sock for h in holders if h.drops or (h.job and not h.awaiting)]
+            poller = select.poll()
+            for descriptor in descriptors:
+                poller.register(descriptor,select.POLLIN)
+            for descriptor in writes:
+                poller.modify(descriptor,select.POLLIN|select.POLLOUT)
+            poller.poll(math.ceil(wait*1000))
     finally:
         admission.cancel(retired, time.monotonic())
+        if refill_job:
+            refill_job.cancel.set()
         hotseat.close()
         reader.stop.set()
         for worker in workers:
@@ -7555,6 +8144,8 @@ def run_supervisor() -> int:
             os.killpg(planner.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        if pool:
+            pool.close()
         # Locks are released immediately above. Give the planner time to commit
         # its accumulated metadata once during an orderly stop/reboot.
         deadline = time.monotonic() + 50
@@ -7822,7 +8413,7 @@ else:
             os.fsync(output.fileno())
         subprocess.run([sys.executable, sys.argv[1], '--config', staged, '--check-config'], check=True, stdout=subprocess.DEVNULL)
         if path.exists():
-            backup = path.with_name('config.json.pre-1.5.2.' + str(time.time_ns()))
+            backup = path.with_name('config.json.pre-1.5.3.' + str(time.time_ns()))
             shutil.copy2(path, backup)
             print('Previous configuration saved to', backup)
         os.replace(staged, path)
@@ -9218,7 +9809,7 @@ ensure_fs_watch_tools() {
 }
 
 write_hotseat() {
-  local target="/opt/ramcache-controller/hotseat-1.5.1-2f21cbae110b"
+  local target="/opt/ramcache-controller/hotseat-1.5.3"
   local stage reason="" native_ok=1 requested=1 arch multiarch compiler
   local -a dependencies cflags libs extra_includes
   stage=$(mktemp -d /opt/ramcache-controller/.hotseat.XXXXXX) || return 1
@@ -9254,7 +9845,7 @@ def inode_key(dev, ino):
 class BaseIndex:
     """Compact identities for active AND retiring base workers."""
     def __init__(self):
-        self.workers, self.devices = {}, {}
+        self.workers, self.devices, self.buckets = {}, {}, {}
         self.generation = 0
 
     def add(self, pid, groups, reset=True):
@@ -9269,10 +9860,17 @@ class BaseIndex:
                 raise ValueError("invalid base inode index")
             result[int(dev)] = (inos, sizes)
             self.devices.setdefault(int(dev), {})[pid] = (inos, sizes)
+            for bucket in {ino >> 12 for ino in inos}:
+                self.buckets.setdefault((int(dev),bucket), set()).add(pid)
         self.generation += 1
 
     def remove(self, pid):
-        for dev in self.workers.pop(pid, {}):
+        for dev, (inos, _) in self.workers.pop(pid, {}).items():
+            for bucket in {ino >> 12 for ino in inos}:
+                members = self.buckets[(dev,bucket)]
+                members.discard(pid)
+                if not members:
+                    del self.buckets[(dev,bucket)]
             self.devices[dev].pop(pid, None)
             if not self.devices[dev]:
                 del self.devices[dev]
@@ -9280,7 +9878,8 @@ class BaseIndex:
 
     def contains(self, key, size=0):
         dev, ino = key
-        for values, sizes in self.devices.get(dev, {}).values():
+        for pid in self.buckets.get((dev,ino >> 12), ()):
+            values, sizes = self.devices[dev][pid]
             i = bisect.bisect_left(values, ino)
             if i < len(values) and values[i] == ino and sizes[i] >= size:
                 return True
@@ -9331,12 +9930,15 @@ class HotseatBridge:
         self.measured_locked = self.measured_anon = 0
         self.io_group = None
         if enabled:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(self.path)
-            self.server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_NONBLOCK)
-            self.server.bind(self.path)
-            os.chmod(self.path, 0o600)
-            self.server.listen(1)
+            self.listen()
+
+    def listen(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.path)
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_NONBLOCK)
+        self.server.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.server.listen(1)
 
     @property
     def reserved(self):
@@ -9532,8 +10134,8 @@ class HotseatBridge:
     def sync_workers(self, workers, retired):
         if not self.peer:
             return
-        current = {w.proc.pid: w for w in workers}
-        current.update({w.proc.pid: w for _, w in retired if w.proc.poll() is None})
+        current = {w.key: w for w in workers}
+        current.update({w.key: w for _, w in retired if w.proc.poll() is None})
         # Chunks are already bounded by the original controller. Transfer only
         # new/removed workers, using compact inode arrays rather than file paths.
         for pid in list(self.known):
@@ -9544,7 +10146,8 @@ class HotseatBridge:
                 self.known.pop(pid, None)
         count = 0
         for pid, worker in current.items():
-            if pid in self.known:
+            version = (id(worker), getattr(worker.proc, "revision", 0))
+            if self.known.get(pid) == version:
                 continue
             devices = {}
             for rec in worker.records:
@@ -9558,11 +10161,16 @@ class HotseatBridge:
                     return
                 self.base.add(pid, groups, reset=first)
                 first = False
-            self.known[pid] = True
+            if first:
+                if not self.enqueue({"type":"base_del","pid":pid}):
+                    return
+                self.base.remove(pid)
+            self.known[pid] = version
             count += 1
             if count >= 8:
                 break
-        complete = len(self.known) == len(current)
+        complete = len(self.known) == len(current) and all(
+            self.known.get(k) == (id(w), getattr(w.proc, "revision", 0)) for k,w in current.items())
         if complete and not self.snapshot_done:
             self.enqueue({"type": "base_done"})
         self.snapshot_done = complete
@@ -9584,8 +10192,8 @@ class HotseatBridge:
         self.measured_locked, self.measured_anon = locked, anon
 
     def track_base_growth(self, workers, retired=()):
-        current = {w.proc.pid: w.locked for w in workers}
-        current.update({w.proc.pid: w.locked for _, w in retired if w.proc.poll() is None})
+        current = {w.key: w.locked for w in workers}
+        current.update({w.key: w.locked for _, w in retired if w.proc.poll() is None})
         self.growth_ready += sum(max(0, value-self.last_base.get(pid, 0)) for pid, value in current.items())
         self.normal_ready += sum(value for pid, value in self.last_base.items()
                                  if pid not in current and pid not in self.pressure_pending)
@@ -9596,7 +10204,7 @@ class HotseatBridge:
                 del self.pressure_pending[pid]
 
     def note_pressure(self, worker, before):
-        self.pressure_pending[worker.proc.pid] = (worker.proc, worker.locked)
+        self.pressure_pending[worker.key] = (worker.proc, worker.locked)
         self.pressure_before = max(self.pressure_before, int(before))
 
     def renew_paused_lease(self):
@@ -9895,22 +10503,33 @@ def process_matches(pid, birth):
         return False
 
 
+class IneligibleFile(ValueError):
+    """A resolved object falls outside the existing selection policy."""
+
+
 def resolve_event(event, excludes, state, runtime, known_path=None):
     """Try the observed name first; inspect only its process if that fails."""
     key, seen, pid, birth, start, end, path = event
 
+    best_error = None
+
     def attempt(name):
+        nonlocal best_error
         fd = -1
         try:
             fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
             st = os.fstat(fd)
             canonical = os.readlink(f"/proc/self/fd/{fd}")
-            if (st.st_dev, st.st_ino) != key or not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or not st.st_nlink:
-                raise ValueError("identity changed or file is not eligible")
+            if (st.st_dev, st.st_ino) != key or not st.st_nlink:
+                raise OSError(errno.ESTALE,"observed file identity changed",name)
+            if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+                raise IneligibleFile("observed file is no longer eligible")
             if not path_allowed(canonical, excludes, state, runtime):
-                raise ValueError("excluded file")
+                raise IneligibleFile("excluded file")
             return fd, canonical, st, seen, event
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
+            if best_error is None or isinstance(best_error, FileNotFoundError):
+                best_error = error
             if fd >= 0:
                 os.close(fd)
             return None
@@ -9947,6 +10566,8 @@ def resolve_event(event, excludes, state, runtime, known_path=None):
                         continue
         except OSError:
             pass
+    if best_error is not None:
+        raise best_error
     raise FileNotFoundError("observed identity could not be resolved")
 
 
@@ -10133,15 +10754,15 @@ class Store:
 
 def resolve_path(path, seen, excludes, state, runtime):
     if not path_allowed(path, excludes, state, runtime):
-        raise FileNotFoundError("ineligible saved path")
+        raise IneligibleFile("ineligible saved path")
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
         st = os.fstat(fd)
         canonical = os.readlink(f"/proc/self/fd/{fd}")
         if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or not st.st_nlink:
-            raise FileNotFoundError("saved file is no longer eligible")
+            raise IneligibleFile("saved file is no longer eligible")
         if not path_allowed(canonical, excludes, state, runtime):
-            raise FileNotFoundError("saved file moved to an excluded path")
+            raise IneligibleFile("saved file moved to an excluded path")
         return fd, canonical, st, seen, None
     except BaseException:
         os.close(fd)
@@ -10194,6 +10815,11 @@ class Sidecar:
         self.open_fds = {}
         self.claim_pending = {}
         self.failed = collections.OrderedDict()
+        self.retry_ready = IndexedHeap()
+        self.metadata_retries = collections.OrderedDict()
+        self.future_args = {}
+        self.previously_selected = set()
+        self.initial_selection = True
         self.futures = {}
         self.future_started = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="hotseat-metadata")
@@ -10445,6 +11071,7 @@ class Sidecar:
             return False
         future = self.pool.submit(function, *args)
         self.futures[future] = kind, key
+        self.future_args[future] = (function,args)
         self.future_started[future] = time.monotonic()
         def done(_):
             with contextlib.suppress(OSError):
@@ -10470,6 +11097,8 @@ class Sidecar:
             os.close(self.open_fds.pop(entry.key))
         self.watch.remove(entry.watch)
         self.entries.pop(entry.key, None)
+        self.previously_selected.discard(entry.key)
+        self.retry_ready.remove(entry.key)
         self.metadata_bytes -= 512+len(os.fsencode(entry.path))
         self.observer_command("U", entry.key)
         self.dirty_generation += 1
@@ -10478,6 +11107,11 @@ class Sidecar:
 
     def mark_entry(self, entry, metrics=True):
         key = entry.key
+        delayed = entry.retry > time.monotonic()
+        if delayed:
+            self.retry_ready.set(key, entry.retry)
+        else:
+            self.retry_ready.remove(key)
         if entry.in_base or entry.dropping:
             self.pending.remove(key)
         elif 0 < entry.target < page_bytes(entry.size):
@@ -10486,7 +11120,7 @@ class Sidecar:
             self.pending.remove(key)
         if not entry.worker and entry.claimed and (not entry.target or entry.in_base or entry.dropping):
             self.unclaim(entry)
-        if entry.target and not entry.worker and not entry.in_base and not entry.dropping:
+        if entry.target and not delayed and not entry.worker and not entry.in_base and not entry.dropping:
             self.needs_open.set(key, entry.seen)
         else:
             self.needs_open.remove(key)
@@ -10496,7 +11130,7 @@ class Sidecar:
             self.discardable.set(key, entry.seen)
         else:
             self.discardable.remove(key)
-        if entry.dirty and not entry.worker and (entry.target or entry.in_base):
+        if entry.dirty and not delayed and not entry.worker and (entry.target or entry.in_base):
             self.validation_queue[key] = True
         if entry.worker:
             worker = entry.worker
@@ -10504,7 +11138,7 @@ class Sidecar:
                 worker.oldest.set(key, entry.seen)
             else:
                 worker.oldest.remove(key)
-            if entry.target > entry.locked and not entry.in_base and not entry.dropping:
+            if entry.target > entry.locked and not delayed and not entry.in_base and not entry.dropping:
                 worker.loading.set(key, entry.seen)
             else:
                 worker.loading.remove(key)
@@ -10534,10 +11168,24 @@ class Sidecar:
                 continue
             kind, key = self.futures.pop(future)
             self.future_started.pop(future, None)
+            function, args = self.future_args.pop(future)
             try:
                 fd, path, st, seen, locator = future.result()
             except Exception as error:
-                self.failed[key] = time.monotonic()+30
+                code = getattr(error, "errno", None)
+                reason = errno.errorcode.get(code) or ("unresolved" if isinstance(error, FileNotFoundError) else type(error).__name__)
+                self.counters[f"metadata/{kind}/{reason}"] += 1
+                # Keep one retry for a transient failure, even if the file goes quiet.
+                previous = self.metadata_retries.pop(key, None)
+                attempts = min(5,previous[3]+1 if previous else 1)
+                delay = min(300,5*2**attempts)
+                self.failed[key] = time.monotonic()+delay
+                if (isinstance(error,OSError) and not isinstance(error,FileNotFoundError)) or (
+                        isinstance(error,FileNotFoundError) and attempts < 3):
+                    self.metadata_retries[key] = (kind,function,args,attempts,self.failed[key])
+                    if len(self.metadata_retries)>8192:
+                        self.metadata_retries.popitem(last=False)
+                        self.counters["metadata_retry_evictions"] += 1
                 self.failed.move_to_end(key)
                 if len(self.failed) > 65536:
                     self.failed.popitem(last=False)
@@ -10547,12 +11195,19 @@ class Sidecar:
                     self.observer_command("N", key)
                 entry = self.entries.get(key)
                 if entry:
-                    if entry.target:
+                    entry.retry = self.failed[key]
+                    entry.dirty = True
+                    if isinstance(error, (FileNotFoundError, ValueError)):
                         self.selected_bytes -= entry.target
                         entry.target = 0
-                    self.forget(entry)
+                        self.selected.remove(key)
+                        if entry.worker:
+                            entry.dropping = True
+                    self.mark_entry(entry)
                 continue
             try:
+                self.failed.pop(key, None)
+                self.metadata_retries.pop(key, None)
                 actual_key = (st.st_dev, st.st_ino)
                 if kind in ("open", "check") and actual_key != key:
                     old = self.entries.get(key)
@@ -10618,6 +11273,7 @@ class Sidecar:
         # discard a multi-GiB file to release a 64-MiB amount.
         while self.selected_bytes > limit and self.selected:
             entry = self.entries[self.selected.peek()]
+            self.previously_selected.add(entry.key)
             amount = min(entry.target, self.selected_bytes-limit)
             entry.target -= amount
             self.selected_bytes -= amount
@@ -10636,15 +11292,25 @@ class Sidecar:
             self.settled_limit = limit
             self.settled_selected = min(self.settled_selected, self.selected_bytes)
         if not self.selection_active:
-            if now < self.next_refresh:
+            scheduled = now >= self.next_refresh
+            if not scheduled and (limit <= self.settled_limit or not self.previously_selected):
                 return
             self.selection_active = True
-            self.selection_replace = True
-            self.selection_topup = False
-            self.selection_candidates = collections.deque(key for _, key in sorted(self.pending.data))
-            self.selection_discovery = collections.deque(reversed(self.unknown))
-            self.selection_restore = len(self.restore)
-            self.counters["hourly_refreshes"] += 1
+            self.selection_replace = scheduled
+            self.selection_topup = not scheduled
+            if scheduled:
+                self.selection_candidates = collections.deque(key for _, key in sorted(self.pending.data))
+                self.selection_discovery = collections.deque(reversed(self.unknown))
+                self.selection_restore = len(self.restore)
+                self.counters["initial_selections" if self.initial_selection else "scheduled_refreshes"] += 1
+                self.counters["hourly_refreshes"] += 1
+                self.initial_selection = False
+                self.previously_selected.clear()
+            else:
+                self.selection_candidates = collections.deque(sorted(
+                    self.previously_selected, key=lambda k: self.entries[k].seen, reverse=True))
+                self.selection_discovery = collections.deque()
+                self.selection_restore = 0
         self.need_policy = False
         deferred = []
         for _ in range(64):
@@ -10685,6 +11351,7 @@ class Sidecar:
                 self.mark_entry(victim)
             entry.target = complete
             self.selected_bytes += cost
+            self.previously_selected.discard(entry.key)
             self.selected.set(entry.key, entry.seen)
             self.mark_entry(entry)
             self.dirty_generation += 1
@@ -10749,6 +11416,8 @@ class Sidecar:
                 self.dirty_generation += 1
             if error and error != errno.ECANCELED:
                 self.counters["lock_errors"] += 1
+                operation = {OPEN:"open", LOCK:"lock", CHECK:"check", DROP:"drop", TRIM:"trim"}.get(op,str(op))
+                self.counters[f"locker/{operation}/{errno.errorcode.get(error,error)}"] += 1
                 self.error = os.strerror(error)
                 entry.retry = time.monotonic()+30
                 if error in (errno.ESTALE, errno.ENOENT) or op == OPEN:
@@ -10930,6 +11599,16 @@ class Sidecar:
                 if not self.submit("check", key, resolve_path, entry.path, entry.seen, self.excludes, self.state, self.runtime):
                     self.validation_queue[key] = True
                     break
+        # Revisit a bounded number of eligible retries. An unrelated missing
+        # or denied file cannot monopolize both metadata slots.
+        if not self.paused and not self.io_busy and len(self.futures)<1:
+            now = time.monotonic()
+            for _ in range(min(8,len(self.metadata_retries))):
+                key, retry = self.metadata_retries.popitem(last=False)
+                kind,function,args,attempts,deadline = retry
+                self.metadata_retries[key] = retry
+                if deadline<=now and self.submit(kind,key,function,*args):
+                    break
         # Reserve metadata opportunities for selected-file loading, so a stream
         # of new observations cannot starve admission behind path resolution.
         deferred = []
@@ -11032,6 +11711,14 @@ class Sidecar:
 
     def report(self):
         locked, inflight = self.accounting()
+        now = time.monotonic()
+        # Deadlines are adaptive, so insertion order need not be deadline order.
+        for _ in range(min(64,len(self.failed))):
+            key, deadline = self.failed.popitem(last=False)
+            if deadline>now:
+                self.failed[key] = deadline
+        oldest = min(self.future_started.values(), default=now)
+        pending_since = next(iter(self.unknown.values()))[1]/1e9 if self.unknown else now
         if self.metrics_dirty:
             self.metrics = {
                 "want": sum(e.target for e in self.entries.values() if not e.in_base),
@@ -11058,6 +11745,9 @@ class Sidecar:
                   "partial_files": self.metrics.get("partial_files", 0),
                   "oversized_files": self.metrics.get("oversized_files", 0),
                   "base_files_skipped": self.metrics.get("base_files_skipped", 0),
+                  "metadata_jobs_active": len(self.futures), "metadata_candidates_waiting": len(self.unknown),
+                  "metadata_retry_keys": len(self.metadata_retries), "locker_retry_keys": len(self.retry_ready),
+                  "oldest_pending_metadata_seconds": round(max(0, now-min(oldest,pending_since)), 2),
                   "pending_metadata": len(self.unknown)+len(self.futures), "checkpoint_pending": self.save_future is not None,
                   "last_error": self.error, "counters": dict(self.counters), "observer": self.observer_stats}
         self.send({"type": "status", "revision": self.revision, "want": want, "locked": locked,
@@ -11092,6 +11782,12 @@ class Sidecar:
                             entry.watch = -1
                         entry.dirty = True
                         self.mark_entry(entry)
+            now = time.monotonic()
+            while self.retry_ready and self.retry_ready.data[0][0] <= now:
+                key = self.retry_ready.pop()
+                entry = self.entries.get(key)
+                if entry:
+                    self.mark_entry(entry)
             self.finish_metadata()
             self.check_lockers()
             self.reap_lockers()
@@ -11462,9 +12158,19 @@ RAMCACHE_HOTSEAT_SOURCE_2
 
 #define HEAP_MAX 131072U
 #define COALESCE_NS 100000000ULL
-struct pending { struct rc_key key; uint64_t due; };
+struct pending { struct rc_key key; uint64_t due, blocked_since; };
 static struct pending heap[HEAP_MAX];
 static unsigned heap_count, callback_count;
+/* One pending delivery or tail check per key. Slots use separate chaining;
+ * heap moves never invalidate membership and storage is bounded. */
+static struct member { struct rc_key key; unsigned next; } members[HEAP_MAX+1];
+static unsigned heads[65536], unused=1, recycled;
+static unsigned *member_link(struct rc_key key) {
+    uint64_t hash=(key.ino^(key.ino>>32)^key.major)*11400714819323198485ULL+key.minor;
+    unsigned *link=&heads[hash>>48];
+    while(*link && memcmp(&members[*link].key,&key,sizeof(key))) link=&members[*link].next;
+    return link;
+}
 static int candidates, residents, names, acks, counters, config_fd;
 static int cpus;
 static struct rc_counts *percpu;
@@ -11494,7 +12200,7 @@ static struct rc_counts totals(void) {
     unsigned zero=0; struct rc_counts out={0};
     if(bpf_map_lookup_elem(counters,&zero,percpu)) { out.errors=1; return out; }
     for(int i=0;i<cpus;i++) {
-        out.events+=percpu[i].events; out.lost+=percpu[i].lost; out.inserts+=percpu[i].inserts;
+        out.probe_lost+=percpu[i].probe_lost; out.events+=percpu[i].events; out.lost+=percpu[i].lost; out.inserts+=percpu[i].inserts;
         out.errors+=percpu[i].errors; out.path_errors+=percpu[i].path_errors;
     }
     return out;
@@ -11507,11 +12213,16 @@ static int activity(const struct rc_key *key, struct rc_activity *out) {
     if(a || (!b && other.seen>out->seen)) *out=other;
     return 0;
 }
-static void schedule(struct rc_key key, uint64_t due) {
+static void schedule(struct rc_key key, uint64_t due, uint64_t blocked_since) {
+    unsigned *link=member_link(key);
+    if(*link) return;
     if(heap_count==HEAP_MAX) { retry_overflow++; recover=true; return; }
+    unsigned m=recycled?recycled:unused++;
+    if(recycled) recycled=members[m].next;
+    members[m]=(struct member){key,0}; *link=m;
     unsigned i=heap_count++;
     while(i) { unsigned parent=(i-1)/2; if(heap[parent].due<=due) break; heap[i]=heap[parent]; i=parent; }
-    heap[i]=(struct pending){key,due};
+    heap[i]=(struct pending){key,due,blocked_since};
 }
 static struct pending pop(void) {
     struct pending result=heap[0], last=heap[--heap_count]; unsigned i=0;
@@ -11522,9 +12233,13 @@ static struct pending pop(void) {
         heap[i]=heap[child]; i=child;
     }
     if(heap_count) heap[i]=last;
+    unsigned *link=member_link(result.key), m=*link;
+    if(!m) abort();
+    *link=members[m].next; members[m].next=recycled; recycled=m;
     return result;
 }
-static int deliver(const struct rc_key *key, bool tail) {
+static int deliver(const struct rc_key *key, bool tail, uint64_t blocked_since) {
+    if(!tail && *member_link(*key)) return 0;
     struct rc_ack ack={0};
     (void)bpf_map_lookup_elem(acks,key,&ack);
     if(tail) {
@@ -11543,19 +12258,19 @@ static int deliver(const struct rc_key *key, bool tail) {
     size_t len=offsetof(struct rc_event,path)+strnlen(event.path,RC_PATH-1)+1;
     if(send(STDIN_FILENO,&event,len,MSG_DONTWAIT|MSG_NOSIGNAL)!=(ssize_t)len) {
         if(errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=ENOBUFS) return -2;
-        transport_full++; schedule(*key,monotonic_ns()+COALESCE_NS); return -1;
+        uint64_t now=monotonic_ns(); transport_full++; schedule(*key,now+COALESCE_NS,blocked_since?blocked_since:now); return -1;
     }
     sent++; if(!event.path[0]) unresolved++;
     ack.seen=a.seen; ack.after=monotonic_ns()+COALESCE_NS;
     if(bpf_map_update_elem(acks,key,&ack,BPF_ANY)) recover=true;
-    schedule(*key,ack.after);
+    schedule(*key,ack.after,0);
     return 0;
 }
 static int ring_event(void *ctx, void *data, size_t size) {
     (void)ctx;
     if(size==sizeof(struct rc_notice)) {
         struct rc_notice notice; memcpy(&notice,data,sizeof(notice));
-        if(deliver(&notice.key,false)==-2) return -EPIPE;
+        if(deliver(&notice.key,false,0)==-2) return -EPIPE;
     }
     return ++callback_count>=128?1:0;
 }
@@ -11589,7 +12304,7 @@ static int probe(const char *directory) {
     bpf_map_delete_elem(candidates,&cfg.test); bpf_map_delete_elem(acks,&cfg.test);
     struct rc_counts before=totals();
     cfg.force_loss=1; if(update_config() || pread(fd,&byte,1,0)!=1) goto done;
-    if(activity(&cfg.test,&a) || totals().lost<=before.lost) goto done;
+    if(activity(&cfg.test,&a) || totals().probe_lost<=before.probe_lost) goto done;
     if(bpf_map_update_elem(residents,&cfg.test,&a,BPF_ANY)) goto done;
     struct rc_ack ack={.seen=a.seen}; bpf_map_update_elem(acks,&cfg.test,&ack,BPF_ANY);
     if(pread(fd,&byte,1,0)!=1 || bpf_map_lookup_elem(residents,&cfg.test,&a) || a.seen<=ack.seen) goto done;
@@ -11646,7 +12361,7 @@ int main(int argc, char **argv) {
     if(!ring) return 1;
     /* Own service cgroup is excluded before READY and any cache loading. */
     message(3,"{\"mode\":\"ebpf\",\"selftest\":true}");
-    uint64_t next_stats=monotonic_ns(), last_events=totals().events, last_lost=totals().lost;
+    uint64_t next_stats=monotonic_ns(), last_events=totals().events, last_lost=0;
     uint64_t last_stats=next_stats-1000000000ULL, scan_lost=0, scan_retry=0, pause_count=0;
     uint64_t resume_at=0, backoff=5, healthy_since=monotonic_ns(); unsigned excessive=0;
     struct rc_key cursor={0}; bool have_cursor=false; int scan_map=0;
@@ -11665,15 +12380,19 @@ int main(int argc, char **argv) {
                 detach(); resume_at=now+backoff*1000000000ULL; backoff=backoff<30?backoff*2:60; pause_count++;
             } else if(!resume_at && now-healthy_since>60000000000ULL) backoff=5;
             last_events=stats.events; last_stats=now;
+            unsigned blocked=0; uint64_t oldest=now;
+            for(unsigned i=0;i<heap_count;i++) if(heap[i].blocked_since) {
+                blocked++; if(heap[i].blocked_since<oldest) oldest=heap[i].blocked_since;
+            }
             char status[1024];
-            snprintf(status,sizeof(status),"{\"events\":%llu,\"notification_overflows\":%llu,\"map_errors\":%llu,\"path_errors\":%llu,\"candidate_churn\":%s,\"delivered\":%llu,\"locator_events\":%llu,\"recoveries\":%llu,\"transport_backpressure\":%llu,\"recovery_queue_overflows\":%llu,\"observation_pause_count\":%llu,\"observation_paused\":%s}",
-                     stats.events,stats.lost,stats.errors,stats.path_errors,stats.inserts>=RC_CANDIDATES?"true":"false",
+            snprintf(status,sizeof(status),"{\"events\":%llu,\"notification_overflows\":%llu,\"probe_overflows\":%llu,\"retry_keys\":%u,\"backpressured_keys\":%u,\"oldest_backpressure_ms\":%llu,\"recovery_active\":%s,\"map_errors\":%llu,\"path_errors\":%llu,\"candidate_churn\":%s,\"delivered\":%llu,\"locator_events\":%llu,\"recoveries\":%llu,\"transport_backpressure\":%llu,\"recovery_queue_overflows\":%llu,\"observation_pause_count\":%llu,\"observation_paused\":%s}",
+                     stats.events,stats.lost,stats.probe_lost,heap_count,blocked,(unsigned long long)((now-oldest)/1000000),recover?"true":"false",stats.errors,stats.path_errors,stats.inserts>=RC_CANDIDATES?"true":"false",
                      (unsigned long long)sent,(unsigned long long)unresolved,(unsigned long long)recoveries,
                      (unsigned long long)transport_full,(unsigned long long)retry_overflow,(unsigned long long)pause_count,resume_at?"true":"false");
             message(2,status); next_stats=now+1000000000ULL;
         }
         for(unsigned n=0;n<128 && heap_count && heap[0].due<=now;n++) {
-            struct pending item=pop(); if(deliver(&item.key,true)==-2) goto finish;
+            struct pending item=pop(); if(deliver(&item.key,true,item.blocked_since)==-2) goto finish;
         }
         if(recover) {
             if(!have_cursor && !scan_map) { scan_lost=totals().lost; scan_retry=retry_overflow; }
@@ -11684,7 +12403,7 @@ int main(int argc, char **argv) {
             int rc=bpf_map_lookup_batch(fd,have_cursor?&cursor:NULL,&out,keys,values,&amount,NULL);
             int error=rc?errno:0;
             if(rc && error!=ENOENT) { amount=0; message(4,"kernel BPF batch lookup failed"); goto finish; }
-            for(unsigned i=0;i<amount;i++) if(deliver(&keys[i],true)==-2) goto finish;
+            for(unsigned i=0;i<amount;i++) if(deliver(&keys[i],false,0)==-2) goto finish;
             if(!rc) { cursor=out; have_cursor=true; }
             else {
                 have_cursor=false;
@@ -11772,7 +12491,7 @@ static __always_inline int identify(struct file *f, struct rc_key *key, struct r
     if(magic==0x9fa0 || magic==0x62656572 || magic==0x01021994 || magic==0x858458f6 || magic==0x63677270) return 0;
     unsigned int dev=BPF_CORE_READ(sb,s_dev);
     key->major=dev>>20; key->minor=dev&0xfffff; key->ino=BPF_CORE_READ(ino,i_ino);
-    if((*cfg)->testing && (key->major!=(*cfg)->test.major || key->minor!=(*cfg)->test.minor || key->ino!=(*cfg)->test.ino)) return 0;
+    if((*cfg)->testing && (cg==(*cfg)->exclude_a || cg==(*cfg)->exclude_b) && (key->major!=(*cfg)->test.major || key->minor!=(*cfg)->test.minor || key->ino!=(*cfg)->test.ino)) return 0;
     return 1;
 }
 static __always_inline struct rc_activity *observe(struct rc_key *key, struct rc_config *cfg, unsigned int flags,
@@ -11805,7 +12524,12 @@ static __always_inline struct rc_activity *observe(struct rc_key *key, struct rc
     if(ack && (now<ack->after || old>ack->seen)) return a;
     if(!ack && old) return a;
     if(__sync_val_compare_and_swap(&a->notified,old,now)!=old) return a;
-    struct rc_notice *notice=cfg->force_loss?0:bpf_ringbuf_reserve(&notices,sizeof(*notice),0);
+    if(cfg->force_loss && cfg->testing && key->major==cfg->test.major &&
+       key->minor==cfg->test.minor && key->ino==cfg->test.ino) {
+        if(stats) stats->probe_lost++;
+        return a;
+    }
+    struct rc_notice *notice=bpf_ringbuf_reserve(&notices,sizeof(*notice),0);
     if(!notice) { if(stats) stats->lost++; }
     else { notice->key=*key; bpf_ringbuf_submit(notice,0); }
     return a;
@@ -11887,7 +12611,7 @@ struct rc_activity {
 struct rc_ack { unsigned long long seen, after; };
 struct rc_notice { struct rc_key key; };
 struct rc_name { char path[RC_PATH]; unsigned int pid, pad; unsigned long long birth; };
-struct rc_counts { unsigned long long events, lost, inserts, errors, path_errors; };
+struct rc_counts { unsigned long long events, lost, probe_lost, inserts, errors, path_errors; };
 struct rc_config { unsigned long long exclude_a, exclude_b; struct rc_key test; unsigned int testing, force_loss, paused, pad; };
 /* Socket packet types: 1 event; 2 counters; 3 ready; 4 fatal. Commands P/U/Q. */
 struct rc_event {
@@ -12031,7 +12755,529 @@ if __name__ == "__main__":
     raise SystemExit(preflight(directory) if sys.argv[1] == "preflight" else activation(directory))
 RAMCACHE_HOTSEAT_SOURCE_6
 
-  if ! "$PYTHON_BIN" -m py_compile "$stage/hotseat_bridge.py" "$stage/ramcache_hotseat.py" "$stage/hotseat_probe.py"; then
+  cat > "$stage/base_pool.py" <<'RAMCACHE_BASE_POOL'
+"""Supervisor end of the RC53 local batch-lock protocol."""
+import collections
+import errno
+import os
+import resource
+import socket
+import struct
+import subprocess
+import time
+from pathlib import Path
+
+HEADER = struct.Struct("=4sIQIIQ")
+FILE = struct.Struct("=QQQQQII")
+LOAD, DROP, RESULT, RELEASED, PROGRESS, CHECK, CHECKED = range(1, 8)
+PAGE = os.sysconf("SC_PAGE_SIZE")
+U64_MASK = (1 << 64) - 1
+
+
+def pages(rec):
+    return (rec.size + PAGE - 1) // PAGE * PAGE
+
+
+class Batch:
+    """One pressure/release lifetime. Several batches can share a real PID."""
+    def __init__(self, owner, number, records):
+        self.owner, self.number, self.items = owner, number, records
+        self.pid = owner.proc.pid
+        self.group_key = -number  # Separate namespace from real vmtouch PIDs.
+        self.returncode = None
+        self.confirmed = self.partial = self.offset = self.revision = 0
+        self.dropping = False
+        self.last_result = self.drop_sequence = 0
+        self.drop_sent = 0.
+        self.bad = set()
+        self.worker = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        if self.returncode is None and not self.dropping:
+            self.dropping = True
+            self.owner.drops.append(self)
+            self.owner.flush()
+
+    def kill(self):
+        # Queued release orders do not indicate a hung helper. A delivered
+        # order that never completes (including blocked I/O) needs escalation.
+        if self.drop_sent and time.monotonic() - self.drop_sent > 10:
+            self.owner.stop()
+
+    def refresh_records(self):
+        self.worker.records = [r for i, r in enumerate(self.items) if i not in self.bad]
+        if self.worker.records:
+            self.worker.priority = min(r.priority for r in self.worker.records)
+        self.revision += 1
+
+
+class Holder:
+    def __init__(self, pool):
+        self.pool = pool
+        self.sock, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            self.proc = subprocess.Popen([pool.binary], stdin=child, close_fds=True)
+        except BaseException:
+            self.sock.close()
+            raise
+        finally:
+            child.close()
+        self.sock.setblocking(False)
+        self.groups = {}
+        self.sequence = 0
+        self.slots = self.reserved = 0
+        self.job = self.awaiting = None
+        self.drops = collections.deque()
+        self.audits = collections.deque()
+        self.next_audit = time.monotonic() + 3600
+        self.kernel_locked = self.anon = 0
+        self.failure = ""
+        self.accepting = True
+        self.stopping = False
+
+    def stop(self):
+        self.accepting = False
+        self.stopping = True
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+    def fits(self, count, size):
+        return (self.accepting and self.job is None and not self.drops and
+                self.slots + count <= self.pool.map_limit and
+                (self.pool.lock_limit < 0 or self.reserved + size <= self.pool.lock_limit))
+
+    def send(self, data):
+        try:
+            if self.sock.send(data) != len(data):
+                raise OSError("short RC53 command")
+        except BlockingIOError:
+            return False
+        except OSError:
+            self.stop()
+            return False
+        return True
+
+    def flush(self):
+        if self.stopping:
+            return
+        while self.drops:
+            batch = self.drops[0]
+            if not batch.drop_sequence:
+                self.sequence += 1
+                batch.drop_sequence = self.sequence
+            if not self.send(HEADER.pack(b"RC53", DROP, batch.number, 0, 0, batch.drop_sequence)):
+                return
+            batch.drop_sent = time.monotonic()
+            self.drops.popleft()
+        if self.awaiting or not self.job:
+            return
+        batch, op, first = self.job
+        if batch.dropping:
+            self.job = None
+            return
+        parts = []
+        length = HEADER.size
+        for rec in batch.items[first:first+128]:
+            path = os.fsencode(rec.path) + b"\0"
+            if length + FILE.size + len(path) > 65536:
+                break
+            parts.append(FILE.pack(rec.dev, rec.ino, rec.size, rec.mtime_ns & U64_MASK, rec.ctime_ns & U64_MASK,
+                                   rec.mode, len(path)) + path)
+            length += len(parts[-1])
+        if not parts:
+            raise ValueError("invalid path length for RC53")
+        serial = self.sequence + 1
+        payload = HEADER.pack(b"RC53", op, batch.number, first, len(parts), serial) + b"".join(parts)
+        if self.send(payload):
+            self.sequence = serial
+            self.awaiting = (batch, op, first, len(parts), serial)
+
+    def receive(self):
+        for _ in range(64):
+            try:
+                data = self.sock.recv(2048)
+            except BlockingIOError:
+                break
+            if len(data) < HEADER.size:
+                raise OSError("base locker closed its socket")
+            magic, op, number, first, count, serial = HEADER.unpack_from(data)
+            batch = self.groups.get(number)
+            if magic != b"RC53" or not 0 < serial <= self.sequence:
+                raise ValueError("unexpected base locker session or command")
+            if batch is None:
+                if 0 < number <= self.pool.serial:
+                    continue  # An acknowledgement for an already retired batch.
+                raise ValueError("unknown base locker batch")
+            if op != RELEASED and serial <= batch.last_result:
+                continue
+            if op == RELEASED:
+                if len(data) != HEADER.size or serial != batch.drop_sequence or not batch.dropping or self.awaiting and self.awaiting[0] is batch:
+                    raise ValueError("unexpected base locker release")
+                self.slots -= len(batch.items)
+                self.reserved -= batch.worker.requested
+                batch.returncode = 0
+                self.groups.pop(number)
+                if self.job and self.job[0] is batch:
+                    self.job = None
+                continue
+            if not self.awaiting or self.awaiting[0] is not batch or self.awaiting[2:] != (first, count, serial):
+                raise ValueError("out-of-order base locker acknowledgement")
+            _, command, _, _, _ = self.awaiting
+            if op == PROGRESS and command == LOAD and len(data) == HEADER.size+8:
+                partial, = struct.unpack_from("=Q", data, HEADER.size)
+                if partial > batch.worker.requested-batch.confirmed:
+                    raise ValueError("base locker progress exceeds reservation")
+                batch.partial = partial
+                continue
+            if op != (RESULT if command == LOAD else CHECKED) or len(data) != HEADER.size+4*count:
+                raise ValueError("malformed base locker acknowledgement")
+            batch.last_result = serial
+            batch.partial = 0
+            prev = batch.worker.requested
+            changed = False
+            for i, error in enumerate(struct.unpack_from(f"={count}i", data, HEADER.size), first):
+                if i in batch.bad:
+                    continue
+                r = batch.items[i]
+                size = pages(r)
+                if error:
+                    # A cancelled batch retains its reservations until RELEASED.
+                    if batch.dropping:
+                        continue
+                    batch.bad.add(i)
+                    batch.worker.requested -= size
+                    if command == CHECK:
+                        batch.confirmed -= size
+                    changed = True
+                    if error == errno.ENOMEM and self.slots > len(batch.items):
+                        self.accepting = False
+                    self.pool.errors.append((r, error, "validate" if command == CHECK else "lock"))
+                elif command == LOAD:
+                    batch.confirmed += size
+                    self.pool.completed_bytes += size
+            self.reserved -= prev-batch.worker.requested
+            if changed:
+                batch.refresh_records()
+            batch.worker.reported_pages = batch.confirmed//PAGE
+            batch.worker.last_progress = time.monotonic()
+            self.awaiting = self.job = None
+            end = first + count
+            if not batch.dropping:
+                if end < len(batch.items):
+                    if command == LOAD:
+                        self.job = (batch, LOAD, end)
+                    else:
+                        self.audits.append((number, end))
+                elif command == LOAD:
+                    batch.worker.ready.set()
+            self.flush()
+
+    def sample(self, memory, now):
+        self.kernel_locked, self.anon = memory(self.proc.pid)
+        if self.audits or self.stopping:
+            return
+        confirmed = sum(g.confirmed for g in self.groups.values() if not g.dropping)
+        if now >= self.next_audit or (confirmed > self.kernel_locked and now >= self.next_audit-3570):
+            self.audits.extend((n, 0) for n,g in self.groups.items() if g.worker.ready.is_set() and not g.dropping)
+            self.next_audit = now + 3600
+
+    def audit_one(self):
+        if not self.job and not self.drops and self.audits:
+            number, first = self.audits.popleft()
+            group = self.groups.get(number)
+            if group and not group.dropping:
+                self.job = (group, CHECK, first)
+                self.flush()
+
+
+class BasePool:
+    def __init__(self, binary):
+        self.binary = str(binary)
+        self.holders = []
+        self.serial = self.completed_bytes = 0
+        self.errors = collections.deque()
+        self.last_error = ""
+        self.crashes = 0
+        try:
+            maps = int(Path("/proc/sys/vm/max_map_count").read_text())
+        except (OSError, ValueError):
+            maps = 65530
+        self.map_limit = max(1, (maps-min(512, maps//4))//2)
+        self.lock_limit = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
+
+    def start(self, records, factory, task_check, now):
+        size = sum(pages(r) for r in records)
+        holder = next((h for h in self.holders if h.fits(len(records), size)), None)
+        if holder is None:
+            if not task_check(now, native=True):
+                return None
+            if self.lock_limit >= 0 and size > self.lock_limit:
+                raise OSError(errno.ENOMEM,"batch exceeds holder memlock allowance")
+            holder = Holder(self)
+            self.holders.append(holder)
+        self.serial += 1
+        batch = Batch(holder, self.serial, records)
+        worker = factory(batch, records, size, now, records[0].priority or (99,))
+        batch.worker = worker
+        holder.groups[batch.number] = batch
+        holder.slots += len(records)
+        holder.reserved += size
+        holder.job = (batch, LOAD, 0)
+        holder.flush()
+        return worker
+
+    def poll(self, memory=None, now=0):
+        for h in list(self.holders):
+            code = h.proc.poll()
+            if code is not None:
+                if h.groups:
+                    self.crashes += 1
+                for batch in h.groups.values():
+                    batch.returncode = code or 1
+                    batch.worker.diagnostic = h.failure or f"base locker exited ({code})"
+                h.sock.close()
+                self.holders.remove(h)
+                continue
+            if h.stopping:
+                continue
+            try:
+                h.receive()
+                h.flush()
+                if memory:
+                    h.sample(memory, now)
+                    h.audit_one()
+                if not h.groups and (not h.accepting or len(self.holders)>1):
+                    h.stop()
+            except (OSError, ValueError, struct.error) as exc:
+                h.failure = self.last_error = str(exc)
+                h.stop()
+
+    def close(self):
+        for h in self.holders:
+            h.stop()
+        for h in self.holders:
+            h.proc.wait()
+            h.sock.close()
+            for batch in h.groups.values():
+                batch.returncode = h.proc.returncode
+RAMCACHE_BASE_POOL
+  cat > "$stage/base_lock.c" <<'RAMCACHE_BASE_LOCK'
+/* Base-cache sibling of the hot-seat range locker. The control thread releases
+ * independent batches while the I/O thread faults a bounded range at a time.
+ * Local SOCK_SEQPACKET ABI. All filenames are bytes and no mapping is dereferenced. */
+#define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+enum { LOAD=1, DROP, RESULT, RELEASED, PROGRESS, CHECK, CHECKED };
+enum { PACKET=65536, ITEMS=128, GROUP_FILES=8192, QUANTUM=4*1024*1024 };
+struct header { char magic[4]; uint32_t op; uint64_t id; uint32_t first, count; uint64_t sequence; };
+struct file { uint64_t dev, ino, size, mtime, ctime; uint32_t mode, pathlen; };
+_Static_assert(sizeof(struct header)==32 && sizeof(struct file)==48,"base protocol ABI");
+struct mapping { void *addr; size_t len; };
+struct group {
+    uint64_t id, drop_sequence;
+    _Atomic int cancelled;
+    unsigned slots;
+    struct mapping *maps;
+    struct group *next;
+};
+static struct group *groups[1024], *active;
+static pthread_mutex_t state=PTHREAD_MUTEX_INITIALIZER, output=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wake=PTHREAD_COND_INITIALIZER;
+static unsigned char request[PACKET];
+static size_t request_bytes, page;
+static int queued;
+
+static struct group **locate(uint64_t id) {
+    struct group **g=&groups[id%1024];
+    while(*g && (*g)->id!=id) g=&(*g)->next;
+    return g;
+}
+static void unmap(struct mapping *m) {
+    if(m->addr && munmap(m->addr,m->len)<0) _exit(2);
+    m->addr=NULL;
+}
+static void clear_group(struct group *g) {
+    for(unsigned i=0;i<g->slots;i++) unmap(&g->maps[i]);
+}
+static void forget(struct group *g) {
+    *locate(g->id)=g->next;
+    free(g->maps); free(g);
+}
+static void reply(struct header h, unsigned op, const void *data, size_t n) {
+    h.op=op;
+    struct iovec vec[]={{&h,sizeof(h)},{(void *)data,n}};
+    struct msghdr msg={.msg_iov=vec,.msg_iovlen=n?2:1};
+    pthread_mutex_lock(&output);
+    ssize_t sent;
+    do sent=sendmsg(0,&msg,MSG_NOSIGNAL); while(sent<0 && errno==EINTR);
+    pthread_mutex_unlock(&output);
+    if(sent!=(ssize_t)(sizeof(h)+n)) _exit(1);
+}
+static uint64_t nanos(struct timespec t) { return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
+static int matches(struct stat *st, struct file *f) {
+    return S_ISREG(st->st_mode) && st->st_nlink && (uint64_t)st->st_dev==f->dev &&
+        (uint64_t)st->st_ino==f->ino && (uint64_t)st->st_size==f->size &&
+        (uint32_t)st->st_mode==f->mode && nanos(st->st_mtim)==f->mtime && nanos(st->st_ctim)==f->ctime;
+}
+static int lock_file(struct group *g, const char *path, struct file *f, struct header h,
+                     uint64_t completed, uint64_t *last, struct mapping *m) {
+    if(!f->size || f->size>SIZE_MAX-page) return EFBIG;
+    int fd=open(path,O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOFOLLOW);
+    if(fd<0) return errno;
+    int err=0;
+    struct stat st;
+    if(fstat(fd,&st)<0) err=errno;
+    else if(!matches(&st,f)) err=ESTALE;
+    if(!err) {
+        m->len=((size_t)f->size+page-1)/page*page;
+        m->addr=mmap(NULL,m->len,PROT_READ,MAP_SHARED,fd,0);
+        if(m->addr==MAP_FAILED) { err=errno; m->addr=NULL; }
+    }
+    for(size_t offset=0;!err && offset<m->len;) {
+        size_t len=m->len-offset;
+        if(len>QUANTUM) len=QUANTUM;
+        if(atomic_load(&g->cancelled)) err=ECANCELED;
+        else if(mlock((char *)m->addr+offset,len)<0) err=errno;
+        else {
+            offset+=len;
+            uint64_t held=completed+offset;
+            if(held>=*last+32ULL*1024*1024) {
+                reply(h,PROGRESS,&held,sizeof(held)); *last=held;
+            }
+        }
+    }
+    if(!err && fstat(fd,&st)<0) err=errno;
+    if(!err && !matches(&st,f)) err=ESTALE;
+    if(!err && lstat(path,&st)<0) err=errno;
+    if(!err && !matches(&st,f)) err=ESTALE;
+    close(fd);
+    if(err) unmap(m);
+    return err;
+}
+static void *load(void *unused) {
+    (void)unused;
+    unsigned char packet[PACKET];
+    for(;;) {
+        pthread_mutex_lock(&state);
+        while(!queued) pthread_cond_wait(&wake,&state);
+        size_t n=request_bytes;
+        memcpy(packet,request,n);
+        struct group *g=active;
+        queued=0;
+        pthread_mutex_unlock(&state);
+        struct header h;
+        memcpy(&h,packet,sizeof(h));
+        int32_t errors[ITEMS];
+        uint64_t completed=0,last=0;
+        size_t pos=sizeof(h);
+        for(unsigned i=0;i<h.count;i++) {
+            struct file f;
+            if(n-pos<sizeof(f)) _exit(2);
+            memcpy(&f,packet+pos,sizeof(f)); pos+=sizeof(f);
+            if(!f.pathlen || f.pathlen>n-pos || packet[pos]!='/' ||
+               packet[pos+f.pathlen-1] || memchr(packet+pos,0,f.pathlen-1)) _exit(2);
+            const char *path=(const char *)packet+pos;
+            pos+=f.pathlen;
+            struct mapping m={0};
+            int err=0;
+            if(atomic_load(&g->cancelled)) err=ECANCELED;
+            else if(h.op==LOAD) err=lock_file(g,path,&f,h,completed,&last,&m);
+            else {
+                struct stat st;
+                if(lstat(path,&st)<0) err=errno;
+                else if(!matches(&st,&f)) err=ESTALE;
+            }
+            pthread_mutex_lock(&state);
+            if(atomic_load(&g->cancelled)) err=ECANCELED;
+            struct mapping *slot=&g->maps[h.first+i];
+            if(h.op==LOAD && !err) {
+                if(slot->addr) _exit(2);
+                *slot=m; completed+=m.len;
+            } else {
+                unmap(&m);
+                if(h.op==CHECK && err && err!=ECANCELED) unmap(slot);
+            }
+            pthread_mutex_unlock(&state);
+            errors[i]=err;
+        }
+        if(pos!=n) _exit(2);
+        /* Serialize completion before a concurrent DROP can confirm retirement. */
+        pthread_mutex_lock(&state);
+        reply(h,h.op==LOAD?RESULT:CHECKED,errors,h.count*sizeof(*errors));
+        active=NULL;
+        if(atomic_load(&g->cancelled)) {
+            h.sequence=g->drop_sequence;
+            clear_group(g); forget(g);
+            h.first=h.count=0; reply(h,RELEASED,NULL,0);
+        }
+        pthread_mutex_unlock(&state);
+    }
+    return NULL;
+}
+int main(int argc,char **argv) {
+    if(argc==2 && !strcmp(argv[1],"--protocol")) { puts("RC53"); return 0; }
+    pid_t parent=getppid();
+    if(prctl(PR_SET_PDEATHSIG,SIGKILL)<0 || parent!=getppid()) return 1;
+    long p=sysconf(_SC_PAGESIZE); if(p<=0) return 1; page=(size_t)p;
+    pthread_t io; if(pthread_create(&io,NULL,load,NULL)) return 1;
+    for(;;) {
+        unsigned char packet[PACKET];
+        ssize_t n=recv(0,packet,sizeof(packet),MSG_TRUNC);
+        if(n<0 && errno==EINTR) continue;
+        if(n<=0) return n!=0;
+        struct header h;
+        if((size_t)n<sizeof(h) || n>PACKET) return 2;
+        memcpy(&h,packet,sizeof(h));
+        if(memcmp(h.magic,"RC53",4) || !h.id) return 2;
+        pthread_mutex_lock(&state);
+        struct group **slot=locate(h.id), *g=*slot;
+        if(h.op==DROP && n==(ssize_t)sizeof(h) && !h.count) {
+            if(g) { g->drop_sequence=h.sequence; atomic_store(&g->cancelled,1); clear_group(g); }
+            if(!g || g!=active) { if(g) forget(g); reply(h,RELEASED,NULL,0); }
+        } else {
+            if(active || (h.op!=LOAD && h.op!=CHECK) || !h.count || h.count>ITEMS ||
+               h.first>GROUP_FILES-h.count) return 2;
+            if(!g) {
+                if(h.first || h.op!=LOAD) return 2;
+                g=calloc(1,sizeof(*g)); if(!g) return 1;
+                g->id=h.id; *slot=g;
+            }
+            unsigned end=h.first+h.count;
+            if(h.op==LOAD) {
+                if(h.first!=g->slots) return 2;
+                struct mapping *maps=realloc(g->maps,end*sizeof(*maps));
+                if(!maps) return 1;
+                memset(maps+g->slots,0,h.count*sizeof(*maps));
+                g->maps=maps; g->slots=end;
+            } else if(end>g->slots) return 2;
+            active=g; queued=1; request_bytes=(size_t)n; memcpy(request,packet,(size_t)n);
+            pthread_cond_signal(&wake);
+        }
+        pthread_mutex_unlock(&state);
+    }
+}
+RAMCACHE_BASE_LOCK
+  if ! "$PYTHON_BIN" -m py_compile "$stage/base_pool.py" "$stage/hotseat_bridge.py" "$stage/ramcache_hotseat.py" "$stage/hotseat_probe.py"; then
     rm -rf -- "$stage"
     return 1
   fi
@@ -12107,6 +13353,16 @@ HOTSEAT_ENABLED
       rm -f -- "$stage/hotseat-lock" "$stage/hotseat-observer" "$stage/hotseat.bpf.o"
     fi
   fi
+  # This holder needs only the Linux C library and pthreads. Its availability
+  # is independent of BTF, libbpf, and the user's hot-seat preference.
+  compiler=$(command -v cc || command -v gcc || command -v clang || true)
+  if [[ -n "$compiler" ]] && "$compiler" -std=gnu11 -O2 -Wall -Wextra -Werror -pthread \
+       "$stage/base_lock.c" -o "$stage/base-lock" && [[ "$("$stage/base-lock" --protocol)" == RC53 ]]; then
+    echo "Reusable base locker ready."
+  else
+    rm -f -- "$stage/base-lock"
+    echo "Using the installed vmtouch base backend."
+  fi
   "$PYTHON_BIN" - "$stage/build-status.json" "$native_ok" "$reason" <<'HOTSEAT_BUILD_STATUS'
 import json, sys
 from pathlib import Path
@@ -12116,8 +13372,16 @@ HOTSEAT_BUILD_STATUS
   if [[ -d "$target" ]]; then
     # Identical content-addressed program files are safe to reuse. Replace the
     # directory only after a previous unavailable build or a completed stop.
-    if [[ "$native_ok" == 1 ]] && { [[ ! -f "$target/hotseat.bpf.o" ]] ||
-       ! "$PYTHON_BIN" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("available") else 1)' "$target/build-status.json"; }; then
+    if [[ -x "$stage/base-lock" && ! -x "$target/base-lock" ]] ||
+       { [[ "$native_ok" == 1 ]] && { [[ ! -f "$target/hotseat.bpf.o" ]] ||
+          ! "$PYTHON_BIN" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("available") else 1)' "$target/build-status.json"; }; }; then
+      # Each optional component can become available independently on a later update.
+      if [[ ! -x "$stage/base-lock" && -x "$target/base-lock" ]]; then
+        cp -p -- "$target/base-lock" "$stage/base-lock" || return 1
+      fi
+      if [[ "$native_ok" == 0 && -f "$target/hotseat.bpf.o" ]]; then
+        cp -p -- "$target"/{hotseat-lock,hotseat-observer,hotseat.bpf.o,build-status.json} "$stage/" || return 1
+      fi
       local previous="${target}.previous.$(date +%s).$$"
       mv -- "$target" "$previous" || { rm -rf -- "$stage"; return 1; }
       if ! mv -- "$stage" "$target"; then mv -- "$previous" "$target"; return 1; fi
@@ -12148,7 +13412,7 @@ HOTSEAT_BUILD_STATUS
 }
 
 report_hotseat_activation() {
-  if ! "$PYTHON_BIN" /opt/ramcache-controller/hotseat-1.5.1-2f21cbae110b/hotseat_probe.py activation; then
+  if ! "$PYTHON_BIN" /opt/ramcache-controller/hotseat-1.5.3/hotseat_probe.py activation; then
     echo "Details: sudo journalctl -u ramcache-hotseat.service -b -n 60" >&2
   fi
 }
@@ -12167,7 +13431,7 @@ StartLimitBurst=5
 Type=exec
 User=root
 Group=root
-ExecStart=$PYTHON_BIN /opt/ramcache-controller/hotseat-1.5.1-2f21cbae110b/ramcache_hotseat.py
+ExecStart=$PYTHON_BIN /opt/ramcache-controller/hotseat-1.5.3/ramcache_hotseat.py
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=30
@@ -12191,7 +13455,11 @@ UNIT
 
 install_all() {
   need_root
+  install -d -m 755 /opt/ramcache-controller
+  exec 8>/opt/ramcache-controller/.installer.lock
+  flock -x 8
   prepare_installer_log
+  if [[ -f "$UPGRADE_DIR/ready" ]]; then restore_upgrade; fi
   export DEBIAN_FRONTEND=noninteractive
   printf 'Checking requirements...\n'
   ensure_dependencies >>"$INSTALL_LOG" 2>&1
@@ -12203,9 +13471,18 @@ install_all() {
     rm -f "$STAGED_CONTROLLER"
     installer_failed 1
   fi
+  prepare_upgrade
   if ! write_config >>"$INSTALL_LOG" 2>&1; then
     rm -f "$STAGED_CONTROLLER"
     installer_failed 1
+  fi
+  if [[ "$UPGRADE_ACTIVE" == 1 ]]; then
+    if [[ -f "$UPGRADE_DIR/running" && ! -e /var/lib/ramcache-controller/inventory.sqlite3 &&
+          ! -e /var/lib/ramcache-controller/startup-plan.jsonl ]]; then
+      "$PYTHON_BIN" "$STAGED_CONTROLLER" --seed-existing >>"$INSTALL_LOG" 2>&1
+    fi
+    touch "$UPGRADE_DIR/switching"
+    systemctl stop ramcache-controller.service >>"$INSTALL_LOG" 2>&1
   fi
   mv -f "$STAGED_CONTROLLER" /opt/ramcache-controller/ramcache_controller.py
   install -d -m 700 /var/lib/ramcache-controller
@@ -12217,11 +13494,16 @@ install_all() {
   systemctl daemon-reload >>"$INSTALL_LOG" 2>&1
   systemctl enable ramcache-controller.service >>"$INSTALL_LOG" 2>&1
   systemctl restart ramcache-controller.service >>"$INSTALL_LOG" 2>&1
+  verify_started_controller >>"$INSTALL_LOG" 2>&1
+  if [[ "$UPGRADE_ACTIVE" == 1 ]]; then
+    rm -rf -- "$UPGRADE_DIR"
+    UPGRADE_ACTIVE=0
+  fi
   if [[ "${RAMCACHE_VERBOSE:-0}" == 1 ]]; then cat "$INSTALL_LOG"; fi
   if [[ "$ACTION" == update ]]; then
-    printf '\nUpdated ramcache to 1.5.2. Settings and learned state kept.\n'
+    printf '\nUpdated ramcache to 1.5.3. Settings and learned state kept.\n'
   else
-    printf '\nInstalled ramcache 1.5.2. Filling runs in the background.\n'
+    printf '\nInstalled ramcache 1.5.3. Filling runs in the background.\n'
   fi
   report_hotseat_activation
   printf 'Initialization after an install or update can take several minutes.\n'
@@ -12294,7 +13576,7 @@ uninstall_all() {
 }
 
 status_all() {
-  echo "RAM cache controller installer: v1.5.2"
+  echo "RAM cache controller installer: v1.5.3"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     echo "Distribution: ${PRETTY_NAME:-${ID:-Linux}}"
